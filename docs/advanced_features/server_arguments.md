@@ -314,8 +314,9 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--moe-a2a-backend` | Select the backend for all-to-all communication for expert parallelism. | `none` | `none`, `deepep`, `mooncake`, `mori`, `nixl`, `ascend_fuseep`|
 | `--moe-runner-backend` | Choose the runner backend for MoE. | `auto` | `auto`, `deep_gemm`, `triton`, `triton_kernel`, `flashinfer_trtllm`, `flashinfer_trtllm_routed`, `flashinfer_cutlass`, `flashinfer_mxfp4`, `flashinfer_cutedsl`, `cutlass` |
 | `--flashinfer-mxfp4-moe-precision` | Choose the computation precision of flashinfer mxfp4 moe | `default` | `default`, `bf16` |
+| `--enable-flashinfer-allreduce` | Enable FlashInfer standalone allreduce for non-fused TP allreduce. | `False` | bool flag (set to enable) |
 | `--enable-flashinfer-allreduce-fusion` | Enable FlashInfer allreduce fusion with Residual RMSNorm. | `False` | bool flag (set to enable) |
-| `--flashinfer-allreduce-backend` | Select FlashInfer backend for allreduce fusion. | `auto` | `auto`, `trtllm`, `mnnvl` |
+| `--flashinfer-allreduce-backend` | Select FlashInfer backend for standalone/fused allreduce. | `auto` | `auto`, `trtllm`, `mnnvl` |
 | `--enable-aiter-allreduce-fusion` | Enable aiter allreduce fusion with Residual RMSNorm. | `False` | bool flag (set to enable) |
 | `--deepep-mode` | Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch. | `auto` | `normal`, `low_latency`, `auto` |
 | `--ep-num-redundant-experts` | Allocate this number of redundant experts in expert parallel. | `0` | Type: int |

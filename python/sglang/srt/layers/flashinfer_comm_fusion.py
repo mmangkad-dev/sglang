@@ -2,7 +2,6 @@ import logging
 from typing import Optional, Tuple
 
 import torch
-import torch.distributed as dist
 
 from sglang.srt.distributed import (
     get_attn_tensor_model_parallel_rank,
@@ -12,6 +11,9 @@ from sglang.srt.distributed import (
     get_moe_tensor_parallel_rank,
     get_moe_tensor_parallel_world_size,
     get_tp_group,
+)
+from sglang.srt.distributed.device_communicators.flashinfer_utils import (
+    create_mnnvl_comm_backend,
 )
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.custom_op import register_custom_op
@@ -58,51 +60,12 @@ def _get_flashinfer_allreduce_backend() -> str:
 
 def _create_mnnvl_comm_backend():
     try:
-        tp_group = get_tp_group().device_group
+        tp_group = get_tp_group().cpu_group
     except Exception as e:
         logger.debug(f"Failed to fetch TP process group for mnnvl backend: {e}")
         return None
 
-    try:
-        from flashinfer.comm.mnnvl import TorchDistBackend
-
-        return TorchDistBackend(group=tp_group)
-    except Exception:
-        pass
-
-    try:
-        from flashinfer.comm.mnnvl import CommBackend
-    except Exception as e:
-        logger.debug(f"Failed to import flashinfer.comm.mnnvl.CommBackend: {e}")
-        return None
-
-    class TorchDistributedCommBackend(CommBackend):
-        def __init__(self, group: dist.ProcessGroup):
-            self._group = group
-
-        def Get_rank(self) -> int:
-            return self._group.rank()
-
-        def Get_size(self) -> int:
-            return self._group.size()
-
-        def allgather(self, data: int):
-            gathered = [None] * self.Get_size()
-            dist.all_gather_object(gathered, data, group=self._group)
-            return gathered
-
-        def bcast(self, data, root: int = 0):
-            obj_list = [data]
-            dist.broadcast_object_list(obj_list, src=root, group=self._group)
-            return obj_list[0]
-
-        def Split(self, color: int, key: int):
-            return self
-
-        def barrier(self):
-            dist.barrier(group=self._group)
-
-    return TorchDistributedCommBackend(tp_group)
+    return create_mnnvl_comm_backend(tp_group)
 
 
 class FlashInferWorkspaceManager:

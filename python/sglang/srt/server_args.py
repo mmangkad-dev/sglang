@@ -519,6 +519,7 @@ class ServerArgs:
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
+    enable_flashinfer_allreduce: bool = False
     enable_flashinfer_allreduce_fusion: bool = False
     flashinfer_allreduce_backend: Literal["auto", "trtllm", "mnnvl"] = "auto"
     enable_aiter_allreduce_fusion: bool = False
@@ -4817,6 +4818,11 @@ class ServerArgs:
             help="Choose the computation precision of flashinfer mxfp4 moe",
         )
         parser.add_argument(
+            "--enable-flashinfer-allreduce",
+            action="store_true",
+            help="Enable FlashInfer standalone allreduce for non-fused TP allreduce.",
+        )
+        parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
             help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
@@ -4826,7 +4832,7 @@ class ServerArgs:
             type=str,
             choices=FLASHINFER_ALLREDUCE_BACKEND_CHOICES,
             default=ServerArgs.flashinfer_allreduce_backend,
-            help="FlashInfer backend for allreduce fusion.",
+            help="FlashInfer backend for standalone/fused allreduce.",
         )
         parser.add_argument(
             "--enable-aiter-allreduce-fusion",

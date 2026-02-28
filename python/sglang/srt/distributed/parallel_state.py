@@ -220,6 +220,7 @@ class GroupCoordinator:
     use_pynccl: bool  # a hint of whether to use PyNccl
     use_pymscclpp: bool  # a hint of whether to use PyMsccl
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
+    use_flashinfer_allreduce: bool  # a hint of whether to use FlashInfer allreduce
     use_torch_symm_mem_all_reduce: (
         bool  # a hint of whether to use TorchSymmMemAllReduce
     )
@@ -229,6 +230,7 @@ class GroupCoordinator:
     # communicators are only created for world size > 1
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
+    fi_ar_comm: Optional[Any]  # FlashInfer allreduce communicator
     torch_symm_mem_comm: Optional[Any]  # Torch symm mem communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
 
@@ -240,6 +242,8 @@ class GroupCoordinator:
         use_pynccl: bool,
         use_pymscclpp: bool,
         use_custom_allreduce: bool,
+        use_flashinfer_allreduce: bool,
+        flashinfer_allreduce_backend: str,
         use_torch_symm_mem_all_reduce: bool,
         use_hpu_communicator: bool,
         use_xpu_communicator: bool,
@@ -319,6 +323,8 @@ class GroupCoordinator:
         self.pynccl_use_current_stream = pynccl_use_current_stream
         self.use_pymscclpp = use_pymscclpp
         self.use_custom_allreduce = use_custom_allreduce
+        self.use_flashinfer_allreduce = use_flashinfer_allreduce
+        self.flashinfer_allreduce_backend = flashinfer_allreduce_backend
         self.use_torch_symm_mem_all_reduce = use_torch_symm_mem_all_reduce
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
@@ -328,6 +334,9 @@ class GroupCoordinator:
         # Lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
             dispatch_custom_allreduce,
+        )
+        from sglang.srt.distributed.device_communicators.flashinfer_all_reduce import (
+            FlashInferAllReduce,
         )
         from sglang.srt.distributed.device_communicators.pymscclpp import (
             PyMscclppCommunicator,
@@ -366,6 +375,19 @@ class GroupCoordinator:
             self.pymscclpp_comm = PyMscclppCommunicator(
                 group=self.cpu_group,
                 device=self.device,
+            )
+
+        self.fi_ar_comm: Optional[FlashInferAllReduce] = None
+        # Standalone FlashInfer allreduce is currently only intended for TP-like groups.
+        if (
+            use_flashinfer_allreduce
+            and self.world_size > 1
+            and "tp" in self.unique_name
+        ):
+            self.fi_ar_comm = FlashInferAllReduce(
+                group=self.cpu_group,
+                device=self.device,
+                backend=flashinfer_allreduce_backend,
             )
 
         self.ca_comm: Optional[Any] = None
@@ -610,17 +632,23 @@ class GroupCoordinator:
 
         outplace_all_reduce_method = None
         if (
-            self.ca_comm is not None
-            and not self.ca_comm.disabled
-            and self.ca_comm.should_custom_ar(input_)
-        ):
-            outplace_all_reduce_method = "ca"
-        elif (
             self.qr_comm is not None
             and not self.qr_comm.disabled
             and self.qr_comm.should_quick_allreduce(input_)
         ):
             outplace_all_reduce_method = "qr"
+        elif (
+            self.fi_ar_comm is not None
+            and not self.fi_ar_comm.disabled
+            and self.fi_ar_comm.should_use_fi_ar(input_)
+        ):
+            outplace_all_reduce_method = "flashinfer"
+        elif (
+            self.ca_comm is not None
+            and not self.ca_comm.disabled
+            and self.ca_comm.should_custom_ar(input_)
+        ):
+            outplace_all_reduce_method = "ca"
         elif (
             self.pymscclpp_comm is not None
             and not self.pymscclpp_comm.disabled
@@ -703,16 +731,29 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         ca_comm = self.ca_comm
         qr_comm = self.qr_comm
+        fi_ar_comm = self.fi_ar_comm
         pymscclpp_comm = self.pymscclpp_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
         pynccl_comm = self.pynccl_comm
-        assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
+        assert any(
+            [
+                qr_comm,
+                fi_ar_comm,
+                ca_comm,
+                pymscclpp_comm,
+                torch_symm_mem_comm,
+                pynccl_comm,
+            ]
+        )
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
         elif outplace_all_reduce_method == "qr":
             assert not qr_comm.disabled
             out = qr_comm.quick_all_reduce(input_)
+        elif outplace_all_reduce_method == "flashinfer":
+            assert not fi_ar_comm.disabled
+            out = fi_ar_comm.all_reduce(input_)
         elif outplace_all_reduce_method == "torch_symm_mem":
             assert not torch_symm_mem_comm.disabled
             out = torch_symm_mem_comm.all_reduce(input_)
@@ -1398,6 +1439,9 @@ class GroupCoordinator:
             self.cpu_group = None
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
+        if self.fi_ar_comm is not None:
+            self.fi_ar_comm.destroy()
+            self.fi_ar_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
         if self.mq_broadcaster is not None:
@@ -1422,6 +1466,8 @@ def init_world_group(
         use_pynccl=False,
         use_pymscclpp=False,
         use_custom_allreduce=False,
+        use_flashinfer_allreduce=False,
+        flashinfer_allreduce_backend="auto",
         use_torch_symm_mem_all_reduce=False,
         use_hpu_communicator=False,
         use_xpu_communicator=False,
@@ -1441,6 +1487,8 @@ def init_model_parallel_group(
     use_mscclpp_allreduce: Optional[bool] = None,
     pynccl_use_current_stream: bool = True,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
+    use_flashinfer_allreduce: Optional[bool] = None,
+    flashinfer_allreduce_backend: Optional[str] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1448,6 +1496,10 @@ def init_model_parallel_group(
         use_mscclpp_allreduce = _ENABLE_MSCCLPP_ALL_REDUCE
     if use_torch_symm_mem_allreduce is None:
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
+    if use_flashinfer_allreduce is None:
+        use_flashinfer_allreduce = _ENABLE_FLASHINFER_ALL_REDUCE
+    if flashinfer_allreduce_backend is None:
+        flashinfer_allreduce_backend = _FLASHINFER_ALLREDUCE_BACKEND
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
@@ -1459,6 +1511,8 @@ def init_model_parallel_group(
         ),
         use_pymscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,
+        use_flashinfer_allreduce=use_flashinfer_allreduce,
+        flashinfer_allreduce_backend=flashinfer_allreduce_backend,
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
@@ -1586,6 +1640,8 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
+_ENABLE_FLASHINFER_ALL_REDUCE = False
+_FLASHINFER_ALLREDUCE_BACKEND = "auto"
 
 
 def set_custom_all_reduce(enable: bool):
@@ -1601,6 +1657,16 @@ def set_mscclpp_all_reduce(enable: bool):
 def set_torch_symm_mem_all_reduce(enable: bool):
     global _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
+
+
+def set_flashinfer_all_reduce(enable: bool):
+    global _ENABLE_FLASHINFER_ALL_REDUCE
+    _ENABLE_FLASHINFER_ALL_REDUCE = enable
+
+
+def set_flashinfer_all_reduce_backend(backend: str):
+    global _FLASHINFER_ALLREDUCE_BACKEND
+    _FLASHINFER_ALLREDUCE_BACKEND = backend
 
 
 _DEVICE_TO_DISTRIBUTED_BACKEND = {

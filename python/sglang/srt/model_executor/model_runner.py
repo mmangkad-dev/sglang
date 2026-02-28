@@ -65,6 +65,8 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
+    set_flashinfer_all_reduce,
+    set_flashinfer_all_reduce_backend,
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
@@ -849,6 +851,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.server_args.host or "127.0.0.1", self.dist_port
             ).to_tcp()
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
+        set_flashinfer_all_reduce(self.server_args.enable_flashinfer_allreduce)
+        set_flashinfer_all_reduce_backend(self.server_args.flashinfer_allreduce_backend)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
         set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
 
