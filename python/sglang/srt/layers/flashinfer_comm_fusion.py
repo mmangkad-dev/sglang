@@ -2,6 +2,7 @@ import logging
 from typing import Optional, Tuple
 
 import torch
+import torch.distributed as dist
 
 from sglang.srt.distributed import (
     get_attn_tensor_model_parallel_rank,
@@ -10,6 +11,7 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_moe_tensor_parallel_rank,
     get_moe_tensor_parallel_world_size,
+    get_tp_group,
 )
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.custom_op import register_custom_op
@@ -41,9 +43,66 @@ if is_flashinfer_available():
             "implementation"
         )
 
-
 def is_flashinfer_allreduce_unavailable() -> bool:
     return _flashinfer_allreduce_unavailable
+
+
+def _get_flashinfer_allreduce_backend() -> str:
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        return get_global_server_args().flashinfer_allreduce_backend
+    except Exception:
+        return "auto"
+
+
+def _create_mnnvl_comm_backend():
+    try:
+        tp_group = get_tp_group().device_group
+    except Exception as e:
+        logger.debug(f"Failed to fetch TP process group for mnnvl backend: {e}")
+        return None
+
+    try:
+        from flashinfer.comm.mnnvl import TorchDistBackend
+
+        return TorchDistBackend(group=tp_group)
+    except Exception:
+        pass
+
+    try:
+        from flashinfer.comm.mnnvl import CommBackend
+    except Exception as e:
+        logger.debug(f"Failed to import flashinfer.comm.mnnvl.CommBackend: {e}")
+        return None
+
+    class TorchDistributedCommBackend(CommBackend):
+        def __init__(self, group: dist.ProcessGroup):
+            self._group = group
+
+        def Get_rank(self) -> int:
+            return self._group.rank()
+
+        def Get_size(self) -> int:
+            return self._group.size()
+
+        def allgather(self, data: int):
+            gathered = [None] * self.Get_size()
+            dist.all_gather_object(gathered, data, group=self._group)
+            return gathered
+
+        def bcast(self, data, root: int = 0):
+            obj_list = [data]
+            dist.broadcast_object_list(obj_list, src=root, group=self._group)
+            return obj_list[0]
+
+        def Split(self, color: int, key: int):
+            return self
+
+        def barrier(self):
+            dist.barrier(group=self._group)
+
+    return TorchDistributedCommBackend(tp_group)
 
 
 class FlashInferWorkspaceManager:
@@ -54,10 +113,12 @@ class FlashInferWorkspaceManager:
         self.max_token_num = None
         self.hidden_dim = None
         self.dtype = None
+        self.backend = None
         self.initialized = False
 
     def initialize(
         self,
+        backend: str,
         world_size: int,
         rank: int,
         max_token_num: int,
@@ -74,14 +135,28 @@ class FlashInferWorkspaceManager:
 
         self.cleanup()
         try:
-            self.workspace = _flashinfer_comm.create_allreduce_fusion_workspace(
-                backend="trtllm",
+            workspace_kwargs = dict(
+                backend=backend,
                 world_size=world_size,
                 rank=rank,
                 max_token_num=max_token_num,
                 hidden_dim=hidden_dim,
                 dtype=dtype,
                 force_oneshot_support=bool(use_oneshot),
+            )
+
+            if backend in ("auto", "mnnvl"):
+                comm_backend = _create_mnnvl_comm_backend()
+                if comm_backend is not None:
+                    workspace_kwargs["comm_backend"] = comm_backend
+                else:
+                    logger.warning(
+                        "Could not initialize mnnvl comm backend from torch.distributed. "
+                        "FlashInfer will fall back to default comm backend behavior."
+                    )
+
+            self.workspace = _flashinfer_comm.create_allreduce_fusion_workspace(
+                **workspace_kwargs
             )
         except Exception as e:
             global _flashinfer_allreduce_unavailable
@@ -99,12 +174,14 @@ class FlashInferWorkspaceManager:
         self.max_token_num = max_token_num
         self.hidden_dim = hidden_dim
         self.dtype = dtype
+        self.backend = backend
         self.initialized = True
 
-        backend = getattr(self.workspace, "backend", "unknown")
+        resolved_backend = getattr(self.workspace, "backend", "unknown")
         logger.info(
             f"FlashInfer workspace initialized for rank {rank}, "
-            f"world_size {world_size}, backend {backend}"
+            f"world_size {world_size}, backend {resolved_backend} "
+            f"(requested: {backend})"
         )
 
     def is_buffer_size_sufficient(
@@ -143,6 +220,7 @@ class FlashInferWorkspaceManager:
                 self.max_token_num = None
                 self.hidden_dim = None
                 self.dtype = None
+                self.backend = None
 
 
 _workspace_manager = FlashInferWorkspaceManager()
@@ -181,11 +259,13 @@ def ensure_workspace_initialized(
         return False
 
     token_num = token_num or max_token_num
+    backend = _get_flashinfer_allreduce_backend()
 
     if (
         not _workspace_manager.initialized
         or _workspace_manager.world_size != world_size
         or _workspace_manager.rank != rank
+        or _workspace_manager.backend != backend
         or not _workspace_manager.is_buffer_size_sufficient(
             token_num=token_num,
             hidden_dim=hidden_dim,
@@ -194,6 +274,7 @@ def ensure_workspace_initialized(
         )
     ):
         _workspace_manager.initialize(
+            backend=backend,
             world_size=world_size,
             rank=rank,
             max_token_num=max_token_num,

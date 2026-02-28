@@ -201,6 +201,8 @@ MOE_A2A_BACKEND_CHOICES = [
     "flashinfer",
 ]
 
+FLASHINFER_ALLREDUCE_BACKEND_CHOICES = ["auto", "trtllm", "mnnvl"]
+
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
@@ -518,6 +520,7 @@ class ServerArgs:
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
+    flashinfer_allreduce_backend: Literal["auto", "trtllm", "mnnvl"] = "auto"
     enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
@@ -4817,6 +4820,13 @@ class ServerArgs:
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
             help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
+        )
+        parser.add_argument(
+            "--flashinfer-allreduce-backend",
+            type=str,
+            choices=FLASHINFER_ALLREDUCE_BACKEND_CHOICES,
+            default=ServerArgs.flashinfer_allreduce_backend,
+            help="FlashInfer backend for allreduce fusion.",
         )
         parser.add_argument(
             "--enable-aiter-allreduce-fusion",
