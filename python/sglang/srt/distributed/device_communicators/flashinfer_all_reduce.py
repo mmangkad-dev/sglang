@@ -144,8 +144,11 @@ class FlashInferAllReduce:
                         dtype=dtype,
                     ):
                         return True
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(
+                        "FlashInfer workspace size check failed; recreating workspace: %s",
+                        e,
+                    )
             self.destroy()
 
         assert self.max_workspace_size is not None
@@ -196,8 +199,8 @@ class FlashInferAllReduce:
         if self.workspace is not None:
             try:
                 self.workspace.destroy()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to destroy FlashInfer workspace: %s", e)
             self.workspace = None
             self.hidden_dim = None
             self.dtype = None
