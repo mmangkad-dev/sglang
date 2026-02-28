@@ -45,8 +45,12 @@ if is_flashinfer_available():
             "implementation"
         )
 
+
 def is_flashinfer_allreduce_unavailable() -> bool:
-    return _flashinfer_allreduce_unavailable
+    return _flashinfer_allreduce_unavailable or (
+        _workspace_manager is not None
+        and getattr(_workspace_manager, "disabled", False)
+    )
 
 
 def _get_flashinfer_allreduce_backend() -> str:
@@ -77,7 +81,10 @@ class FlashInferWorkspaceManager:
         self.hidden_dim = None
         self.dtype = None
         self.backend = None
+        self.resolved_backend = None
+        self.force_oneshot_support = False
         self.initialized = False
+        self.disabled = False
 
     def initialize(
         self,
@@ -90,6 +97,9 @@ class FlashInferWorkspaceManager:
         use_oneshot: Optional[bool] = None,
     ):
         """Initialize workspace"""
+        if self.disabled:
+            return
+
         if _flashinfer_comm is None:
             logger.warning(
                 "FlashInfer comm not available, skipping workspace initialization"
@@ -122,14 +132,14 @@ class FlashInferWorkspaceManager:
                 **workspace_kwargs
             )
         except Exception as e:
-            global _flashinfer_allreduce_unavailable
-            _flashinfer_allreduce_unavailable = True
             logger.warning(
-                f"Failed to initialize FlashInfer workspace: {e}. "
-                "Disabling flashinfer allreduce fusion permanently."
+                "Failed to initialize FlashInfer workspace: %s. "
+                "Disabling FlashInfer allreduce fusion for this run.",
+                e,
             )
             self.workspace = None
             self.initialized = False
+            self.disabled = True
             return
 
         self.world_size = world_size
@@ -138,12 +148,14 @@ class FlashInferWorkspaceManager:
         self.hidden_dim = hidden_dim
         self.dtype = dtype
         self.backend = backend
+        self.resolved_backend = getattr(self.workspace, "backend", backend)
+        self.force_oneshot_support = bool(use_oneshot)
         self.initialized = True
+        self.disabled = False
 
-        resolved_backend = getattr(self.workspace, "backend", "unknown")
         logger.info(
             f"FlashInfer workspace initialized for rank {rank}, "
-            f"world_size {world_size}, backend {resolved_backend} "
+            f"world_size {world_size}, backend {self.resolved_backend} "
             f"(requested: {backend})"
         )
 
@@ -156,17 +168,32 @@ class FlashInferWorkspaceManager:
     ) -> bool:
         if not self.initialized or self.workspace is None:
             return False
-        try:
-            return self.workspace.is_buffer_size_sufficient(
-                tp_size=self.world_size,
-                num_tokens=token_num,
-                hidden_dim=hidden_dim,
-                dtype=dtype,
-                use_oneshot=use_oneshot,
-            )
-        except Exception as e:
-            logger.debug(f"FlashInfer workspace size check failed: {e}")
+        if hidden_dim != self.hidden_dim or dtype != self.dtype:
             return False
+        if token_num > self.max_token_num:
+            return False
+        if bool(use_oneshot) and not self.force_oneshot_support:
+            return False
+        # Avoid expensive/unstable backend checks on mnnvl which can trigger
+        # repeated workspace churn during graph capture.
+        if self.resolved_backend == "trtllm" and hasattr(
+            self.workspace, "is_buffer_size_sufficient"
+        ):
+            try:
+                return self.workspace.is_buffer_size_sufficient(
+                    tp_size=self.world_size,
+                    num_tokens=token_num,
+                    hidden_dim=hidden_dim,
+                    dtype=dtype,
+                    use_oneshot=use_oneshot,
+                )
+            except Exception as e:
+                logger.debug(
+                    "FlashInfer workspace internal size check failed; keeping current "
+                    "workspace to avoid repeated reinitialization: %s",
+                    e,
+                )
+        return True
 
     def cleanup(self):
         """Clean up workspace"""
@@ -184,6 +211,8 @@ class FlashInferWorkspaceManager:
                 self.hidden_dim = None
                 self.dtype = None
                 self.backend = None
+                self.resolved_backend = None
+                self.force_oneshot_support = False
 
 
 _workspace_manager = FlashInferWorkspaceManager()
@@ -202,6 +231,8 @@ def ensure_workspace_initialized(
         return False
 
     if not is_flashinfer_available() or _flashinfer_comm is None:
+        return False
+    if _workspace_manager.disabled:
         return False
 
     if use_attn_tp_group:

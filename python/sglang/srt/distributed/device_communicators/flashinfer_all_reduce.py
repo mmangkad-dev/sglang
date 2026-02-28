@@ -27,6 +27,9 @@ except ImportError:
 MiB = 1024 * 1024
 
 # Max size of the communicated tensor by world size and GPU capability.
+# Adopted from vLLM thresholds.
+# TODO(mmangkad): Tune these thresholds for SGLang, since optimal values may
+# differ from vLLM based on runtime/scheduling behavior.
 _FI_ALLREDUCE_MAX_SIZE_MB: dict[int, dict[int, float]] = {
     90: {
         2: 64,
