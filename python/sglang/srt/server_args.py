@@ -1557,7 +1557,7 @@ class ServerArgs:
             if is_blackwell_supported():
                 # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
                 if not self.enable_dp_attention and self.nnodes == 1:
-                    self.enable_flashinfer_allreduce_fusion = True
+                    self.flashinfer_allreduce_fusion_backend = "auto"
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
                     )
@@ -1887,16 +1887,8 @@ class ServerArgs:
                 "Overlap scheduler is disabled when using sparse head for embedding model."
             )
 
-        # FlashInfer allreduce fusion (fused allreduce + Residual + RMSNorm) backend support:
-        #
-        #   Feature / Framework   | SM100 | SM90 | Single Node | Multi-Node |
-        #   --------------------- | ----- | ---- | ----------- | ---------- |
-        #   TRT-LLM AllReduce     | Yes   | Yes  | Yes         | No         |
-        #   MNNVL AllReduce       | Yes   | No   | Yes         | Yes        |
-        #
-        # With backend "auto": trtllm is used on single-node, mnnvl on both single or multi-node (SM100 only).
-        # Auto-enable only when single-node (any SM90/100) or multi-node + Blackwell (so "auto" can pick mnnvl).
-        # Multi-node + Hopper is excluded: trtllm would be chosen and does not support multi-node.
+        # FlashInfer allreduce fusion: auto-enable when single-node (any SM90/100) or multi-node + Blackwell.
+        # See sglang.srt.layers.flashinfer_comm_fusion for backend support table (TRT-LLM vs MNNVL, SM90/100, single/multi-node).
         # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
         device_name = get_device_name()
         is_h20_device = (
@@ -4470,14 +4462,9 @@ class ServerArgs:
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
-            action="store_true",
+            action=DeprecatedAction,
             help="(Deprecated: use --flashinfer-allreduce-fusion-backend=auto) "
             "Enable FlashInfer allreduce fusion with Residual RMSNorm.",
-        )
-        parser.add_argument(
-            "--enable-aiter-allreduce-fusion",
-            action="store_true",
-            help="Enable Aiter AllReduce Fusion.",
         )
         parser.add_argument(
             "--enable-aiter-allreduce-fusion",

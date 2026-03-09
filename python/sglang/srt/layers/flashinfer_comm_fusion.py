@@ -17,10 +17,14 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 
+# FlashInfer allreduce fusion: set when flashinfer is available (see block below)
 _flashinfer_comm = None
 _unified_allreduce = None
 _workspace_manager = None
 _mnnvl_comm_backend = None
+_AllReduceFusionPattern = None
+_create_allreduce_fusion_workspace = None
+_allreduce_fusion = None
 
 if is_flashinfer_available():
     try:
@@ -117,6 +121,18 @@ if is_flashinfer_available():
         _mnnvl_comm_backend = None
 
 
+# FlashInfer allreduce fusion (fused allreduce + Residual + RMSNorm) backend support
+# for --flashinfer-allreduce-fusion-backend:
+#
+#   Feature / Framework   | SM100 | SM90 | Single Node | Multi-Node |
+#   --------------------- | ----- | ---- | ----------- | ---------- |
+#   TRT-LLM AllReduce     | Yes   | Yes  | Yes         | No         |
+#   MNNVL AllReduce       | Yes   | No   | Yes         | Yes        |
+#
+# With backend "auto": trtllm is used on single-node, mnnvl on single or multi-node (SM100 only).
+# Multi-node + Hopper is unsupported (trtllm would be chosen but does not support multi-node).
+
+
 class FlashInferWorkspaceManager:
     """
     Workspace manager using FlashInfer's unified allreduce API.
@@ -131,6 +147,10 @@ class FlashInferWorkspaceManager:
         self.hidden_dim = None
         self.dtype = None
         self.initialized = False
+        # Max size ever requested (not cleared on cleanup) so we only grow and minimize recreates
+        self._max_token_num_seen: Optional[int] = None
+        self._max_hidden_dim_seen: Optional[int] = None
+        self._logged_init = False
 
     def initialize(
         self,
@@ -145,21 +165,23 @@ class FlashInferWorkspaceManager:
         use_oneshot: Optional[bool] = None,
     ):
         """Initialize workspace using FlashInfer's unified API"""
+        # Track max size ever requested so we can create with at least that (only grow, minimize recreates)
+        self._max_token_num_seen = max(max_token_num, self._max_token_num_seen or 0)
+        self._max_hidden_dim_seen = max(hidden_dim, self._max_hidden_dim_seen or 0)
+        # Reuse existing workspace if it already covers this problem size
+        if (
+            self.initialized
+            and self.world_size == world_size
+            and self.is_buffer_size_sufficient(
+                token_num=max_token_num,
+                hidden_dim=hidden_dim,
+                dtype=dtype or torch.bfloat16,
+                use_oneshot=use_oneshot,
+            )
+        ):
+            return
+        # Same world_size but buffer too small: free old workspace before creating new one
         if self.initialized and self.world_size == world_size:
-            # Check if workspace is sufficient for current problem size
-            if self.workspace is not None:
-                try:
-                    if hasattr(self.workspace, "is_buffer_size_sufficient"):
-                        if self.workspace.is_buffer_size_sufficient(
-                            world_size,
-                            max_token_num,
-                            hidden_dim,
-                            dtype or torch.bfloat16,
-                        ):
-                            return
-                except Exception:
-                    pass
-            # Workspace needs to be recreated
             self.cleanup()
 
         if not _unified_allreduce:
@@ -186,13 +208,16 @@ class FlashInferWorkspaceManager:
             comm_backend = _mnnvl_comm_backend(group)
 
         try:
+            # Create with at least the max size we've ever been asked for (only grow, fewer recreates)
+            alloc_token_num = max(max_token_num, self._max_token_num_seen or 0)
+            alloc_hidden_dim = max(hidden_dim, self._max_hidden_dim_seen or 0)
             # Use FlashInfer's unified API to create workspace
             create_kw = dict(
                 backend=backend,
                 world_size=world_size,
                 rank=rank,
-                max_token_num=max_token_num,
-                hidden_dim=hidden_dim,
+                max_token_num=alloc_token_num,
+                hidden_dim=alloc_hidden_dim,
                 dtype=dtype or torch.bfloat16,
                 gpus_per_node=gpus_per_node,
                 comm_backend=comm_backend,
@@ -202,16 +227,23 @@ class FlashInferWorkspaceManager:
             self.workspace = _create_allreduce_fusion_workspace(**create_kw)
             self.world_size = world_size
             self.rank = rank
-            self.max_token_num = max_token_num
-            self.hidden_dim = hidden_dim
+            self.max_token_num = alloc_token_num
+            self.hidden_dim = alloc_hidden_dim
             self.dtype = dtype or torch.bfloat16
             self.initialized = True
 
             backend_name = getattr(self.workspace, "backend", "unknown")
-            logger.info(
-                f"FlashInfer workspace initialized for rank {rank}, "
-                f"world_size {world_size}, backend: {backend_name}"
-            )
+            if not self._logged_init:
+                logger.info(
+                    f"FlashInfer workspace initialized for rank {rank}, "
+                    f"world_size {world_size}, backend: {backend_name}"
+                )
+                self._logged_init = True
+            else:
+                logger.debug(
+                    f"FlashInfer workspace re-initialized for rank {rank}, "
+                    f"world_size {world_size}, backend: {backend_name}"
+                )
         except Exception as e:
             logger.warning(f"Failed to initialize FlashInfer workspace: {e}")
             self.workspace = None
@@ -236,10 +268,18 @@ class FlashInferWorkspaceManager:
             )
         except Exception as e:
             logger.debug(f"FlashInfer workspace size check failed: {e}")
+            # Fallback: some backends (e.g. MNNVL) may use a different API; reuse if within our allocated size
+            if (
+                self.max_token_num is not None
+                and self.hidden_dim is not None
+                and token_num <= self.max_token_num
+                and hidden_dim <= self.hidden_dim
+            ):
+                return True
             return False
 
     def cleanup(self):
-        """Clean up workspace"""
+        """Clean up workspace."""
         if self.workspace is not None:
             try:
                 if hasattr(self.workspace, "destroy"):
@@ -254,6 +294,7 @@ class FlashInferWorkspaceManager:
                 self.max_token_num = None
                 self.hidden_dim = None
                 self.dtype = None
+                self._logged_init = False
 
 
 _workspace_manager = FlashInferWorkspaceManager()
