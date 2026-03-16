@@ -4625,7 +4625,8 @@ class ServerArgs:
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
-            action=DeprecatedAction,
+            action=DeprecatedStoreTrueAction,
+            new_flag="--flashinfer-allreduce-fusion-backend=auto",
             help="(Deprecated: use --flashinfer-allreduce-fusion-backend=auto) "
             "Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
