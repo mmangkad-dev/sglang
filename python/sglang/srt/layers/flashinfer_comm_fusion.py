@@ -19,12 +19,12 @@ logger = logging.getLogger(__name__)
 
 # FlashInfer allreduce fusion: set when flashinfer is available (see block below)
 _flashinfer_comm = None
-_unified_allreduce = None
 _workspace_manager = None
 _mnnvl_comm_backend = None
 _AllReduceFusionPattern = None
 _create_allreduce_fusion_workspace = None
 _allreduce_fusion = None
+_flashinfer_allreduce_unavailable = False
 
 if is_flashinfer_available():
     try:
@@ -35,11 +35,13 @@ if is_flashinfer_available():
         ):
             _flashinfer_comm = comm
         else:
+            _flashinfer_allreduce_unavailable = True
             logger.warning(
                 "flashinfer.comm unified allreduce_fusion API is not available, "
                 "falling back to standard implementation"
             )
     except ImportError:
+        _flashinfer_allreduce_unavailable = True
         logger.warning(
             "flashinfer.comm is not available, falling back to standard "
             "implementation"
@@ -58,13 +60,11 @@ if is_flashinfer_available():
         except ImportError:
             from flashinfer.comm.trtllm_ar import AllReduceFusionPattern
 
-        _unified_allreduce = True
         _AllReduceFusionPattern = AllReduceFusionPattern
         _create_allreduce_fusion_workspace = create_allreduce_fusion_workspace
         _allreduce_fusion = allreduce_fusion
     except ImportError:
         # Fall back to legacy API if unified API is not available
-        _unified_allreduce = False
         _AllReduceFusionPattern = None
         _create_allreduce_fusion_workspace = None
         _allreduce_fusion = None
@@ -133,6 +133,10 @@ if is_flashinfer_available():
 # Multi-node + Hopper is unsupported (trtllm would be chosen but does not support multi-node).
 
 
+def is_flashinfer_allreduce_unavailable() -> bool:
+    return _flashinfer_allreduce_unavailable
+
+
 class FlashInferWorkspaceManager:
     """
     Workspace manager using FlashInfer's unified allreduce API.
@@ -183,12 +187,6 @@ class FlashInferWorkspaceManager:
         # Same world_size but buffer too small: free old workspace before creating new one
         if self.initialized and self.world_size == world_size:
             self.cleanup()
-
-        if not _unified_allreduce:
-            logger.warning(
-                "FlashInfer unified API not available, skipping workspace initialization"
-            )
-            return
 
         if _flashinfer_comm is None:
             logger.warning(
@@ -245,7 +243,12 @@ class FlashInferWorkspaceManager:
                     f"world_size {world_size}, backend: {backend_name}"
                 )
         except Exception as e:
-            logger.warning(f"Failed to initialize FlashInfer workspace: {e}")
+            global _flashinfer_allreduce_unavailable
+            _flashinfer_allreduce_unavailable = True
+            logger.warning(
+                f"Failed to initialize FlashInfer workspace: {e}. "
+                "Disabling flashinfer allreduce fusion permanently."
+            )
             self.workspace = None
             self.initialized = False
 
@@ -309,8 +312,11 @@ def ensure_workspace_initialized(
     token_num: Optional[int] = None,
     use_oneshot: Optional[bool] = None,
 ):
-    """Ensure workspace is initialized using FlashInfer's unified API"""
-    if not is_flashinfer_available() or not _unified_allreduce:
+    """Ensure workspace is initialized"""
+    if _flashinfer_allreduce_unavailable:
+        return False
+
+    if not is_flashinfer_available() or _flashinfer_comm is None:
         return False
 
     world_size = get_tensor_model_parallel_world_size()
@@ -394,10 +400,9 @@ def flashinfer_allreduce_residual_rmsnorm(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: (norm_output, residual_output)
     """
-    if not is_flashinfer_available() or not _unified_allreduce:
+    if not is_flashinfer_available():
         logger.debug(
-            "FlashInfer unified API not available, falling back to standard "
-            "implementation"
+            "FlashInfer not available, falling back to standard implementation"
         )
         return None, None
 
