@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 _flashinfer_comm = None
 _workspace_manager = None
+_flashinfer_allreduce_unavailable = False
 
 if is_flashinfer_available():
     try:
@@ -28,11 +29,13 @@ if is_flashinfer_available():
         ):
             _flashinfer_comm = comm
         else:
+            _flashinfer_allreduce_unavailable = True
             logger.warning(
                 "flashinfer.comm unified allreduce_fusion API is not available, "
                 "falling back to standard implementation"
             )
     except ImportError:
+        _flashinfer_allreduce_unavailable = True
         logger.warning(
             "flashinfer.comm is not available, falling back to standard "
             "implementation"
@@ -56,6 +59,10 @@ def _create_mnnvl_comm_backend():
         return None
 
     return create_mnnvl_comm_backend(tp_group)
+
+
+def is_flashinfer_allreduce_unavailable() -> bool:
+    return _flashinfer_allreduce_unavailable
 
 
 class FlashInferWorkspaceManager:
@@ -88,7 +95,7 @@ class FlashInferWorkspaceManager:
 
         if _flashinfer_comm is None:
             logger.warning(
-                "FlashInfer comm not available, skipping workspace " "initialization"
+                "FlashInfer comm not available, skipping workspace initialization"
             )
             return
 
@@ -118,9 +125,11 @@ class FlashInferWorkspaceManager:
                 **workspace_kwargs
             )
         except Exception as e:
+            global _flashinfer_allreduce_unavailable
+            _flashinfer_allreduce_unavailable = True
             logger.warning(
                 "Failed to initialize FlashInfer workspace: %s. "
-                "Disabling FlashInfer allreduce fusion for this run.",
+                "Disabling flashinfer allreduce fusion permanently.",
                 e,
             )
             self.workspace = None
@@ -212,6 +221,9 @@ def ensure_workspace_initialized(
     use_oneshot: Optional[bool] = None,
 ):
     """Ensure workspace is initialized"""
+    if _flashinfer_allreduce_unavailable:
+        return False
+
     if not is_flashinfer_available() or _flashinfer_comm is None:
         return False
     if _workspace_manager.disabled:
@@ -297,7 +309,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     """
     if not is_flashinfer_available() or _flashinfer_comm is None:
         logger.debug(
-            "FlashInfer not available, falling back to standard " "implementation"
+            "FlashInfer not available, falling back to standard implementation"
         )
         return None, None
 
