@@ -43,12 +43,32 @@ _FI_ALLREDUCE_MAX_SIZE_MB: dict[int, dict[int, float]] = {
     },
 }
 
+# Keep this as a plain Python lookup: should_use_fi_ar() runs in the piecewise
+# torch.compile path, and helpers like torch._utils._element_size() (or creating
+# a temporary tensor just to query element_size()) can trigger Dynamo graph
+# breaks there.
+#
+# This table is intentionally limited to the dtypes supported by FlashInfer
+# allreduce, rather than all possible torch dtypes.
+_DTYPE_ELEMENT_SIZES: dict[torch.dtype, int] = {
+    torch.float16: 2,
+    torch.bfloat16: 2,
+    torch.float32: 4,
+}
+
 
 def _get_device_capability() -> Optional[int]:
     if not torch.cuda.is_available():
         return None
     major, minor = torch.cuda.get_device_capability()
     return major * 10 + minor
+
+
+def _get_dtype_element_size(dtype: torch.dtype) -> int:
+    try:
+        return _DTYPE_ELEMENT_SIZES[dtype]
+    except KeyError as e:
+        raise ValueError(f"Unsupported dtype for FlashInfer allreduce: {dtype}") from e
 
 
 class FlashInferAllReduce:
@@ -103,7 +123,7 @@ class FlashInferAllReduce:
         assert self.max_workspace_size is not None
         if hidden_dim <= 0:
             return 0
-        element_size = torch._utils._element_size(dtype)
+        element_size = _get_dtype_element_size(dtype)
         return self.max_workspace_size // (hidden_dim * element_size)
 
     def _can_fit_workspace(
