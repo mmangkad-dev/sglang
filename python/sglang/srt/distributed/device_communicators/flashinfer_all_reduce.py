@@ -99,6 +99,24 @@ class FlashInferAllReduce:
         self.max_workspace_size = int(self.max_workspace_size * MiB)
         self.disabled = False
 
+    def _max_tokens_for(self, hidden_dim: int, dtype: torch.dtype) -> int:
+        assert self.max_workspace_size is not None
+        if hidden_dim <= 0:
+            return 0
+        element_size = torch._utils._element_size(dtype)
+        return self.max_workspace_size // (hidden_dim * element_size)
+
+    def _can_fit_workspace(
+        self,
+        num_tokens: int,
+        hidden_dim: int,
+        dtype: torch.dtype,
+    ) -> bool:
+        if self.max_workspace_size is None:
+            return False
+        max_tokens = self._max_tokens_for(hidden_dim, dtype)
+        return max_tokens > 0 and num_tokens <= max_tokens
+
     def _create_workspace(
         self,
         max_token_num: int,
@@ -151,9 +169,7 @@ class FlashInferAllReduce:
                     )
             self.destroy()
 
-        assert self.max_workspace_size is not None
-        element_size = torch.tensor([], dtype=dtype, device="cpu").element_size()
-        max_tokens = self.max_workspace_size // (hidden_dim * element_size)
+        max_tokens = self._max_tokens_for(hidden_dim, dtype)
         if max_tokens <= 0 or num_tokens > max_tokens:
             return False
 
@@ -185,15 +201,34 @@ class FlashInferAllReduce:
             return False
 
         num_tokens, hidden_dim = input_tensor.shape
-        return self._ensure_workspace(num_tokens, hidden_dim, input_tensor.dtype)
+        return self._can_fit_workspace(num_tokens, hidden_dim, input_tensor.dtype)
 
     def all_reduce(self, input_tensor: torch.Tensor) -> torch.Tensor:
         assert _flashinfer_comm is not None
-        return _flashinfer_comm.allreduce_fusion(
-            input=input_tensor,
-            workspace=self.workspace,
-            pattern=_flashinfer_comm.AllReduceFusionPattern.kAllReduce,
-        )
+        if not self.should_use_fi_ar(input_tensor):
+            raise RuntimeError(
+                "FlashInfer allreduce was invoked for an unsupported tensor shape."
+            )
+
+        num_tokens, hidden_dim = input_tensor.shape
+        if not self._ensure_workspace(num_tokens, hidden_dim, input_tensor.dtype):
+            raise RuntimeError("FlashInfer allreduce workspace initialization failed.")
+
+        try:
+            return _flashinfer_comm.allreduce_fusion(
+                input=input_tensor,
+                workspace=self.workspace,
+                pattern=_flashinfer_comm.AllReduceFusionPattern.kAllReduce,
+            )
+        except Exception as e:
+            logger.warning(
+                "FlashInfer allreduce execution failed: %s. "
+                "Disabling FlashInfer allreduce.",
+                e,
+            )
+            self.destroy()
+            self.disabled = True
+            raise RuntimeError("FlashInfer allreduce execution failed.") from e
 
     def destroy(self):
         if self.workspace is not None:

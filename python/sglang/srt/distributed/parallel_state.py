@@ -752,7 +752,10 @@ class GroupCoordinator:
             assert not qr_comm.disabled
             out = qr_comm.quick_all_reduce(input_)
         elif outplace_all_reduce_method == "flashinfer":
-            assert not fi_ar_comm.disabled
+            if fi_ar_comm.disabled:
+                raise RuntimeError(
+                    "FlashInfer allreduce was selected, but the communicator is disabled."
+                )
             out = fi_ar_comm.all_reduce(input_)
         elif outplace_all_reduce_method == "torch_symm_mem":
             assert not torch_symm_mem_comm.disabled
