@@ -218,4 +218,5 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
+git_describe_command = ["python", "python/sglang/_versioning.py", "describe"]
+fallback_version = "0.0.0.dev0"

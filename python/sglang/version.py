@@ -9,13 +9,21 @@ except ImportError:
     except Exception:
         try:
             import pathlib
+            import sys
 
             from setuptools_scm import get_version
 
-            # point to the directory containing pyproject.toml.
-            project_root = pathlib.Path(__file__).parent.parent.parent
+            # Point to the repository root above python/ so source checkouts and
+            # editable installs follow the same version logic as wheel builds.
+            project_root = pathlib.Path(__file__).resolve().parent.parent.parent
             __version__ = get_version(
-                root=str(project_root), fallback_version="0.0.0.dev0"
+                root=str(project_root),
+                fallback_version="0.0.0.dev0",
+                git_describe_command=[
+                    sys.executable,
+                    str(pathlib.Path(__file__).resolve().with_name("_versioning.py")),
+                    "describe",
+                ],
             )
             __version_tuple__ = tuple(__version__.split("."))
         except Exception:
