@@ -517,6 +517,7 @@ class ServerArgs:
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
+    disable_flashinfer_allreduce_fusion: bool = False
     enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
@@ -2055,6 +2056,10 @@ class ServerArgs:
             and self.moe_a2a_backend == "none"
         ):
             self.enable_flashinfer_allreduce_fusion = True
+
+        # Apply explicit disable override after all auto-enable logic
+        if self.disable_flashinfer_allreduce_fusion:
+            self.enable_flashinfer_allreduce_fusion = False
 
     def _handle_mamba_radix_cache(
         self,
@@ -4746,6 +4751,13 @@ class ServerArgs:
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
             help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
+        )
+        parser.add_argument(
+            "--disable-flashinfer-allreduce-fusion",
+            action="store_true",
+            help="Disable FlashInfer allreduce fusion even if it was auto-enabled. "
+            "Use this to work around illegal memory access errors during CUDA graph "
+            "capture with TP>1.",
         )
         parser.add_argument(
             "--enable-aiter-allreduce-fusion",
