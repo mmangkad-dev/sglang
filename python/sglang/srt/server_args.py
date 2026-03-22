@@ -1695,13 +1695,6 @@ class ServerArgs:
 
             quant_method = get_quantization_config(hf_config)
             is_mxfp4_quant_format = quant_method == "mxfp4"
-            if is_blackwell_supported():
-                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
-                if not self.enable_dp_attention and self.nnodes == 1:
-                    self.enable_flashinfer_allreduce_fusion = True
-                    logger.info(
-                        "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
-                    )
             if not self.enable_dp_attention and self.nnodes == 1 and is_hip():
                 # TODO (Hubert): Put this back later
                 # self.enable_aiter_allreduce_fusion = True
@@ -2044,7 +2037,7 @@ class ServerArgs:
             )
 
         # TRTLLM AllReduce Fusion supports SM90/100, enable it by default
-        # for models with explicit support (DeepseekV3, GptOss, Glm4Moe, Qwen3Moe)
+        # for models with explicit support (DeepseekV3, Glm4Moe, Qwen3Moe)
         # TODO: currently, it is only supported in the single node scenario. https://github.com/flashinfer-ai/flashinfer/issues/2006
         # TODO: there is currently a bug on H20 device specifically, https://github.com/flashinfer-ai/flashinfer/issues/2204
         device_name = get_device_name()
@@ -2056,7 +2049,6 @@ class ServerArgs:
             and model_arch
             in [
                 "DeepseekV3ForCausalLM",
-                "GptOssForCausalLM",
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
                 "Qwen3MoeForCausalLM",
