@@ -307,7 +307,7 @@ mark_step_done "Install extra dependency"
 # Fix other dependencies
 # ------------------------------------------------------------------------------
 # Fix CUDA version mismatch between torch and torchaudio.
-# PyPI's torch 2.9.1 bundles cu128 but torchaudio from pytorch.org/cu129 uses cu129.
+# PyPI's torch 2.11.0 bundles cu128 but torchaudio from pytorch.org/cu129 uses cu129.
 # This mismatch causes torchaudio's C extension to fail loading, producing:
 #   "partially initialized module 'torchaudio' has no attribute 'lib'"
 # We cannot replace torch with cu129 (breaks sgl_kernel ABI), so instead we reinstall
@@ -322,21 +322,7 @@ if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
     $PIP_CMD install "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_VER}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 fi
 
-# Fix dependencies: DeepEP depends on nvshmem 3.4.5 — skip reinstall when already correct (avoids pip races / wasted work)
-INSTALLED_NVSHMEM=$(pip show nvidia-nvshmem-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-if [ "$INSTALLED_NVSHMEM" = "3.4.5" ]; then
-    echo "nvidia-nvshmem-cu12==3.4.5 already installed, skipping reinstall"
-else
-    $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 $PIP_INSTALL_SUFFIX
-fi
-
-# Fix dependencies: Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
-INSTALLED_CUDNN=$(pip show nvidia-cudnn-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-if [ "$INSTALLED_CUDNN" = "9.16.0.29" ]; then
-    echo "nvidia-cudnn-cu12==9.16.0.29 already installed, skipping reinstall"
-else
-    $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 $PIP_INSTALL_SUFFIX
-fi
+# nvshmem and cudnn are bundled with torch 2.11.0
 
 mark_step_done "Fix other dependencies"
 

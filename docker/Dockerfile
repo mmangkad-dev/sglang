@@ -222,8 +222,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # DeepEP
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
 # TODO: move from Tom's branch to DeepEP hybrid-ep branch
-# We use the nvshmem version that ships with torch 2.9.1
-# CU12 uses 3.3.20 and CU13 uses 3.3.24
+# nvshmem 3.4.5 is bundled with torch 2.11.0
 RUN set -eux; \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
       git clone https://github.com/fzyzcjy/DeepEP.git && \
@@ -324,18 +323,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
    python3 -m pip install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --force-reinstall --no-deps;
 
-# Patching packages for CUDA 12/13 compatibility
-# TODO: Remove when torch version covers these packages
+# Install cuda-python for CUDA 12/13
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-    python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps ; \
-    python3 -m pip install cuda-python==12.9 ; \
+    python3 -m pip install "cuda-python>=12,<13" ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-    python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cudnn-cu13==9.16.0.29 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
     python3 -m pip install nixl-cu13 --no-deps ; \
-    python3 -m pip install cuda-python==13.2.0 ; \
+    python3 -m pip install "cuda-python>=13,<14" ; \
 fi
 
 # Install development tools
