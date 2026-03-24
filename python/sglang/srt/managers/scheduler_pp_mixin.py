@@ -28,6 +28,9 @@ from sglang.srt.managers.utils import (
     get_logprob_from_pp_outputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.models.deepseek_common.index_cache import (
+    get_index_cache_topk_buffer_width,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 
@@ -618,6 +621,15 @@ class SchedulerPPMixin:
                         device="cuda",
                     ),
                 }
+                index_cache_topk_width = get_index_cache_topk_buffer_width(
+                    model_config.hf_config
+                )
+                if index_cache_topk_width is not None:
+                    proxy_tensors["topk_indices"] = torch.zeros(
+                        (current_seq_len, index_cache_topk_width),
+                        dtype=torch.int64,
+                        device="cuda",
+                    )
 
                 pp_proxy = PPProxyTensors(proxy_tensors)
 

@@ -825,6 +825,8 @@ def model_forward_maybe_tbo(
     input_data_scatter_mode: ScatterMode,
     residual: Optional[torch.Tensor],
     zero_allocator: Optional[BumpAllocator] = None,
+    topk_indices: Optional[torch.Tensor] = None,
+    return_topk_indices: bool = False,
 ):
     inputs = dict(
         positions=positions,
@@ -832,6 +834,7 @@ def model_forward_maybe_tbo(
         forward_batch=forward_batch,
         residual=residual,
         zero_allocator=zero_allocator,
+        **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
     )
     layer_input_scatter_mode = layers[0].layer_scatter_modes.layer_input_mode
     operations_strategy = OperationsStrategy.init_new_tbo(
@@ -843,9 +846,12 @@ def model_forward_maybe_tbo(
             operations_strategy=operations_strategy,
             input_data_scatter_mode=input_data_scatter_mode,
             layer_input_scatter_mode=layer_input_scatter_mode,
+            return_topk_indices=return_topk_indices,
         )
     else:
-        return _model_forward_non_tbo(inputs, operations_strategy)
+        return _model_forward_non_tbo(
+            inputs, operations_strategy, return_topk_indices=return_topk_indices
+        )
 
 
 def _model_forward_tbo(
@@ -853,6 +859,7 @@ def _model_forward_tbo(
     operations_strategy: OperationsStrategy,
     input_data_scatter_mode: ScatterMode,
     layer_input_scatter_mode: ScatterMode,
+    return_topk_indices: bool = False,
 ):
     inputs_arr = _model_forward_tbo_split_inputs(
         **inputs,
@@ -877,11 +884,25 @@ def _model_forward_tbo(
             delta_stages=[0, operations_strategy.tbo_delta_stages],
         )
 
-    return _model_forward_tbo_merge_outputs(*outputs_arr, original_hidden_states_len)
+    return _model_forward_tbo_merge_outputs(
+        *outputs_arr,
+        original_hidden_states_len,
+        return_topk_indices=return_topk_indices,
+    )
 
 
-def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):
+def _model_forward_non_tbo(
+    inputs,
+    operations_strategy: OperationsStrategy,
+    return_topk_indices: bool = False,
+):
     outputs = execute_operations(inputs, operations_strategy.operations)
+    if return_topk_indices:
+        return (
+            outputs["hidden_states"],
+            outputs["residual"],
+            outputs.get("topk_indices"),
+        )
     return outputs["hidden_states"], outputs["residual"]
 
 
@@ -893,6 +914,7 @@ def _model_forward_tbo_split_inputs(
     zero_allocator: Optional[BumpAllocator],
     input_data_scatter_mode: ScatterMode,
     layer_input_scatter_mode: ScatterMode,
+    topk_indices: Optional[torch.Tensor] = None,
 ) -> List[Dict]:
     tbo_splitter_scatter_mode = ScatterMode.TP_ATTN_FULL
     context = CommunicateContext.init_new()
@@ -913,6 +935,7 @@ def _model_forward_tbo_split_inputs(
         positions=positions,
         forward_batch=forward_batch,
         zero_allocator=zero_allocator,
+        topk_indices=topk_indices,
     )
 
     def _post_transform(hidden_states, residual, forward_batch, **kwargs):
@@ -941,6 +964,7 @@ def _model_forward_tbo_split_inputs_raw(
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
     zero_allocator: Optional[BumpAllocator],
+    topk_indices: Optional[torch.Tensor] = None,
 ) -> List[Dict]:
     return [
         dict(
@@ -948,6 +972,7 @@ def _model_forward_tbo_split_inputs_raw(
                 hidden_states=hidden_states,
                 residual=residual,
                 positions=positions,
+                topk_indices=topk_indices,
                 output_forward_batch=output_forward_batch,
                 tbo_subbatch_index=tbo_subbatch_index,
             ),
@@ -967,6 +992,7 @@ def _model_forward_filter_inputs(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     positions: torch.Tensor,
+    topk_indices: Optional[torch.Tensor],
     output_forward_batch: ForwardBatch,
     tbo_subbatch_index: int,
 ) -> Dict:
@@ -974,6 +1000,7 @@ def _model_forward_filter_inputs(
     hidden_states = hidden_states[token_slice]
     residual = None if residual is None else residual[token_slice]
     positions = positions[token_slice]
+    topk_indices = None if topk_indices is None else topk_indices[token_slice]
 
     assert output_forward_batch.tbo_padded_len is not None
     padded_len = output_forward_batch.tbo_padded_len
@@ -994,28 +1021,50 @@ def _model_forward_filter_inputs(
         positions=_pad(positions),
         forward_batch=output_forward_batch,
         tbo_subbatch_index=tbo_subbatch_index,
+        **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
     )
 
 
-def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
+def _model_forward_tbo_merge_outputs(
+    output_a, output_b, original_len, return_topk_indices: bool = False
+):
     def _handle_key(name):
-        value_a = output_a[name]
-        value_b = output_b[name]
-        assert (value_a is None) == (value_b is None)
-        if value_a is None:
-            return None
+        value_a = output_a.get(name)
+        value_b = output_b.get(name)
         s0, t0 = output_a["forward_batch"].tbo_parent_token_range
         s1, t1 = output_b["forward_batch"].tbo_parent_token_range
-        res = torch.zeros(
-            (original_len, *value_a.shape[1:]),
-            dtype=value_a.dtype,
-            device=value_a.device,
-        )
-        res[slice(s0, t0)] = value_a[: t0 - s0]
-        res[slice(s1, t1)] = value_b[: t1 - s1]
+        if value_a is None and (t0 - s0) != 0:
+            raise ValueError(f"Missing `{name}` for a non-empty TBO child output.")
+        if value_b is None and (t1 - s1) != 0:
+            raise ValueError(f"Missing `{name}` for a non-empty TBO child output.")
+        if value_a is None and value_b is None:
+            return None
+
+        template = value_a if value_a is not None else value_b
+        if name == "topk_indices":
+            res = torch.full(
+                (original_len, *template.shape[1:]),
+                -1,
+                dtype=template.dtype,
+                device=template.device,
+            )
+        else:
+            res = torch.zeros(
+                (original_len, *template.shape[1:]),
+                dtype=template.dtype,
+                device=template.device,
+            )
+        if value_a is not None:
+            res[slice(s0, t0)] = value_a[: t0 - s0]
+        if value_b is not None:
+            res[slice(s1, t1)] = value_b[: t1 - s1]
         return res
 
-    return _handle_key("hidden_states"), _handle_key("residual")
+    hidden_states = _handle_key("hidden_states")
+    residual = _handle_key("residual")
+    if not return_topk_indices:
+        return hidden_states, residual
+    return hidden_states, residual, _handle_key("topk_indices")
 
 
 # -------------------------------- Utilities and wrappers ---------------------------------------

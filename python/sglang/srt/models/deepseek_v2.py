@@ -128,6 +128,14 @@ from sglang.srt.models.deepseek_common.attention_forward_methods import (
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
+from sglang.srt.models.deepseek_common.index_cache import (
+    TopkIndices,
+    add_topk_indices_to_pp_proxy_tensors,
+    extract_topk_indices_from_pp_proxy_tensors,
+    get_index_cache_skip_flags,
+    has_reusable_topk_indices,
+    resolve_index_cache_pattern,
+)
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _get_llama_4_scaling,
@@ -1096,6 +1104,7 @@ class DeepseekV2AttentionMLA(
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         skip_rope: bool = False,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -1185,6 +1194,16 @@ class DeepseekV2AttentionMLA(
                 layer_id=layer_id,
                 alt_stream=alt_stream,
             )
+            self.index_cache_pattern = resolve_index_cache_pattern(
+                config, use_nsa=self.use_nsa, is_nextn=is_nextn
+            )
+            self.skip_topk, self.next_skip_topk = get_index_cache_skip_flags(
+                self.index_cache_pattern, 0 if layer_id is None else layer_id
+            )
+        else:
+            self.index_cache_pattern = None
+            self.skip_topk = False
+            self.next_skip_topk = False
 
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
@@ -1308,17 +1327,36 @@ class DeepseekV2AttentionMLA(
         return handler(self, forward_batch)
 
     def op_prepare(self, state):
+        prev_topk_indices = (
+            state.pop("prev_topk_indices")
+            if state.get("prev_topk_indices") is not None
+            else None
+        )
         state.attn_intermediate_state = self.forward_prepare(
             positions=state.positions,
             hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
             forward_batch=state.forward_batch,
             zero_allocator=state.zero_allocator,
+            prev_topk_indices=prev_topk_indices,
         )
 
     def op_core(self, state):
-        state.hidden_states_after_attn = self.forward_core(
-            state.pop("attn_intermediate_state")
-        )
+        hidden_states = self.forward_core(state.pop("attn_intermediate_state"))
+        if isinstance(hidden_states, tuple):
+            hidden_states, topk_indices = hidden_states
+            if topk_indices is not None:
+                state.topk_indices_after_attn = topk_indices
+        state.hidden_states_after_attn = hidden_states
+
+    def _require_prev_topk_indices(
+        self, prev_topk_indices: Optional[TopkIndices]
+    ) -> TopkIndices:
+        if not has_reusable_topk_indices(prev_topk_indices):
+            raise ValueError(
+                f"Layer {self.layer_id} is configured as a shared IndexCache layer "
+                "but no reusable top-k indices were provided from the previous full layer."
+            )
+        return prev_topk_indices
 
     def forward(
         self,
@@ -1328,6 +1366,7 @@ class DeepseekV2AttentionMLA(
         zero_allocator: BumpAllocator,
         layer_scatter_modes: LayerScatterModes = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[TopkIndices] = None,
     ):
         s = self.forward_prepare(
             positions=positions,
@@ -1336,6 +1375,7 @@ class DeepseekV2AttentionMLA(
             zero_allocator=zero_allocator,
             layer_scatter_modes=layer_scatter_modes,
             llama_4_scaling=llama_4_scaling,
+            prev_topk_indices=prev_topk_indices,
         )
         return self.forward_core(s)
 
@@ -1347,6 +1387,7 @@ class DeepseekV2AttentionMLA(
         zero_allocator: BumpAllocator,
         layer_scatter_modes: LayerScatterModes = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[TopkIndices] = None,
     ):
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
@@ -1386,7 +1427,12 @@ class DeepseekV2AttentionMLA(
             )
         elif attn_forward_method == AttnForwardMethod.MLA:
             inner_state = self.forward_absorb_prepare(
-                positions, hidden_states, forward_batch, zero_allocator, llama_4_scaling
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                llama_4_scaling,
+                prev_topk_indices,
             )
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_ROCM:
             inner_state = self.forward_absorb_fused_mla_rope_prepare(
@@ -1422,6 +1468,7 @@ class DeepseekV2AttentionMLA(
                 forward_batch,
                 zero_allocator,
                 layer_scatter_modes,
+                prev_topk_indices=prev_topk_indices,
             )
         else:
             raise NotImplementedError
@@ -1547,6 +1594,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             reduce_results=False,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
+            is_nextn=is_nextn,
         )
         if not hasattr(config, "q_lora_rank") and envs.SGLANG_USE_AG_AFTER_QLORA.get():
             raise ValueError(
@@ -1633,6 +1681,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         gemm_output_zero_allocator: BumpAllocator = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[TopkIndices] = None,
     ) -> torch.Tensor:
         quant_format = (
             "mxfp4"
@@ -1675,7 +1724,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
             llama_4_scaling=llama_4_scaling,
             layer_scatter_modes=self.layer_scatter_modes,
+            prev_topk_indices=prev_topk_indices,
         )
+        if isinstance(hidden_states, tuple):
+            hidden_states, topk_indices = hidden_states
+        else:
+            topk_indices = None
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -1711,7 +1765,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
-        return hidden_states, residual
+        return hidden_states, residual, topk_indices
 
     def op_comm_prepare_attn(
         self,
@@ -1722,6 +1776,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
         tbo_subbatch_index: Optional[int] = None,
+        topk_indices: Optional[TopkIndices] = None,
     ):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
             self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
@@ -1736,6 +1791,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 tbo_subbatch_index=tbo_subbatch_index,
             )
         )
+        if topk_indices is not None:
+            state.prev_topk_indices = topk_indices
 
     def op_comm_prepare_mlp(self, state):
         state.hidden_states_mlp_input, state.residual_after_comm_pre_mlp = (
@@ -1765,6 +1822,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             state.pop("residual_after_comm_pre_mlp"),
             state.forward_batch,
         )
+        topk_indices = (
+            state.pop("topk_indices_after_attn")
+            if state.get("topk_indices_after_attn") is not None
+            else None
+        )
 
         output = dict(
             positions=state.positions,
@@ -1774,6 +1836,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             zero_allocator=state.zero_allocator,
             tbo_subbatch_index=state.tbo_subbatch_index,
         )
+        if topk_indices is not None:
+            output["topk_indices"] = topk_indices
 
         state.clear(
             expect_keys={
@@ -1796,9 +1860,11 @@ class DeepseekV2Model(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.config = config
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
+        self.index_cache_pattern = resolve_index_cache_pattern(config)
         self.pp_group = get_pp_group()
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
@@ -1927,6 +1993,9 @@ class DeepseekV2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        index_cache_pattern = getattr(
+            self, "index_cache_pattern", resolve_index_cache_pattern(self.config)
+        )
         total_num_layers = self.end_layer - self.start_layer
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -1934,10 +2003,12 @@ class DeepseekV2Model(nn.Module):
             else:
                 hidden_states = input_embeds
             residual = None
+            topk_indices = None
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+            topk_indices = extract_topk_indices_from_pp_proxy_tensors(pp_proxy_tensors)
         device = hidden_states.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
@@ -1979,6 +2050,16 @@ class DeepseekV2Model(nn.Module):
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
+        if (
+            hidden_states.shape[0] != 0
+            and not has_reusable_topk_indices(topk_indices)
+            and index_cache_pattern is not None
+            and index_cache_pattern[self.start_layer] == "S"
+        ):
+            raise ValueError(
+                "This pipeline-parallel stage starts with a shared IndexCache layer, "
+                "but no top-k indices were received from the previous stage."
+            )
         if forward_batch.can_run_tbo:
             if (
                 self.first_k_dense_replace > normal_start_layer
@@ -2005,7 +2086,7 @@ class DeepseekV2Model(nn.Module):
                     else:
                         aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
-                hidden_states, residual = layer(
+                hidden_states, residual, topk_indices = layer(
                     positions,
                     hidden_states,
                     forward_batch,
@@ -2013,10 +2094,11 @@ class DeepseekV2Model(nn.Module):
                     zero_allocator,
                     gemm_output_zero_allocator,
                     llama_4_scaling,
+                    prev_topk_indices=topk_indices,
                 )
 
         if normal_end_layer != self.end_layer:
-            hidden_states, residual = model_forward_maybe_tbo(
+            hidden_states, residual, topk_indices = model_forward_maybe_tbo(
                 layers=self.layers[normal_end_layer : self.end_layer],
                 enable_tbo=True,
                 positions=positions,
@@ -2027,15 +2109,17 @@ class DeepseekV2Model(nn.Module):
                     normal_end_layer - 1
                 ].layer_scatter_modes.layer_output_mode,
                 zero_allocator=zero_allocator,
+                topk_indices=topk_indices,
+                return_topk_indices=True,
             )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            proxy_tensors = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+            }
+            add_topk_indices_to_pp_proxy_tensors(proxy_tensors, topk_indices)
+            return PPProxyTensors(proxy_tensors)
         else:
             if not forward_batch.forward_mode.is_idle():
                 if residual is None:

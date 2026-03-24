@@ -148,6 +148,9 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_common.index_cache import (
+    get_index_cache_topk_buffer_width,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
@@ -2072,6 +2075,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
+            pp_proxy_topk_indices_width=get_index_cache_topk_buffer_width(
+                self.model_config.hf_config
+            ),
         )
         buffers.num_token_non_padded[...] = num_tokens
 

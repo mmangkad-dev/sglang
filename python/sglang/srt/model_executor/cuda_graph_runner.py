@@ -64,6 +64,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.models.deepseek_common.index_cache import (
+    get_index_cache_topk_buffer_width,
+)
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.utils import (
     empty_context,
@@ -159,6 +162,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
+        pp_proxy_topk_indices_width: Optional[int] = None,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -191,6 +195,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
                     "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype),
                     "residual": torch.zeros((max_bs, hidden_size), dtype=dtype),
                 }
+                if pp_proxy_topk_indices_width is not None:
+                    pp_proxy_tensors["topk_indices"] = torch.zeros(
+                        (max_bs, pp_proxy_topk_indices_width),
+                        dtype=torch.int64,
+                    )
             else:
                 pp_proxy_tensors = None
 
@@ -339,8 +348,28 @@ class DecodeInputBuffers(ForwardInputBuffers):
         # Pipeline-parallel proxy tensors.
         if pp_proxy_tensors is not None and self.pp_proxy_tensors is not None:
             for key, buf in self.pp_proxy_tensors.items():
-                src = pp_proxy_tensors.tensors[key]
+                src = pp_proxy_tensors.tensors.get(key)
+                if src is None:
+                    if key.startswith("topk_indices"):
+                        buf[:raw_num_token].fill_(-1)
+                    else:
+                        buf[:raw_num_token].zero_()
+                    continue
                 dim = src.shape[0]
+                if src.shape[1:] != buf.shape[1:]:
+                    if (
+                        key.startswith("topk_indices")
+                        and src.ndim == buf.ndim == 2
+                        and src.shape[1] <= buf.shape[1]
+                    ):
+                        buf[:dim].fill_(-1)
+                        dsts.append(buf[:dim, : src.shape[1]])
+                        srcs.append(src)
+                        continue
+                    raise ValueError(
+                        f"Shape mismatch for pipeline proxy tensor `{key}`: "
+                        f"expected trailing shape {buf.shape[1:]}, got {src.shape[1:]}."
+                    )
                 dsts.append(buf[:dim])
                 srcs.append(src)
 
@@ -626,6 +655,9 @@ class CudaGraphRunner:
             enable_mamba_track=enable_mamba_track,
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
+            ),
+            pp_proxy_topk_indices_width=get_index_cache_topk_buffer_width(
+                self.model_runner.model_config.hf_config
             ),
         )
         self.buffers.share_buffers()
