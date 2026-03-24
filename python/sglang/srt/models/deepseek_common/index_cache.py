@@ -132,12 +132,24 @@ def get_index_cache_topk_buffer_width(config: Any) -> Optional[int]:
     return ceil_align(_get_config_attr(config, "index_topk"), 2048)
 
 
+def _is_graph_capture_mode() -> bool:
+    try:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+    except Exception:
+        return False
+    return get_is_capture_mode()
+
+
 def has_reusable_topk_indices(topk_indices: Optional[TopkIndices]) -> bool:
     if topk_indices is None:
         return False
     if isinstance(topk_indices, tuple):
         return any(has_reusable_topk_indices(item) for item in topk_indices)
-    return topk_indices.numel() > 0 and bool((topk_indices != -1).any().item())
+    if topk_indices.numel() == 0:
+        return False
+    if _is_graph_capture_mode():
+        return True
+    return bool((topk_indices != -1).any().item())
 
 
 def extract_topk_indices_from_pp_proxy_tensors(

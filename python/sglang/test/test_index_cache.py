@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -110,6 +111,15 @@ class TestIndexCache(unittest.TestCase):
         self.assertTrue(
             has_reusable_topk_indices(torch.tensor([[0, -1, -1]], dtype=torch.int64))
         )
+
+    def test_has_reusable_topk_indices_skips_content_check_during_capture(self):
+        with mock.patch(
+            "sglang.srt.models.deepseek_common.index_cache._is_graph_capture_mode",
+            return_value=True,
+        ):
+            self.assertTrue(
+                has_reusable_topk_indices(torch.full((2, 4), -1, dtype=torch.int64))
+            )
 
 
 if __name__ == "__main__":
