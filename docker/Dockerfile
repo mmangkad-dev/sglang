@@ -264,7 +264,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
             ;; \
     esac && \
     if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-        sed -i "/^    include_dirs = \['csrc\/'\]/a\\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
+        sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
     fi && \
     TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --no-build-isolation .
 
