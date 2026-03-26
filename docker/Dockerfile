@@ -39,35 +39,37 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
     sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
 fi
 
-# Python setup (combined with apt update to reduce layers)
-RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    apt update && apt install -y --no-install-recommends wget software-properties-common \
-    && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt install -y --no-install-recommends python3.12-full python3.12-dev python3.10-venv \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
-    && update-alternatives --set python3 /usr/bin/python3.12 \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
-    && python3 get-pip.py --break-system-packages \
-    && rm get-pip.py \
-    # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
-    && python3 -m pip config set global.break-system-packages true \
-    # Fix for apt-add-repository
-    && cd /usr/lib/python3/dist-packages/ \
-    && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
+# Install uv and create virtual environment with uv's standalone Python
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget \
+    curl \
+    ca-certificates \
+    && curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && /root/.local/bin/uv venv /opt/venv --python 3.12 \
+    && /root/.local/bin/uv pip install --python /opt/venv/bin/python3 pip setuptools wheel \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Set PATH to use venv Python as default (no symlinks needed!)
+ENV PATH="/opt/venv/bin:/root/.local/bin:$PATH" \
+    VIRTUAL_ENV="/opt/venv" \
+    UV_HTTP_TIMEOUT=500 \
+    UV_INDEX_STRATEGY="unsafe-best-match" \
+    UV_LINK_MODE=copy
+
+# Replace pip global cache if specified
+RUN if [ -n "${PIP_DEFAULT_INDEX}" ]; then \
+    pip config set global.index-url ${PIP_DEFAULT_INDEX}; \
+fi
 
 # Install system dependencies (organized by category for better caching)
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     apt-get update && apt-get install -y --no-install-recommends \
     # Core system utilities
-    ca-certificates \
-    software-properties-common \
     netcat-openbsd \
     kmod \
     unzip \
     openssh-server \
-    curl \
-    wget \
     lsof \
     locales \
     # Build essentials (needed for framework stage)
@@ -122,14 +124,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     check \
     libsubunit0 \
     libsubunit-dev \
-    && ln -sf /usr/bin/python3.12 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
-
-# Replace pip global cache if specified
-RUN if [ -n "${PIP_DEFAULT_INDEX}" ]; then \
-    python3 -m pip config set global.index-url ${PIP_DEFAULT_INDEX}; \
-fi
 
 # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
@@ -190,32 +186,32 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
     fi \
     && rm -rf /tmp/local_src
 
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --upgrade pip setuptools wheel html5lib six \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --upgrade pip setuptools wheel html5lib six \
     && cd sglang \
     && case "$CUDA_VERSION" in \
         12.6.1) CUINDEX=126 ;; \
         12.8.1) CUINDEX=128 ;; \
         12.9.1) CUINDEX=129 ;; \
-        13.0.1) CUINDEX=130 ;; \
+        13.0.*) CUINDEX=130 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
-        python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+        uv pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
-        python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} \
+        uv pip install sglang-kernel==${SGL_KERNEL_VERSION} \
     ; \
-    elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
-        python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+    elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+        uv pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     else \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
     ; \
     fi \
-    && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+    && uv pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
-        python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
+        uv pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
     fi \
     && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
@@ -249,7 +245,7 @@ RUN set -eux; \
     fi
 
 # Install DeepEP
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/uv \
     cd /sgl-workspace/DeepEP && \
     case "$CUDA_VERSION" in \
         12.6.1) \
@@ -259,7 +255,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
             # FIXED: 12.8.1 does NOT support Blackwell 10.3 \
             CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
             ;; \
-        12.9.1|13.0.1) \
+        12.9.1|13.0.*) \
             # 12.9.1+ properly supports Blackwell 10.3 \
             CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0;10.3' \
             ;; \
@@ -268,12 +264,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
             ;; \
     esac && \
     if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-        sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
+        sed -i "/^    include_dirs = \['csrc\/'\]/a\\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
     fi && \
     TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --no-build-isolation .
 
 # Install Mooncake
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/uv \
     CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
     if [ "$CUDA_MAJOR" -ge 13 ]; then \
         echo "CUDA >= 13, installing mooncake-transfer-engine from source code"; \
@@ -287,18 +283,18 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         make install; \
     else \
         echo "CUDA < 13, installing mooncake-transfer-engine from pip"; \
-        python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
+        uv pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
     fi
+
 # Install essential Python packages
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install \
     datamodel_code_generator \
     pre-commit \
     pytest \
     black \
     isort \
     icdiff \
-    uv \
     wheel \
     scikit-build-core \
     nixl \
@@ -307,36 +303,37 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     google-cloud-storage
 
 # Build and install sgl-model-gateway (install Rust, build, then remove to save space)
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,target=/root/.cache/uv \
     curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && rustc --version && cargo --version \
-    && python3 -m pip install maturin \
+    && uv pip install maturin \
     && cd /sgl-workspace/sglang/sgl-model-gateway/bindings/python \
     && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
-    && python3 -m pip install --force-reinstall dist/*.whl \
+    && uv pip install --force-reinstall dist/*.whl \
     && cd /sgl-workspace/sglang/sgl-model-gateway \
     && cargo build --release --bin sglang-router --features vendored-openssl \
     && cp target/release/sglang-router /usr/local/bin/sglang-router \
     && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo \
     && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null || true
 
-RUN --mount=type=cache,target=/root/.cache/pip \
-   python3 -m pip install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --force-reinstall --no-deps;
+RUN --mount=type=cache,target=/root/.cache/uv \
+   uv pip install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --force-reinstall --no-deps
 
 # Patching packages for CUDA 12/13 compatibility
 # TODO: Remove when torch version covers these packages
-RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-    python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps ; \
-    python3 -m pip install cuda-python==12.9 ; \
-elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-    python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cudnn-cu13==9.16.0.29 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nixl-cu13 --no-deps ; \
-    python3 -m pip install cuda-python==13.2.0 ; \
-fi
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+        uv pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
+        uv pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps ; \
+        uv pip install cuda-python==12.9 ; \
+    elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+        uv pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
+        uv pip install nvidia-cudnn-cu13==9.16.0.29 --force-reinstall --no-deps ; \
+        uv pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
+        uv pip install nixl-cu13 --no-deps ; \
+        uv pip install cuda-python==13.2.0 ; \
+    fi
 
 # Install development tools
 RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
@@ -378,14 +375,13 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     && rm -rf /var/lib/apt/lists/*
 
 # Install minimal Python dev packages
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --break-system-packages \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install \
     pytest \
     black \
     isort \
     icdiff \
     scikit-build-core \
-    uv \
     pre-commit \
     pandas \
     matplotlib \
@@ -443,12 +439,12 @@ COPY docker/configs/opt/.gitconfig /opt/sglang/.gitconfig
 COPY docker/configs/.zshrc /root/.zshrc
 
 # Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
-RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
-        rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
-        ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
+RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /opt/venv/lib/python3.12/site-packages/triton/backends/nvidia/bin ]; then \
+        rm -f /opt/venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/ptxas && \
+        ln -s /usr/local/cuda/bin/ptxas /opt/venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/ptxas; \
     fi
 
-RUN python3 -m pip install --upgrade "urllib3>=2.6.3"
+RUN uv pip install --upgrade "urllib3>=2.6.3"
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
@@ -488,13 +484,6 @@ ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm
 # Install runtime dependencies (devel base provides gcc/g++/build tools)
 RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     apt-get update && apt-get install -y --no-install-recommends \
-    # Python runtime
-    software-properties-common \
-    && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
-    python3.12-full \
-    python3.12-dev \
-    wget \
     # Core system utilities
     ca-certificates \
     netcat-openbsd \
@@ -532,16 +521,21 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     libnccl-dev \
     # GPG key verification
     gnupg2 \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
-    && update-alternatives --set python3 /usr/bin/python3.12 \
-    && ln -sf /usr/bin/python3.12 /usr/bin/python \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
-    && python3 get-pip.py --break-system-packages \
-    && rm get-pip.py \
-    # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
-    && python3 -m pip config set global.break-system-packages true \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
+
+# Install uv for runtime (optional, for future package installs)
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Copy the entire virtual environment from framework stage
+COPY --from=framework /opt/venv /opt/venv
+
+# Set PATH to use venv Python as default (no symlinks needed!)
+ENV PATH="/opt/venv/bin:/root/.local/bin:$PATH" \
+    VIRTUAL_ENV="/opt/venv" \
+    UV_HTTP_TIMEOUT=500 \
+    UV_INDEX_STRATEGY="unsafe-best-match" \
+    UV_LINK_MODE=copy
 
 # Set up locale
 RUN apt-get update && apt-get install -y --no-install-recommends locales \
@@ -552,16 +546,13 @@ ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
     LC_ALL=en_US.UTF-8
 
-# Copy Python site-packages from framework (contains all built packages)
-COPY --from=framework /usr/local/lib/python3.12/dist-packages /usr/local/lib/python3.12/dist-packages
-
 # Copy SGLang workspace
 COPY --from=framework /sgl-workspace /sgl-workspace
 
 # Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
-RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
-        rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
-        ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
+RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /opt/venv/lib/python3.12/site-packages/triton/backends/nvidia/bin ]; then \
+        rm -f /opt/venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/ptxas && \
+        ln -s /usr/local/cuda/bin/ptxas /opt/venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/ptxas; \
     fi
 
 # Copy GDRCopy runtime libraries (but not the build artifacts)
