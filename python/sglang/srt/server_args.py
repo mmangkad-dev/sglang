@@ -517,8 +517,7 @@ class ServerArgs:
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
-    enable_flashinfer_allreduce_fusion: bool = False
-    disable_flashinfer_allreduce_fusion: bool = False
+    enable_flashinfer_allreduce_fusion: Optional[bool] = None
     enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
@@ -779,12 +778,8 @@ class ServerArgs:
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
-        if self.disable_flashinfer_allreduce_fusion:
+        if self.enable_flashinfer_allreduce_fusion is None:
             self.enable_flashinfer_allreduce_fusion = False
-            logger.info(
-                "FlashInfer allreduce fusion is disabled via "
-                "--disable-flashinfer-allreduce-fusion."
-            )
 
         # Set kernel backends.
         self._handle_sampling_backend()
@@ -1711,7 +1706,11 @@ class ServerArgs:
             is_mxfp4_quant_format = quant_method == "mxfp4"
             if is_blackwell_supported():
                 # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
-                if not self.enable_dp_attention and self.nnodes == 1:
+                if (
+                    self.enable_flashinfer_allreduce_fusion is None
+                    and not self.enable_dp_attention
+                    and self.nnodes == 1
+                ):
                     self.enable_flashinfer_allreduce_fusion = True
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
@@ -2066,7 +2065,7 @@ class ServerArgs:
             device_name and "H20" in device_name and "H200" not in device_name
         )
         if (
-            not self.enable_flashinfer_allreduce_fusion
+            self.enable_flashinfer_allreduce_fusion is None
             and model_arch
             in [
                 "DeepseekV3ForCausalLM",
@@ -4843,14 +4842,18 @@ class ServerArgs:
             default=ServerArgs.flashinfer_mxfp4_moe_precision,
             help="Choose the computation precision of flashinfer mxfp4 moe",
         )
-        parser.add_argument(
+        allreduce_fusion_group = parser.add_mutually_exclusive_group()
+        allreduce_fusion_group.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
+            dest="enable_flashinfer_allreduce_fusion",
+            default=None,
             help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
-        parser.add_argument(
+        allreduce_fusion_group.add_argument(
             "--disable-flashinfer-allreduce-fusion",
-            action="store_true",
+            action="store_false",
+            dest="enable_flashinfer_allreduce_fusion",
             help="Disable FlashInfer allreduce fusion.",
         )
         parser.add_argument(
