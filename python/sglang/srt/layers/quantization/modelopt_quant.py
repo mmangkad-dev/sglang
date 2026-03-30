@@ -32,7 +32,11 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.fp4_utils import (
+    get_fp4_gemm_runner_backend,
+    process_pytorch_scaled_mm_output,
+    pytorch_fp4_gemm_supported,
+)
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
@@ -142,6 +146,51 @@ def fp4_gemm(
         )
     else:
         return cutlass_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
+
+
+def _apply_nvfp4_linear_pytorch(
+    *,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output_dtype: torch.dtype,
+    output_shape: list[int],
+    output_size: int,
+    bias: torch.Tensor | None,
+    fp4_quantize_fn=fp4_quantize,
+) -> torch.Tensor:
+    """Run NVFP4 GEMM through PyTorch torch._scaled_mm with runtime input quantization."""
+    assert pytorch_fp4_gemm_supported(), (
+        "PyTorch NVFP4 backend requires torch._scaled_mm and "
+        "torch.float4_e2m1fn_x2 support."
+    )
+    assert output_dtype == torch.bfloat16, (
+        "PyTorch NVFP4 backend only supports bfloat16 outputs because fp16 can "
+        "overflow before the external alpha correction is applied."
+    )
+
+    x_fp4, x_scale_interleaved = fp4_quantize_fn(x, input_global_scale)
+
+    if weight.dtype == torch.uint8:
+        weight = weight.view(torch.float4_e2m1fn_x2)
+
+    out = torch._scaled_mm(
+        x_fp4.view(torch.float4_e2m1fn_x2),
+        weight.T,
+        scale_a=x_scale_interleaved.reshape(-1),
+        scale_b=weight_scale.reshape(-1),
+        out_dtype=output_dtype,
+    )
+    out = process_pytorch_scaled_mm_output(out)
+    out = out * alpha
+    out = slice_nvfp4_output(out, output_size)
+
+    if bias is not None:
+        out = out + bias
+
+    return out.view(*output_shape)
 
 
 if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
@@ -1358,6 +1407,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
+        fp4_backend = get_fp4_gemm_runner_backend()
 
         # Keep per-shard scales intact for hot reload; derive scalar params below.
         copy_or_rebind_param(
@@ -1370,7 +1420,22 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         # Store original output size before any padding
         layer.output_size_per_partition = layer.weight.shape[0]
 
-        if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
+        if fp4_backend.is_pytorch():
+            if not pytorch_fp4_gemm_supported():
+                raise ValueError(
+                    "PyTorch NVFP4 backend requires torch._scaled_mm and "
+                    "torch.float4_e2m1fn_x2 support."
+                )
+            layer.weight_pytorch = layer.weight.data.view(torch.float4_e2m1fn_x2)
+            copy_or_rebind_param(
+                layer,
+                "weight_scale_interleaved",
+                swizzle_blockscale(layer.weight_scale),
+            )
+            layer.weights_padding_cols = 0
+            return
+
+        if fp4_backend.is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
             # layout but we use our own quantization so we have to call
@@ -1458,11 +1523,25 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         output_dtype = x.dtype
         x_m, _ = x.shape
+        fp4_backend = get_fp4_gemm_runner_backend()
 
         # Get original output size (before padding) and padded weight size
         output_size = layer.output_size_per_partition
         w_n, _ = layer.weight.shape
         output_shape = [x_m, output_size]
+
+        if fp4_backend.is_pytorch():
+            return _apply_nvfp4_linear_pytorch(
+                x=x,
+                weight=getattr(layer, "weight_pytorch", layer.weight),
+                weight_scale=layer.weight_scale_interleaved,
+                input_global_scale=layer.input_scale_inv,
+                alpha=layer.alpha,
+                output_dtype=output_dtype,
+                output_shape=output_shape,
+                output_size=output_size,
+                bias=bias,
+            )
 
         # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)

@@ -216,6 +216,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cudnn",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
+    "pytorch",
 ]
 
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16", "float16"]
@@ -4677,7 +4678,8 @@ class ServerArgs:
             "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutlass otherwise), "
             "'flashinfer_cutlass' (CUTLASS backend), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
-            "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). ",
+            "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling), "
+            "'pytorch' (PyTorch torch._scaled_mm backend; requires PyTorch float4 support and bfloat16 activations). ",
         )
         parser.add_argument(
             "--disable-flashinfer-autotune",

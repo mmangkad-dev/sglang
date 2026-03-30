@@ -4,6 +4,8 @@ import logging
 from enum import Enum
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
@@ -19,6 +21,7 @@ class Fp4GemmRunnerBackend(Enum):
     FLASHINFER_CUDNN = "flashinfer_cudnn"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
+    PYTORCH = "pytorch"
 
     def is_auto(self) -> bool:
         return self == Fp4GemmRunnerBackend.AUTO
@@ -31,6 +34,9 @@ class Fp4GemmRunnerBackend(Enum):
 
     def is_flashinfer_trtllm(self) -> bool:
         return self == Fp4GemmRunnerBackend.FLASHINFER_TRTLLM
+
+    def is_pytorch(self) -> bool:
+        return self == Fp4GemmRunnerBackend.PYTORCH
 
     def get_flashinfer_backend(self) -> str:
         """Get the backend string to pass to FlashInfer's mm_fp4 API.
@@ -48,6 +54,16 @@ class Fp4GemmRunnerBackend(Enum):
 
 
 FP4_GEMM_RUNNER_BACKEND: Fp4GemmRunnerBackend | None = None
+
+
+def pytorch_fp4_gemm_supported() -> bool:
+    return hasattr(torch, "_scaled_mm") and hasattr(torch, "float4_e2m1fn_x2")
+
+
+def process_pytorch_scaled_mm_output(output: torch.Tensor) -> torch.Tensor:
+    if type(output) is tuple and len(output) > 0:
+        return output[0]
+    return output
 
 
 def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
@@ -68,7 +84,24 @@ def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
         else:
             backend = "flashinfer_cutlass"
 
+    if (
+        backend == Fp4GemmRunnerBackend.PYTORCH.value
+        and not pytorch_fp4_gemm_supported()
+    ):
+        raise ValueError(
+            "fp4-gemm-backend=pytorch requires torch._scaled_mm and "
+            "torch.float4_e2m1fn_x2 support."
+        )
+
     FP4_GEMM_RUNNER_BACKEND = Fp4GemmRunnerBackend(backend)
+
+    if FP4_GEMM_RUNNER_BACKEND.is_pytorch():
+        logger.warning(
+            "Using fp4-gemm-backend=pytorch for dense PyTorch NVFP4 GEMM. This backend is "
+            "experimental, currently supports bfloat16 activations/outputs only, "
+            "and may be slower than the FlashInfer cuDNN, FlashInfer CUTLASS, "
+            "or FlashInfer TensorRT-LLM backends."
+        )
 
 
 def get_fp4_gemm_runner_backend() -> Fp4GemmRunnerBackend:
