@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
@@ -30,6 +31,23 @@ def _get_fp4_scalar_type():
     return scalar_types.float4_e2m1f
 
 
+def _swiglu_silu_clamp_mul(x: torch.Tensor, gemm1_limit: float) -> torch.Tensor:
+    gate, up = x.chunk(2, dim=-1)
+    gate = F.silu(gate)
+    gate = gate.clamp(min=None, max=gemm1_limit)
+    up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
+    return gate * up
+
+
+def _swiglu_gpt_oss_sigmoid_alpha(
+    x: torch.Tensor, gemm1_alpha: float, gemm1_limit: float
+) -> torch.Tensor:
+    gate, up = x[..., ::2], x[..., 1::2]
+    gate = gate.clamp(min=None, max=gemm1_limit)
+    up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
+    return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
+
+
 @register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -57,6 +75,8 @@ def fused_marlin_moe(
     w2_global_scale: Optional[torch.Tensor] = None,
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -203,7 +223,17 @@ def fused_marlin_moe(
         is_zp_float=False,
     )
 
-    silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
+    if gemm1_alpha is not None:
+        assert gemm1_limit is not None
+        intermediate_cache2 = _swiglu_gpt_oss_sigmoid_alpha(
+            intermediate_cache1.view(-1, 2 * N), gemm1_alpha, gemm1_limit
+        )
+    elif gemm1_limit is not None:
+        intermediate_cache2 = _swiglu_silu_clamp_mul(
+            intermediate_cache1.view(-1, 2 * N), gemm1_limit
+        )
+    else:
+        silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
 
     if expert_map is not None:
         intermediate_cache3.zero_()

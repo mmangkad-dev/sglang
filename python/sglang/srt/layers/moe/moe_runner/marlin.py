@@ -130,6 +130,8 @@ def fused_experts_none_to_marlin(
         w2_global_scale=quant_info.w2_global_scale,
         w1_bias=quant_info.w13_bias,
         w2_bias=quant_info.w2_bias,
+        gemm1_alpha=runner_config.gemm1_alpha,
+        gemm1_limit=runner_config.gemm1_clamp_limit,
     ).to(hidden_states.dtype)
 
     return StandardCombineInput(
