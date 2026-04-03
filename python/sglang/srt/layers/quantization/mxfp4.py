@@ -450,6 +450,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer):
         if self.use_marlin:
             prepare_moe_mxfp4_layer_for_marlin(layer)
+            torch.cuda.empty_cache()
             return
 
         if self.use_flashinfer:
@@ -812,10 +813,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 global_num_experts=global_num_experts,
             )
             combine_input = self.runner.run(dispatch_output, quant_info)
-            combine_input.hidden_states = combine_input.hidden_states[
-                ..., : self.hidden_size
-            ]
-            return combine_input
+            return combine_input._replace(
+                hidden_states=combine_input.hidden_states[..., : self.hidden_size]
+            )
 
         if self.use_flashinfer:
             # When bf16 mode is enabled, we don't need to quantize the input,
