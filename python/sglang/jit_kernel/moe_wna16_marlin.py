@@ -33,7 +33,7 @@ def _jit_moe_wna16_marlin_module(dtype: torch.dtype) -> Module:
 
 @cache_once
 def _jit_moe_wna16_marlin_fp4_module(dtype: torch.dtype) -> Module:
-    """Separate JIT module with NVFP4 (kFE2M1f) kernel instantiations enabled."""
+    """Separate JIT module with FP4 (NVFP4/MXFP4) kernel paths enabled."""
     args = make_cpp_args(dtype)
     return load_jit(
         "moe_wna16_marlin_fp4",
@@ -152,7 +152,7 @@ def moe_wna16_marlin_gemm(
     b_bias_t = _or_empty(b_bias_or_none, device, a.dtype)
     global_scale_t = _or_empty(global_scale_or_none, device, a.dtype)
 
-    is_fp4 = global_scale_or_none is not None and global_scale_or_none.numel() > 0
+    is_fp4 = b_scales.dtype in [torch.float8_e4m3fn, torch.float8_e8m0fnu]
     if is_fp4:
         module = _jit_moe_wna16_marlin_fp4_module(a.dtype)
     else:
