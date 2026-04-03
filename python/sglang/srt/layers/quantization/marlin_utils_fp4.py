@@ -188,7 +188,12 @@ def prepare_fp4_layer_for_marlin(
 
     part_size_n = layer.output_size_per_partition
     part_size_k = layer.input_size_per_partition
-    param_dtype = layer.params_dtype
+    param_dtype = getattr(layer, "params_dtype", None)
+    if param_dtype is None:
+        # FusedMoE does not natively store params_dtype, so fall back to the
+        # bias dtype when available, otherwise default to bf16.
+        bias = getattr(layer, "w13_weight_bias", None)
+        param_dtype = bias.dtype if bias is not None else torch.bfloat16
 
     weight = getattr(layer, weight_attr)
     assert weight.shape == (part_size_n, part_size_k // 2), (

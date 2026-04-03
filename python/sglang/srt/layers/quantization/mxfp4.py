@@ -342,6 +342,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.with_bias = with_bias
         mxfp4_block = 32
         triton_kernels_padding_alignment = 64
+        layer.params_dtype = params_dtype
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
