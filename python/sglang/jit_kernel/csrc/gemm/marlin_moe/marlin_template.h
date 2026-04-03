@@ -1243,19 +1243,17 @@ __global__ void Marlin(
       }
     }
 
-#ifdef SGL_MOE_MARLIN_FP4
     // Convert FP8 per-group scales to BF16/FP16 before applying them.
-    // Required for kFE2M1f (NVFP4): frag_s holds raw float8_e4m3fn bytes;
-    // without this conversion scale<scalar_t> would misinterpret them as
-    // BF16/FP16, producing NaN/Inf multipliers.
-    if constexpr (w_type == host::kFE2M1f) {
+    // This is required for both:
+    // - NVFP4: scales are float8_e4m3fn
+    // - MXFP4: scales are float8_e8m0fnu
+    if constexpr (s_type == host::kFE4M3fn || s_type == host::kFE8M0fnu) {
       int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
       int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
 
       dequant_fp8_scales<scalar_t2, s_type_id>(s_quant_0, reinterpret_cast<scalar_t2*>(&frag_s[k2]));
       dequant_fp8_scales<scalar_t2, s_type_id>(s_quant_1, reinterpret_cast<scalar_t2*>(&frag_s[k2]) + 2);
     }
-#endif
 
 // We have the m dimension as the inner loop in order to encourage overlapping
 // dequantization and matmul operations.
