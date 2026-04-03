@@ -342,13 +342,25 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         "MoE kernels."
     )
 
-    e = layer.num_local_experts
-    param_dtype = layer.params_dtype
+    def _round_up(x: int, alignment: int) -> int:
+        return ((x + alignment - 1) // alignment) * alignment
 
-    # Derive dimensions from the loaded checkpoint tensors so tensor-parallel
-    # slicing stays correct without introducing extra padding in weight loading.
-    k = layer.w13_weight.shape[2] * 2
-    n = layer.w13_weight.shape[1] // 2
+    e = layer.num_local_experts
+    param_dtype = getattr(layer, "params_dtype", None)
+    if param_dtype is None:
+        bias = getattr(layer, "w13_weight_bias", None)
+        param_dtype = bias.dtype if bias is not None else torch.bfloat16
+
+    # Keep the original checkpoint dimensions for slicing/padding, but repack
+    # into Marlin-friendly shapes. GPT-OSS uses 2880, which Marlin cannot tile
+    # directly for MXFP4; pad K to 256 and N to 128 boundaries.
+    orig_k = layer.w13_weight.shape[2] * 2
+    orig_n = layer.w13_weight.shape[1] // 2
+    k = _round_up(orig_k, 256)
+    n = _round_up(orig_n, 128)
+
+    layer.marlin_hidden_size = k
+    layer.marlin_intermediate_size_per_partition = n
 
     device = layer.w13_weight.device
     perm = torch.empty(0, dtype=torch.int, device=device)
@@ -356,17 +368,24 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     def repack_weight(weight: torch.Tensor, prefix: str) -> torch.Tensor:
         if prefix == "w13":
             size_n, size_k = 2 * n, k
+            orig_size_n, orig_size_k = 2 * orig_n, orig_k
         else:
             size_n, size_k = k, n
+            orig_size_n, orig_size_k = orig_k, orig_n
 
-        assert weight.shape == (e, size_n, size_k // 2), (
-            f"Expected {prefix}_weight shape ({e}, {size_n}, {size_k // 2}), "
+        assert weight.shape == (e, orig_size_n, orig_size_k // 2), (
+            f"Expected {prefix}_weight shape ({e}, {orig_size_n}, {orig_size_k // 2}), "
             f"got {weight.shape}"
         )
 
+        padded = torch.zeros(
+            (e, size_n, size_k // 2), dtype=weight.dtype, device=weight.device
+        )
+        padded[:, :orig_size_n, : orig_size_k // 2] = weight.data
+
         repacked = []
         for i in range(e):
-            qweight = weight.data[i].view(torch.int32).T.contiguous()
+            qweight = padded[i].view(torch.int32).T.contiguous()
             repacked.append(
                 gptq_marlin_repack(
                     b_q_weight=qweight,
@@ -381,14 +400,25 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     def repack_scales(scales: torch.Tensor, prefix: str) -> torch.Tensor:
         if prefix == "w13":
             size_n, size_k = 2 * n, k
+            orig_size_n, orig_size_k = 2 * orig_n, orig_k
         else:
             size_n, size_k = k, n
+            orig_size_n, orig_size_k = orig_k, orig_n
+
+        padded_scales = torch.zeros(
+            (e, size_n, size_k // MXFP4_MARLIN_GROUP_SIZE),
+            dtype=torch.float8_e8m0fnu,
+            device=scales.device,
+        )
+        padded_scales[:, :orig_size_n, : orig_size_k // MXFP4_MARLIN_GROUP_SIZE] = (
+            scales.data.contiguous().view(torch.float8_e8m0fnu)
+        )
 
         processed = []
-        scales = scales.data.contiguous().view(torch.float8_e8m0fnu).to(param_dtype)
+        scales_for_permute = padded_scales.to(param_dtype)
         for i in range(e):
             marlin_scales = marlin_permute_scales(
-                s=scales[i].T.contiguous(),
+                s=scales_for_permute[i].T.contiguous(),
                 size_k=size_k,
                 size_n=size_n,
                 group_size=MXFP4_MARLIN_GROUP_SIZE,
@@ -396,13 +426,19 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             processed.append(mxfp4_marlin_process_scales(marlin_scales))
         return torch.stack(processed).contiguous()
 
-    def repack_bias(bias: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    def repack_bias(
+        bias: Optional[torch.Tensor], padded_width: int
+    ) -> Optional[torch.Tensor]:
         if bias is None:
             return None
+        padded_bias = torch.zeros(
+            (e, padded_width), dtype=bias.dtype, device=bias.device
+        )
+        padded_bias[:, : bias.shape[1]] = bias.data
         permuted = []
         for i in range(e):
             permuted.append(
-                marlin_permute_bias(bias.data[i].to(param_dtype)).contiguous()
+                marlin_permute_bias(padded_bias[i].to(param_dtype)).contiguous()
             )
         return torch.stack(permuted).contiguous()
 
@@ -420,10 +456,10 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     )
 
     if hasattr(layer, "w13_weight_bias") and layer.w13_weight_bias is not None:
-        bias = repack_bias(layer.w13_weight_bias)
+        bias = repack_bias(layer.w13_weight_bias, 2 * n)
         assert bias is not None
         layer.w13_weight_bias = torch.nn.Parameter(bias, requires_grad=False)
     if hasattr(layer, "w2_weight_bias") and layer.w2_weight_bias is not None:
-        bias = repack_bias(layer.w2_weight_bias)
+        bias = repack_bias(layer.w2_weight_bias, k)
         assert bias is not None
         layer.w2_weight_bias = torch.nn.Parameter(bias, requires_grad=False)

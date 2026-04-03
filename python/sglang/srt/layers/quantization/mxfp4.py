@@ -779,6 +779,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if self.use_marlin:
             from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 
+            marlin_hidden_size = getattr(layer, "marlin_hidden_size", x.shape[-1])
+            if marlin_hidden_size > x.shape[-1]:
+                x = torch.nn.functional.pad(
+                    x,
+                    (0, marlin_hidden_size - x.shape[-1]),
+                    mode="constant",
+                    value=0.0,
+                )
+                dispatch_output.hidden_states = x
+
             expert_map = None
             global_num_experts = -1
             if hasattr(layer, "dispatcher") and hasattr(
@@ -801,7 +811,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 expert_map=expert_map,
                 global_num_experts=global_num_experts,
             )
-            return self.runner.run(dispatch_output, quant_info)
+            combine_input = self.runner.run(dispatch_output, quant_info)
+            combine_input.hidden_states = combine_input.hidden_states[
+                ..., : self.hidden_size
+            ]
+            return combine_input
 
         if self.use_flashinfer:
             # When bf16 mode is enabled, we don't need to quantize the input,
