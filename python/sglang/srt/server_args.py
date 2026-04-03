@@ -192,6 +192,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
     "cutlass",
+    "marlin",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -1747,6 +1748,11 @@ class ServerArgs:
                     self.moe_runner_backend = "triton_kernel"
                     logger.warning(
                         "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling triton_kernel MOE kernel."
+                    )
+                elif is_cuda() and is_mxfp4_quant_format:
+                    self.moe_runner_backend = "marlin"
+                    logger.warning(
+                        "Detected CUDA MXFP4 quantization format for GPT-OSS model on a pre-Blackwell GPU, enabling Marlin MXFP4 MOE kernel."
                     )
                 elif (
                     is_hip() and get_bool_env_var("SGLANG_USE_AITER")

@@ -55,6 +55,8 @@ def fused_marlin_moe(
     routed_scaling_factor: Optional[float] = None,
     w1_global_scale: Optional[torch.Tensor] = None,
     w2_global_scale: Optional[torch.Tensor] = None,
+    w1_bias: Optional[torch.Tensor] = None,
+    w2_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -85,9 +87,14 @@ def fused_marlin_moe(
     """
     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
-    # Detect FP4 Marlin mode (when global scales are provided)
-    _is_fp4_marlin = w1_global_scale is not None
-    if _is_fp4_marlin:
+    # Detect FP4 Marlin mode:
+    # - NVFP4 uses float8_e4m3fn per-group scales plus a global scale
+    # - MXFP4 uses float8_e8m0fnu per-group scales without a global scale
+    _is_fp4_marlin = w1_scale.dtype in [
+        torch.float8_e4m3fn,
+        torch.float8_e8m0fnu,
+    ] or (w1_global_scale is not None)
+    if w1_global_scale is not None:
         assert (
             w2_global_scale is not None
         ), "Both w1_global_scale and w2_global_scale must be provided for FP4 Marlin mode"
@@ -171,7 +178,7 @@ def fused_marlin_moe(
         hidden_states,
         intermediate_cache1,
         w1,
-        None,  # b_bias_or_none
+        w1_bias,
         w1_scale,
         w1_global_scale,  # None for INT4/INT8, tensor for FP4 Marlin
         w1_zeros,
@@ -205,7 +212,7 @@ def fused_marlin_moe(
         intermediate_cache2,
         intermediate_cache3,
         w2,
-        None,  # b_bias_or_none
+        w2_bias,
         w2_scale,
         w2_global_scale,  # None for INT4/INT8, tensor for FP4 Marlin
         w2_zeros,

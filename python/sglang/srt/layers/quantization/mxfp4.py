@@ -34,6 +34,9 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    prepare_moe_mxfp4_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -318,6 +321,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
+        self.use_marlin = get_moe_runner_backend().is_marlin()
         self.flashinfer_mxfp4_moe_precision = (
             get_global_server_args().flashinfer_mxfp4_moe_precision
         )
@@ -342,7 +346,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
         intermediate_size_per_partition_after_pad = intermediate_size_per_partition
-        if is_sm100_supported():
+        if self.use_marlin:
+            pass
+        elif is_sm100_supported():
             if self.use_flashinfer:
                 intermediate_size_per_partition_after_pad = round_up(
                     intermediate_size_per_partition, 256
@@ -441,6 +447,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        if self.use_marlin:
+            prepare_moe_mxfp4_layer_for_marlin(layer)
+            return
+
         if self.use_flashinfer:
             # TODO: these values are hardcoded for now, we need to get them from the model
             layer.gemm1_alpha = Parameter(
@@ -743,6 +753,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if self.use_marlin:
+            self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
+            return
         backend = (
             MoeRunnerBackend.TRITON_KERNELS
             if self.use_triton_kernels
@@ -761,6 +774,33 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+
+        if self.use_marlin:
+            from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+
+            expert_map = None
+            global_num_experts = -1
+            if hasattr(layer, "dispatcher") and hasattr(
+                layer.dispatcher, "local_expert_mapping"
+            ):
+                expert_map = layer.dispatcher.local_expert_mapping
+                if expert_map is not None:
+                    global_num_experts = self.moe_runner_config.num_experts
+
+            quant_info = MarlinMoeQuantInfo(
+                w13_qweight=layer.w13_weight,
+                w2_qweight=layer.w2_weight,
+                w13_scales=layer.w13_weight_scale,
+                w2_scales=layer.w2_weight_scale,
+                w13_g_idx_sort_indices=None,
+                w2_g_idx_sort_indices=None,
+                weight_bits=4,
+                w13_bias=getattr(layer, "w13_weight_bias", None),
+                w2_bias=getattr(layer, "w2_weight_bias", None),
+                expert_map=expert_map,
+                global_num_experts=global_num_experts,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         if self.use_flashinfer:
             # When bf16 mode is enabled, we don't need to quantize the input,

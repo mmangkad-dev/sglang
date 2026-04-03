@@ -72,6 +72,8 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
     # FP4 Marlin specific (Optional)
     w13_global_scale: Optional[torch.Tensor] = None
     w2_global_scale: Optional[torch.Tensor] = None
+    w13_bias: Optional[torch.Tensor] = None
+    w2_bias: Optional[torch.Tensor] = None
 
     # EP support (Optional)
     expert_map: Optional[torch.Tensor] = None
@@ -126,6 +128,8 @@ def fused_experts_none_to_marlin(
         routed_scaling_factor=runner_config.routed_scaling_factor,
         w1_global_scale=quant_info.w13_global_scale,
         w2_global_scale=quant_info.w2_global_scale,
+        w1_bias=quant_info.w13_bias,
+        w2_bias=quant_info.w2_bias,
     ).to(hidden_states.dtype)
 
     return StandardCombineInput(

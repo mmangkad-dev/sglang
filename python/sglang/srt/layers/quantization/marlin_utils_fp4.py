@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
 
-"""NVFP4 Marlin fallback: run FP4-quantized models on non-Blackwell GPUs via Marlin kernel."""
+"""FP4 Marlin utilities for non-native FP4 execution on CUDA GPUs."""
 
 import logging
 from typing import Optional
@@ -27,8 +27,9 @@ ScalarType, scalar_types = get_scalar_types()
 
 logger = logging.getLogger(__name__)
 
-# NVFP4 always uses group_size=16
-FP4_MARLIN_GROUP_SIZE = 16
+# NVFP4 always uses group_size=16, MXFP4 uses group_size=32.
+NVFP4_MARLIN_GROUP_SIZE = 16
+MXFP4_MARLIN_GROUP_SIZE = 32
 
 
 def is_fp4_marlin_supported() -> bool:
@@ -91,6 +92,14 @@ def nvfp4_marlin_process_global_scale(global_scale: torch.Tensor) -> torch.Tenso
         target_exponent = 8
     exponent_bias = 2 ** (target_exponent - 1) - 2 ** (fp4_exponent - 1)
     return global_scale * (2.0 ** (exponent_bias - 7))
+
+
+def mxfp4_marlin_process_scales(marlin_scales: torch.Tensor) -> torch.Tensor:
+    """Convert MXFP4 scales into the e8m0 layout expected by Marlin."""
+    marlin_scales = marlin_scales.view(-1, 4)[:, [0, 2, 1, 3]].view(
+        marlin_scales.size(0), -1
+    )
+    return marlin_scales.to(torch.float8_e8m0fnu)
 
 
 def apply_fp4_marlin_linear(
@@ -213,7 +222,7 @@ def prepare_fp4_layer_for_marlin(
         s=weight_scale,
         size_k=part_size_k,
         size_n=part_size_n,
-        group_size=FP4_MARLIN_GROUP_SIZE,
+        group_size=NVFP4_MARLIN_GROUP_SIZE,
     )
     weight_scale = nvfp4_marlin_process_scales(weight_scale)
     setattr(
@@ -299,7 +308,7 @@ def prepare_moe_fp4_layer_for_marlin(layer: torch.nn.Module) -> None:
                 s=scales.data[i].T,
                 size_k=size_k,
                 size_n=size_n,
-                group_size=FP4_MARLIN_GROUP_SIZE,
+                group_size=NVFP4_MARLIN_GROUP_SIZE,
             )
             processed.append(nvfp4_marlin_process_scales(s))
 
@@ -318,3 +327,98 @@ def prepare_moe_fp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             prefix + "_weight_scale_2",
             torch.nn.Parameter(global_scale, requires_grad=False),
         )
+
+
+def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
+    """Repack MXFP4 MoE weights, e8m0 scales, and biases into Marlin format."""
+    logger.warning_once(
+        "MXFP4 quantization is being served with the Marlin MoE backend. "
+        "This uses weight-only FP4 compression on GPUs without native MXFP4 "
+        "MoE kernels."
+    )
+
+    e = layer.num_local_experts
+    param_dtype = layer.params_dtype
+
+    # Derive dimensions from the loaded checkpoint tensors so tensor-parallel
+    # slicing stays correct without introducing extra padding in weight loading.
+    k = layer.w13_weight.shape[2] * 2
+    n = layer.w13_weight.shape[1] // 2
+
+    device = layer.w13_weight.device
+    perm = torch.empty(0, dtype=torch.int, device=device)
+
+    def repack_weight(weight: torch.Tensor, prefix: str) -> torch.Tensor:
+        if prefix == "w13":
+            size_n, size_k = 2 * n, k
+        else:
+            size_n, size_k = k, n
+
+        assert weight.shape == (e, size_n, size_k // 2), (
+            f"Expected {prefix}_weight shape ({e}, {size_n}, {size_k // 2}), "
+            f"got {weight.shape}"
+        )
+
+        repacked = []
+        for i in range(e):
+            qweight = weight.data[i].view(torch.int32).T.contiguous()
+            repacked.append(
+                gptq_marlin_repack(
+                    b_q_weight=qweight,
+                    perm=perm,
+                    size_k=size_k,
+                    size_n=size_n,
+                    num_bits=4,
+                )
+            )
+        return torch.stack(repacked).contiguous()
+
+    def repack_scales(scales: torch.Tensor, prefix: str) -> torch.Tensor:
+        if prefix == "w13":
+            size_n, size_k = 2 * n, k
+        else:
+            size_n, size_k = k, n
+
+        processed = []
+        scales = scales.data.contiguous().view(torch.float8_e8m0fnu).to(param_dtype)
+        for i in range(e):
+            marlin_scales = marlin_permute_scales(
+                s=scales[i].T.contiguous(),
+                size_k=size_k,
+                size_n=size_n,
+                group_size=MXFP4_MARLIN_GROUP_SIZE,
+            )
+            processed.append(mxfp4_marlin_process_scales(marlin_scales))
+        return torch.stack(processed).contiguous()
+
+    def repack_bias(bias: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if bias is None:
+            return None
+        permuted = []
+        for i in range(e):
+            permuted.append(
+                marlin_permute_bias(bias.data[i].to(param_dtype)).contiguous()
+            )
+        return torch.stack(permuted).contiguous()
+
+    layer.w13_weight = torch.nn.Parameter(
+        repack_weight(layer.w13_weight, "w13"), requires_grad=False
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        repack_weight(layer.w2_weight, "w2"), requires_grad=False
+    )
+    layer.w13_weight_scale = torch.nn.Parameter(
+        repack_scales(layer.w13_weight_scale, "w13"), requires_grad=False
+    )
+    layer.w2_weight_scale = torch.nn.Parameter(
+        repack_scales(layer.w2_weight_scale, "w2"), requires_grad=False
+    )
+
+    if hasattr(layer, "w13_weight_bias") and layer.w13_weight_bias is not None:
+        bias = repack_bias(layer.w13_weight_bias)
+        assert bias is not None
+        layer.w13_weight_bias = torch.nn.Parameter(bias, requires_grad=False)
+    if hasattr(layer, "w2_weight_bias") and layer.w2_weight_bias is not None:
+        bias = repack_bias(layer.w2_weight_bias)
+        assert bias is not None
+        layer.w2_weight_bias = torch.nn.Parameter(bias, requires_grad=False)
