@@ -1031,10 +1031,7 @@ __global__ void Marlin(
 
           int warp_row = warp_id / n_warps;
 
-          int cur_k = warp_row * 16;
-          cur_k += k_iter_size * (k % b_sh_wr_iters);
-
-          int k_blocks = cur_k / 16;
+          int k_blocks = b_sh_wr_iters * warp_row + k % b_sh_wr_iters;
           int cur_group_id = k_blocks / group_blocks;
 
           int4* sh_s_stage = sh_s + s_sh_stage * pipe;
