@@ -1000,6 +1000,7 @@ __global__ void Marlin(
 
   auto fetch_scales_to_registers = [&](int k, int full_pipe) {
     int pipe = full_pipe % stages;
+    constexpr bool is_8bit_scale = s_type.size_bits() == 8;
 
     if constexpr (!has_act_order) {
       // No act-order case
@@ -1011,14 +1012,20 @@ __global__ void Marlin(
         }
       } else if constexpr (group_blocks != -1) {
         if constexpr (group_blocks >= thread_k_blocks) {
-          if (k % b_sh_wr_iters == 0) {
-            int4* sh_s_stage =
-                sh_s + s_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
-            reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
-          } else {
-            reinterpret_cast<int4*>(&frag_s[1])[0] = reinterpret_cast<int4*>(&frag_s[0])[0];
+          constexpr int g = group_blocks / thread_k_blocks;
+          if (pipe % g == 0) {
+            if (k % b_sh_wr_iters == 0) {
+              int4* sh_s_stage = sh_s + s_sh_stage * (g * (pipe / g));
+              reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
+            } else {
+              if constexpr (!is_8bit_scale) {
+                reinterpret_cast<int4*>(&frag_s[1])[0] = reinterpret_cast<int4*>(&frag_s[0])[0];
+              } else {
+                reinterpret_cast<int2*>(&frag_s[1])[0] = reinterpret_cast<int2*>(&frag_s[0])[0];
+              }
+            }
           }
-        } else {
+        } else if (group_blocks < b_sh_wr_iters || k % b_sh_wr_iters == 0) {
           auto warp_id = threadIdx.x / 32;
           int n_warps = thread_n_blocks / 4;
 
@@ -1032,11 +1039,17 @@ __global__ void Marlin(
 
           int4* sh_s_stage = sh_s + s_sh_stage * pipe;
 
-          if constexpr (w_type_id != host::kFE2M1f.id()) {
+          if constexpr (!is_8bit_scale) {
             reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
           } else {
             reinterpret_cast<int2*>(&frag_s[k % 2])[0] =
                 reinterpret_cast<int2*>(sh_s_stage)[s_sh_rd + cur_group_id * (2 * s_sh_stride)];
+          }
+        } else if (group_blocks >= b_sh_wr_iters) {
+          if constexpr (!is_8bit_scale) {
+            reinterpret_cast<int4*>(&frag_s[1])[0] = reinterpret_cast<int4*>(&frag_s[0])[0];
+          } else {
+            reinterpret_cast<int2*>(&frag_s[1])[0] = reinterpret_cast<int2*>(&frag_s[0])[0];
           }
         }
       }
