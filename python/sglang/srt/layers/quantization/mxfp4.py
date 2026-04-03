@@ -787,7 +787,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     mode="constant",
                     value=0.0,
                 )
-                dispatch_output.hidden_states = x
+                dispatch_output = dispatch_output._replace(hidden_states=x)
 
             expert_map = None
             global_num_experts = -1
