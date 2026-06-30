@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
+from sglang.srt.distributed import flush_moe_deferred_all_reduce
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -126,6 +127,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         )
 
         if not self.pp_group.is_last_rank:
+            hidden_states = flush_moe_deferred_all_reduce(hidden_states)
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,

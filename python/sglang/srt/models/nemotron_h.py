@@ -802,6 +802,14 @@ class NemotronHModel(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
+            # Nemotron-H's deferred post-expert all-reduce (set by the MoE/MLP
+            # layer under all-reduce fusion) is consumed by the next layer's
+            # input_norm_maybe_fuse_allreduce over the regular TP group. At a
+            # PP boundary there is no next layer and the marker is lost across
+            # the send, so flush it here with tensor_model_parallel_all_reduce.
+            if getattr(hidden_states, "_sglang_needs_allreduce_fusion", False):
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states._sglang_needs_allreduce_fusion = False
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )

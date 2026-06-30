@@ -26,6 +26,7 @@ from transformers import PretrainedConfig
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
+    flush_moe_deferred_all_reduce,
     get_pp_group,
     get_pp_indices,
     parallel_state,
@@ -1147,6 +1148,7 @@ class Glm4MoeModel(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
+            hidden_states = flush_moe_deferred_all_reduce(hidden_states)
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,

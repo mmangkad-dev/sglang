@@ -10,6 +10,8 @@ import torch.distributed
 from .parallel_state import (
     get_attn_tp_group,
     get_moe_ep_group,
+    get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_world_size,
     get_moe_tp_group,
     get_tp_group,
 )
@@ -82,3 +84,30 @@ def moe_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
 def moe_expert_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across moe expert parallel group."""
     return get_moe_ep_group().all_reduce(input_)
+
+
+def flush_moe_deferred_all_reduce(
+    hidden_states: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Complete a post-expert all-reduce that all-reduce fusion deferred.
+
+    When all-reduce fusion is enabled, the post-expert TP/EP all-reduce is
+    skipped in the MoE block and deferred into the next layer's
+    ``prepare_attn``; the pending reduction is tracked by the
+    ``_sglang_needs_allreduce_fusion`` marker on ``hidden_states``. At a
+    pipeline-parallel boundary there is no next layer on this rank and the
+    marker (a plain Python attribute) is not preserved across the PP send, so
+    the deferred reduction would be silently lost. Call this right before
+    handing ``hidden_states`` to the next stage as a ``PPProxyTensor``.
+
+    A no-op when the marker is absent, so it is safe to call unconditionally.
+    """
+    if hidden_states is not None and getattr(
+        hidden_states, "_sglang_needs_allreduce_fusion", False
+    ):
+        if get_moe_expert_parallel_world_size() > 1:
+            hidden_states = moe_expert_parallel_all_reduce(hidden_states)
+        if get_moe_tensor_parallel_world_size() > 1:
+            hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+        hidden_states._sglang_needs_allreduce_fusion = False
+    return hidden_states

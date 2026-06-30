@@ -28,6 +28,7 @@ from transformers import PretrainedConfig
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.distributed import (
+    flush_moe_deferred_all_reduce,
     get_pp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -699,6 +700,7 @@ class GptOssModel(nn.Module):
                     positions, hidden_states, forward_batch, residual
                 )
         if not self.pp_group.is_last_rank:
+            hidden_states = flush_moe_deferred_all_reduce(hidden_states)
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,

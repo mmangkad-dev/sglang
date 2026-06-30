@@ -48,6 +48,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed import (
     divide,
+    flush_moe_deferred_all_reduce,
     get_pp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -2598,6 +2599,7 @@ class DeepseekV2Model(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
+            hidden_states = flush_moe_deferred_all_reduce(hidden_states)
             proxy_tensors = {
                 "hidden_states": hidden_states,
                 "residual": residual,

@@ -33,6 +33,7 @@ from sglang.jit_kernel.all_reduce import (
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
+    flush_moe_deferred_all_reduce,
     get_pp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -1189,6 +1190,7 @@ class MiniMaxM2Model(nn.Module):
                     )
 
         if not self.pp_group.is_last_rank:
+            hidden_states = flush_moe_deferred_all_reduce(hidden_states)
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )

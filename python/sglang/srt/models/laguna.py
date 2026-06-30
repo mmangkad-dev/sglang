@@ -18,6 +18,7 @@ from torch import nn
 
 from sglang.srt.configs.laguna import LagunaConfig
 from sglang.srt.distributed import (
+    flush_moe_deferred_all_reduce,
     get_pp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -583,6 +584,7 @@ class LagunaModel(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
+            hidden_states = flush_moe_deferred_all_reduce(hidden_states)
             return PPProxyTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )

@@ -34,7 +34,7 @@ from sglang.srt.configs.qwen3_5 import (
 )
 
 # Distributed
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import flush_moe_deferred_all_reduce, get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
@@ -1315,6 +1315,7 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
+            hidden_states = flush_moe_deferred_all_reduce(hidden_states)
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,
