@@ -998,9 +998,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         hidden_size = (
             hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
         )
-        output_dtype = (
-            hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
-        )
+        output_dtype = torch.bfloat16
         _provided = _moe_output_buf.get()
         _symm_required = is_allocation_symmetric()
         if (
@@ -1126,6 +1124,16 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             )
         else:
             result = result[0]
+
+    output_activation_dtype = getattr(dispatch_output, "activation_dtype", None)
+    if output_activation_dtype is None and hidden_states_scale is None:
+        output_activation_dtype = hidden_states.dtype
+    if (
+        not defer_finalize
+        and output_activation_dtype is not None
+        and result.dtype != output_activation_dtype
+    ):
+        result = result.to(output_activation_dtype)
 
     return StandardCombineInput(hidden_states=result)
 
