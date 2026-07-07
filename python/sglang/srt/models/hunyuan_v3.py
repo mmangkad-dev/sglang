@@ -34,6 +34,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -111,6 +112,7 @@ class HYV3MoEFused(nn.Module):
         )
         self.expert_bias.weight_loader = HYV3MoEFused.ebias_weight_loader
         scoring_func = "sigmoid"
+        routing_method_type = RoutingMethodType.DeepSeekV3
         self.e_score_correction_bias = self.expert_bias
         self.router_scaling_factor = getattr(config, "router_scaling_factor", 1.0)
         self.gate = ReplicatedLinear(
@@ -155,6 +157,8 @@ class HYV3MoEFused(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
+            routed_scaling_factor=self.router_scaling_factor,
+            routing_method_type=routing_method_type,
         )
 
     @staticmethod
@@ -541,6 +545,9 @@ class HYV3ForCausalLM(nn.Module):
                 parts = name.split(".")
                 if len(parts) >= 3 and int(parts[2]) >= self.config.num_hidden_layers:
                     continue
+
+            name = name.replace(".shared_experts.", ".shared_mlp.")
+            name = name.replace(".e_score_correction_bias", ".expert_bias")
 
             is_found = False
             for param_name, weight_name, shard_id in stacked_params_mapping:

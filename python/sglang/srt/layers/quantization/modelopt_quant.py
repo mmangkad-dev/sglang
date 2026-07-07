@@ -357,9 +357,21 @@ class ModelOptQuantConfig(QuantizationConfig):
             return False
 
         # Build prefix variants: some models wrap layers under "language_model."
-        prefixes_to_check = [prefix]
-        if prefix.startswith("language_model."):
-            prefixes_to_check.append(prefix.removeprefix("language_model."))
+        normalized_prefix = prefix.lstrip(".")
+        prefixes_to_check = [normalized_prefix]
+        if normalized_prefix.startswith("language_model."):
+            prefixes_to_check.append(normalized_prefix.removeprefix("language_model."))
+
+        # Hy3 checkpoints and ModelOpt configs use shared_experts, while the
+        # SGLang module is named shared_mlp.
+        if ".shared_mlp" in normalized_prefix:
+            prefixes_to_check.append(
+                normalized_prefix.replace(".shared_mlp", ".shared_experts")
+            )
+        if ".shared_experts" in normalized_prefix:
+            prefixes_to_check.append(
+                normalized_prefix.replace(".shared_experts", ".shared_mlp")
+            )
 
         # Fused module patterns: the exclude list may reference a sub-component
         # (e.g., "q_a_proj") that is fused into a combined parameter name

@@ -14,6 +14,7 @@
 
 """Inference-only HunyuanV3 NextN (MTP) Speculative Decoding."""
 
+import copy
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -60,18 +61,23 @@ class HYV3ModelNextN(nn.Module):
 
         self.alt_stream = torch.cuda.Stream() if is_cuda() else None
 
-        # Force MoE for the MTP layer: first_k_dense_replace=1 would make
-        # layer_id=0 pick a dense MLP instead of MoE, so override it.
-        orig_first_k = getattr(config, "first_k_dense_replace", 0)
-        config.first_k_dense_replace = 0
+        # The MTP block is stored as model.layers.<num_hidden_layers> in the
+        # checkpoint. Keep that logical prefix for quantization config matching
+        # (notably ModelOpt's model.layers.80* ignore rule), while the local
+        # module remains model.decoder for weight loading below.
+        decoder_config = copy.copy(config)
+        decoder_config.first_k_dense_replace = 0
+        decoder_config.moe_intermediate_size = getattr(
+            config, "nextn_moe_intermediate_size", config.moe_intermediate_size
+        )
+        nextn_layer_id = config.num_hidden_layers
         self.decoder = HYV3DecoderLayer(
-            config=config,
+            config=decoder_config,
             layer_id=0,
             quant_config=quant_config,
-            prefix=f"{prefix}.decoder",
+            prefix=f"{prefix}.layers.{nextn_layer_id}",
             alt_stream=self.alt_stream,
         )
-        config.first_k_dense_replace = orig_first_k
 
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -185,6 +191,8 @@ class HYV3ForCausalLMNextN(nn.Module):
                 subname = name[len(nextn_prefix) :]
                 if any(subname.startswith(s) for s in spec_weight_names):
                     name = f"model.{subname}"
+                elif subname == "final_layernorm.weight":
+                    name = "model.shared_head.norm.weight"
                 else:
                     name = f"model.decoder.{subname}"
             elif name == "model.shared_head.norm.weight":
@@ -203,6 +211,8 @@ class HYV3ForCausalLMNextN(nn.Module):
 
             if "router.gate." in name:
                 name = name.replace("router.", "")
+            name = name.replace(".shared_experts.", ".shared_mlp.")
+            name = name.replace(".e_score_correction_bias", ".expert_bias")
 
             is_found = False
             for param_name, weight_name, shard_id in stacked_params_mapping:

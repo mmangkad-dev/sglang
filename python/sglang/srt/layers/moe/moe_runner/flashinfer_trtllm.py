@@ -924,6 +924,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         trtllm_fp4_block_scale_routed_moe,
     )
 
+    from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutputChecker
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
@@ -998,9 +999,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         hidden_size = (
             hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
         )
-        output_dtype = (
-            hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
-        )
+        # FlashInfer's FP4 TRTLLM kernel validates the output buffer as BF16.
+        output_dtype = torch.bfloat16
         _provided = _moe_output_buf.get()
         _symm_required = is_allocation_symmetric()
         if (
@@ -1127,6 +1127,18 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         else:
             result = result[0]
 
+    output_activation_dtype = None
+    if DispatchOutputChecker.format_is_flashinfer(dispatch_output):
+        output_activation_dtype = dispatch_output.activation_dtype
+    if output_activation_dtype is None and hidden_states_scale is None:
+        output_activation_dtype = hidden_states.dtype
+    if (
+        not defer_finalize
+        and output_activation_dtype is not None
+        and result.dtype != output_activation_dtype
+    ):
+        result = result.to(output_activation_dtype)
+
     return StandardCombineInput(hidden_states=result)
 
 
@@ -1189,6 +1201,9 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
     )
 
     hidden_states = dispatch_output.hidden_states
+    output_activation_dtype = hidden_states.dtype
+    # FlashInfer's BF16 TRTLLM MoE kernels require BF16 activations and weights.
+    hidden_states_for_kernel = hidden_states.to(torch.bfloat16)
     topk_output = dispatch_output.topk_output
 
     with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
@@ -1208,7 +1223,7 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
             )
             final_hidden_states = trtllm_bf16_routed_moe(
                 topk_ids=packed_topk_ids,
-                hidden_states=hidden_states,
+                hidden_states=hidden_states_for_kernel,
                 gemm1_weights=quant_info.gemm1_weights,
                 gemm2_weights=quant_info.gemm2_weights,
                 num_experts=quant_info.global_num_experts,
@@ -1230,12 +1245,15 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
         else:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
             topk_config = topk_output.topk_config
+            routing_method_type = runner_config.routing_method_type
+            if routing_method_type is None:
+                routing_method_type = RoutingMethodType.Default
 
             # Call the fused kernel
             final_hidden_states = trtllm_bf16_moe(
                 routing_logits=topk_output.router_logits,
                 routing_bias=topk_config.correction_bias,
-                hidden_states=hidden_states,
+                hidden_states=hidden_states_for_kernel,
                 gemm1_weights=quant_info.gemm1_weights,
                 gemm2_weights=quant_info.gemm2_weights,
                 num_experts=quant_info.global_num_experts,
@@ -1245,11 +1263,14 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 intermediate_size=runner_config.intermediate_size_per_partition,
                 local_expert_offset=quant_info.local_expert_offset,
                 local_num_experts=runner_config.num_local_experts,
-                routing_method_type=runner_config.routing_method_type,
+                routing_method_type=routing_method_type,
                 routed_scaling_factor=runner_config.routed_scaling_factor,
                 tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
                 activation_type=activation_type,
             )
+
+    if final_hidden_states.dtype != output_activation_dtype:
+        final_hidden_states = final_hidden_states.to(output_activation_dtype)
 
     return StandardCombineInput(hidden_states=final_hidden_states)
 

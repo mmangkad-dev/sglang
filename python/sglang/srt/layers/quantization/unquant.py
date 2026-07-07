@@ -345,6 +345,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 get_w2_permute_indices_with_cache,
             )
 
+            if layer.w13_weight.dtype != torch.bfloat16:
+                copy_or_rebind_param(
+                    layer, "w13_weight", layer.w13_weight.data.to(torch.bfloat16)
+                )
+                torch.cuda.empty_cache()
+            if layer.w2_weight.dtype != torch.bfloat16:
+                copy_or_rebind_param(
+                    layer, "w2_weight", layer.w2_weight.data.to(torch.bfloat16)
+                )
+                torch.cuda.empty_cache()
+
             # w1 and w3 have been swapped, so we don't need do that here
             epilogue_tile_m = 128
             block_k = 128

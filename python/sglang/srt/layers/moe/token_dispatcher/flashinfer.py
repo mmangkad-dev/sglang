@@ -51,6 +51,7 @@ class FlashinferDispatchOutput(NamedTuple):
     topk_output: StandardTopKOutput
     # Provide an output tensor to fused_moe so it writes directly to our buffer
     moe_output: Optional[torch.Tensor] = None
+    activation_dtype: Optional[torch.dtype] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -275,6 +276,7 @@ class FlashinferDispatcher(BaseDispatcher):
             x_sf,
             StandardTopKOutput(topk_weights, topk_ids, topk_output.router_logits),
             moe_output,
+            output_dtype,
         )
 
     @debug_kernel_api
