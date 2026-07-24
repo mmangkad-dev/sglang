@@ -92,25 +92,26 @@ class TorchSymmMemCommunicator:
         supported_max_sizes = TORCH_SYMM_MEM_ALL_REDUCE_MAX_SIZES.get(
             self.device_capability
         )
-        if supported_max_sizes is None:
-            logger.warning(
-                "TorchSymmMemCommunicator: Device capability %s not supported, "
-                "communicator is not available.",
-                self.device_capability,
-            )
-            return
-        if self.world_size not in supported_max_sizes:
-            logger.warning(
-                "TorchSymmMemCommunicator: World size %d not supported, "
-                "communicator is not available.",
-                self.world_size,
-            )
-            return
-        self.max_size = (
-            max_size_override
-            if max_size_override is not None
-            else supported_max_sizes[self.world_size]
-        )
+        if max_size_override is None:
+            if supported_max_sizes is None:
+                logger.warning(
+                    "TorchSymmMemCommunicator: Device capability %s not supported, "
+                    "communicator is not available.",
+                    self.device_capability,
+                )
+                return
+            if self.world_size not in supported_max_sizes:
+                logger.warning(
+                    "TorchSymmMemCommunicator: World size %d not supported, "
+                    "communicator is not available.",
+                    self.world_size,
+                )
+                return
+            self.max_size = supported_max_sizes[self.world_size]
+        else:
+            # Benchmarks must be able to retest configurations that are not
+            # currently enabled in the production selection table.
+            self.max_size = max_size_override
         if self.max_size <= 0:
             raise ValueError("max_size_override must be positive")
         # Keep the JIT all-reduce buffer above the largest prefill payload

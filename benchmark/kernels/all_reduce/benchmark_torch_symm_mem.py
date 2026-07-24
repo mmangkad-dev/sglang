@@ -17,21 +17,22 @@ Examples:
 
     torchrun --standalone --nproc-per-node=8 \
       benchmark/kernels/all_reduce/benchmark_torch_symm_mem.py \
-      --output-json sm103-tp8.json
+      --output-json sm90-tp8.json
 
     torchrun --standalone --nproc-per-node=4 \
       benchmark/kernels/all_reduce/benchmark_torch_symm_mem.py \
       --sizes-kib 16 32 64 128 256 512 1024 2048 4096 8192 \
                   16384 32768 65536 131072 \
-      --modes eager graph --output-json sm103-tp4.json
+      --modes eager graph --output-json sm90-tp4.json
 
 NCCL symmetric memory requires a sufficiently recent NCCL/CUDA/PyTorch stack.
 The benchmark sets the standard NCCL NVLS/CUMEM environment defaults before
 NCCL initialization; explicit user values are preserved.
 
-Unset ``SGLANG_OPT_USE_INKLING_CUSTOM_AR`` when running this standalone
-benchmark. Inkling mode requires a published ``ServerArgs`` runtime context,
-which this low-level communicator benchmark intentionally does not construct.
+The benchmark disables ``SGLANG_OPT_USE_INKLING_CUSTOM_AR`` by default.
+Inkling mode requires a published ``ServerArgs`` runtime context, which this
+low-level communicator benchmark intentionally does not construct. An explicit
+environment value is still preserved for debugging.
 """
 
 from __future__ import annotations
@@ -50,6 +51,9 @@ from typing import Callable, ContextManager, Optional
 # These must be set before importing/initializing NCCL.
 os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
 os.environ.setdefault("NCCL_NVLS_ENABLE", "1")
+# This option defaults to enabled in SGLang, but cannot work in this standalone
+# benchmark because no ServerArgs runtime context is published.
+os.environ.setdefault("SGLANG_OPT_USE_INKLING_CUSTOM_AR", "0")
 
 import torch
 import torch.distributed as dist
@@ -323,10 +327,9 @@ def validate(
 
 def capture_graph(
     backend: Backend,
-    inp: torch.Tensor,
-    out: torch.Tensor,
-    ops_per_trial: int,
+    inputs_and_outputs: list[tuple[torch.Tensor, torch.Tensor]],
 ) -> tuple[torch.cuda.CUDAGraph, torch.Tensor]:
+    inp, out = inputs_and_outputs[0]
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -338,7 +341,10 @@ def capture_graph(
     graph_out = out
     with backend.capture_context():
         with torch.cuda.graph(graph, stream=stream):
-            for _ in range(ops_per_trial):
+            # Custom AR registers graph inputs per collective. Use distinct
+            # static input buffers, as a serving graph does across layers,
+            # rather than registering the same pointer repeatedly.
+            for inp, out in inputs_and_outputs:
                 result = backend.run(inp, out)
                 if result is not None:
                     graph_out = result
@@ -394,7 +400,12 @@ def measure(
             inp.fill_(rank + 1)
 
         if mode == "graph":
-            graph, graph_out = capture_graph(backend, inp, out, args.ops_per_trial)
+            inputs_and_outputs = [(inp, out)]
+            for _ in range(args.ops_per_trial - 1):
+                graph_inp, graph_out = backend.allocate(size_bytes)
+                graph_inp.fill_(rank + 1)
+                inputs_and_outputs.append((graph_inp, graph_out))
+            graph, graph_out = capture_graph(backend, inputs_and_outputs)
             if not args.skip_correctness:
                 graph.replay()
                 torch.cuda.synchronize()
@@ -454,6 +465,7 @@ def metadata(world_size: int, device: torch.device) -> dict:
                 "NCCL_CUMEM_ENABLE",
                 "NCCL_NVLS_ENABLE",
                 "NCCL_DEBUG",
+                "SGLANG_OPT_USE_INKLING_CUSTOM_AR",
             )
         },
     }
