@@ -49,7 +49,7 @@ class TorchSymmMemCommunicator:
     # to the two-shot path.
     _WORLD_SIZES_MULTIMEM = {
         9: [4, 6, 8],
-        10: [4, 6, 8],
+        10: [6, 8],
     }
 
     def __init__(
