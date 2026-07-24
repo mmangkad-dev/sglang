@@ -52,16 +52,29 @@ class TorchSymmMemCommunicator:
         10: [4, 6, 8],
     }
 
-    def __init__(self, group: ProcessGroup, device: Union[int, str, torch.device]):
+    def __init__(
+        self,
+        group: ProcessGroup,
+        device: Union[int, str, torch.device],
+        *,
+        force_multimem: Optional[bool] = None,
+        max_size_override: Optional[int] = None,
+    ):
         """
         Args:
             group: Torch process group used for rendezvous and naming.
             device: Target CUDA device (index, 'cuda:X', or torch.device).
+            force_multimem: Testing/benchmark override. ``True`` forces the
+                multimem kernel and ``False`` forces the two-shot kernel.
+                Production callers should leave this as ``None``.
+            max_size_override: Testing/benchmark buffer size in bytes.
+                Production callers should leave this as ``None``.
         """
 
         self.disabled = True
         self.buffer = None
         self.max_size = 0
+        self.force_multimem = force_multimem
 
         if not torch_symm_mem_available:
             return
@@ -93,7 +106,13 @@ class TorchSymmMemCommunicator:
                 self.world_size,
             )
             return
-        self.max_size = supported_max_sizes[self.world_size]
+        self.max_size = (
+            max_size_override
+            if max_size_override is not None
+            else supported_max_sizes[self.world_size]
+        )
+        if self.max_size <= 0:
+            raise ValueError("max_size_override must be positive")
         # Keep the JIT all-reduce buffer above the largest prefill payload
         # ([16384, 6144] bf16 = 192 MiB), including room for tail regions.
         if envs.SGLANG_OPT_USE_INKLING_CUSTOM_AR.get():
@@ -171,9 +190,13 @@ class TorchSymmMemCommunicator:
         if out is None:
             out = torch.empty_like(inp)
         self.buffer[: inp.numel()].copy_(inp.view(-1))
-        if self.world_size in self._WORLD_SIZES_MULTIMEM.get(
-            self.device_capability, ()
-        ):
+        use_multimem = (
+            self.force_multimem
+            if self.force_multimem is not None
+            else self.world_size
+            in self._WORLD_SIZES_MULTIMEM.get(self.device_capability, ())
+        )
+        if use_multimem:
             torch.ops.symm_mem.multimem_all_reduce_(
                 self.buffer[: inp.numel()], "sum", self.group.group_name
             )
