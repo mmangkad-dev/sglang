@@ -241,6 +241,9 @@ class TestPrefetchCheckpoints(CustomTestCase):
                 test_case.assertEqual(name, "weight")
                 return torch.tensor([1.0])
 
+            def close(self):
+                events.append("close_buffer")
+
         class FakeLoader:
             def __init__(self, group, device, max_threads, nogds):
                 test_case.assertIsInstance(group, FakeGroup)
@@ -288,7 +291,71 @@ class TestPrefetchCheckpoints(CustomTestCase):
             )
 
         torch.testing.assert_close(loaded[0][1], torch.tensor([1.0]))
-        self.assertEqual(events, ["close", "drop:model-rank-0.safetensors"])
+        self.assertEqual(
+            events,
+            [
+                "close_buffer",
+                "close",
+                "drop:model-rank-0.safetensors",
+            ],
+        )
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_fastsafetensors_closes_buffer_and_loader_on_tensor_error(self, _):
+        events = []
+
+        class FakeGroup:
+            def rank(self):
+                return 0
+
+            def size(self):
+                return 1
+
+        class FakeBuffer:
+            key_to_rank_lidx = {"weight": (0, 0)}
+
+            def get_tensor(self, name):
+                raise RuntimeError("failed to load tensor")
+
+            def close(self):
+                events.append("close_buffer")
+
+        class FakeLoader:
+            def __init__(self, group, device, max_threads, nogds):
+                pass
+
+            def add_filenames(self, rank_file_map):
+                pass
+
+            def copy_files_to_device(self):
+                return FakeBuffer()
+
+            def close(self):
+                events.append("close_loader")
+
+        with (
+            patch(
+                "sglang.srt.model_loader.weight_utils.SingleGroup",
+                FakeGroup,
+            ),
+            patch(
+                "sglang.srt.model_loader.weight_utils.SafeTensorsFileLoader",
+                FakeLoader,
+            ),
+            patch(
+                "sglang.srt.model_loader.weight_utils._drop_file_cache_after_load"
+            ) as drop_cache,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "failed to load tensor"):
+                list(
+                    fastsafetensors_weights_iterator(
+                        ["model.safetensors"],
+                        drop_cache_after_load=True,
+                    )
+                )
+
+        self.assertEqual(events, ["close_buffer", "close_loader"])
+        drop_cache.assert_not_called()
 
 
 class TestPrefetchDispatch(CustomTestCase):

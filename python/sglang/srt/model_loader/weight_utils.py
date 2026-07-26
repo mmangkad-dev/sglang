@@ -1042,9 +1042,9 @@ def fastsafetensors_weights_iterator(
         loader = SafeTensorsFileLoader(
             pg, device, max_threads=max_threads, nogds=not enable_gds
         )
-        rank_file_map = {i: [f] for i, f in enumerate(f_list)}
-        loader.add_filenames(rank_file_map)
         try:
+            rank_file_map = {i: [f] for i, f in enumerate(f_list)}
+            loader.add_filenames(rank_file_map)
             fb = loader.copy_files_to_device()
             try:
                 keys = list(fb.key_to_rank_lidx.keys())
@@ -1052,7 +1052,7 @@ def fastsafetensors_weights_iterator(
                     t = fb.get_tensor(k)
                     yield k, t
             finally:
-                pass
+                fb.close()
         finally:
             loader.close()
         if drop_cache_after_load:
