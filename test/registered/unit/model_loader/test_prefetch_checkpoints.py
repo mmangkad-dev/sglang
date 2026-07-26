@@ -232,7 +232,7 @@ class TestPrefetchCheckpoints(CustomTestCase):
                 return 0
 
             def size(self):
-                return 1
+                return 2
 
         class FakeBuffer:
             key_to_rank_lidx = {"weight": (0, 0)}
@@ -251,7 +251,10 @@ class TestPrefetchCheckpoints(CustomTestCase):
             def add_filenames(self, rank_file_map):
                 test_case.assertEqual(
                     rank_file_map,
-                    {0: ["model.safetensors"]},
+                    {
+                        0: ["model-rank-0.safetensors"],
+                        1: ["model-rank-1.safetensors"],
+                    },
                 )
 
             def copy_files_to_device(self):
@@ -276,13 +279,16 @@ class TestPrefetchCheckpoints(CustomTestCase):
         ):
             loaded = list(
                 fastsafetensors_weights_iterator(
-                    ["model.safetensors"],
+                    [
+                        "model-rank-0.safetensors",
+                        "model-rank-1.safetensors",
+                    ],
                     drop_cache_after_load=True,
                 )
             )
 
         torch.testing.assert_close(loaded[0][1], torch.tensor([1.0]))
-        self.assertEqual(events, ["close", "drop:model.safetensors"])
+        self.assertEqual(events, ["close", "drop:model-rank-0.safetensors"])
 
 
 class TestPrefetchDispatch(CustomTestCase):
