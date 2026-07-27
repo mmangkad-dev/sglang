@@ -247,5 +247,153 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
     assert torch.equal(actual, expected)
 
 
+def test_gpt_oss_sm120_layout_and_kernel(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if torch.cuda.get_device_capability()[0] != 12:
+        pytest.skip("SM120 required")
+    pytest.importorskip("flashinfer.fused_moe")
+
+    from flashinfer import block_scale_interleave
+
+    import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as runner_module
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+    from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+    from sglang.srt.layers.moe.utils import MoeRunnerBackend
+    from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+    monkeypatch.setattr(
+        runner_module, "use_symmetric_memory", lambda *args, **kwargs: nullcontext()
+    )
+    monkeypatch.setattr(runner_module, "is_allocation_symmetric", lambda: False)
+    monkeypatch.setattr(runner_module, "get_tp_group", lambda: None)
+
+    num_experts, hidden, intermediate = 2, 160, 160
+    padded_hidden = padded_intermediate = 256
+    generator = torch.Generator(device="cuda").manual_seed(2)
+    w13 = torch.randint(
+        0,
+        128,
+        (num_experts, 2 * intermediate, hidden // 2),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=generator,
+    )
+    w2 = torch.randint(
+        0,
+        128,
+        (num_experts, hidden, intermediate // 2),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=generator,
+    )
+    w13_scale = torch.full(
+        (num_experts, 2 * intermediate, hidden // 32),
+        125,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w2_scale = torch.full(
+        (num_experts, hidden, intermediate // 32),
+        125,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w13_bias = torch.randn(
+        num_experts,
+        2 * intermediate,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    w2_bias = torch.randn(
+        num_experts,
+        hidden,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    layer = SimpleNamespace(
+        w13_weight=torch.nn.Parameter(w13.clone(), requires_grad=False),
+        w2_weight=torch.nn.Parameter(w2.clone(), requires_grad=False),
+        w13_weight_scale=torch.nn.Parameter(w13_scale.clone(), requires_grad=False),
+        w2_weight_scale=torch.nn.Parameter(w2_scale.clone(), requires_grad=False),
+        w13_weight_bias=torch.nn.Parameter(w13_bias.clone(), requires_grad=False),
+        w2_weight_bias=torch.nn.Parameter(w2_bias.clone(), requires_grad=False),
+        num_local_experts=num_experts,
+        moe_tp_size=1,
+        moe_tp_rank=0,
+        moe_ep_size=1,
+        moe_ep_rank=0,
+    )
+    config = MoeRunnerConfig(
+        num_experts=num_experts,
+        num_local_experts=num_experts,
+        hidden_size=hidden,
+        intermediate_size_per_partition=intermediate,
+        top_k=1,
+        activation="silu",
+        is_gated=True,
+        gemm1_alpha=1.702,
+        gemm1_clamp_limit=7.0,
+    )
+    method = Mxfp4MoEMethod.__new__(Mxfp4MoEMethod)
+    method._padded_hidden = padded_hidden
+    method._padded_intermediate = padded_intermediate
+    method.moe_runner_config = config
+    method._process_weights_for_sm120_cutlass(layer)
+    method.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, config)
+
+    expected_w13 = torch.zeros(
+        num_experts,
+        2 * padded_intermediate,
+        padded_hidden // 2,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    expected_w13[:, :intermediate, : hidden // 2] = w13[:, 1::2]
+    expected_w13[
+        :, padded_intermediate : padded_intermediate + intermediate, : hidden // 2
+    ] = w13[:, 0::2]
+    assert torch.equal(layer.w13_weight, expected_w13)
+
+    expected_w13_scale = torch.zeros(
+        num_experts,
+        2 * padded_intermediate,
+        padded_hidden // 32,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    expected_w13_scale[:, :intermediate, : hidden // 32] = w13_scale[:, 1::2]
+    expected_w13_scale[
+        :,
+        padded_intermediate : padded_intermediate + intermediate,
+        : hidden // 32,
+    ] = w13_scale[:, 0::2]
+    expected_w13_scale = block_scale_interleave(expected_w13_scale).reshape_as(
+        expected_w13_scale
+    )
+    assert torch.equal(layer.w13_weight_scale, expected_w13_scale)
+    assert layer._mxfp4_backend == "flashinfer_cutlass_sm120"
+
+    x = torch.randn(
+        4, hidden, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    logits = torch.randn(
+        4, num_experts, dtype=torch.float32, device="cuda", generator=generator
+    )
+    topk_weights, topk_ids = torch.topk(torch.softmax(logits, dim=-1), 1, dim=-1)
+    dispatch_output = StandardDispatchOutput(
+        x,
+        None,
+        StandardTopKOutput(topk_weights, topk_ids.to(torch.int32), logits),
+    )
+    output = method._apply_cutlass(layer, dispatch_output).hidden_states
+    assert output.shape == x.shape
+    assert torch.isfinite(output).all()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -432,6 +432,30 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(sa.dtype, "bfloat16")  # materialized
         self.assertEqual(self._publish(sa).dtype, "bfloat16")
 
+    def test_gpt_oss_mxfp4_sm120_uses_flashinfer(self):
+        from sglang.srt.arg_groups.overrides import _gpt_oss_overrides
+
+        args = SimpleNamespace(
+            dtype="auto",
+            moe_runner_backend="auto",
+            is_attention_backend_not_set=lambda: False,
+        )
+        hf_config = SimpleNamespace(
+            architectures=["GptOssForCausalLM"],
+            quantization_config={"quant_method": "mxfp4"},
+        )
+        with (
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+            patch.object(overrides_module, "is_sm120_supported", return_value=True),
+        ):
+            self.assertEqual(
+                _gpt_oss_overrides(args, hf_config),
+                {
+                    "dtype": "bfloat16",
+                    "moe_runner_backend": "flashinfer_mxfp4",
+                },
+            )
+
     def test_gpt_oss_without_mxfp4_keeps_pristine_dtype(self):
         sa = self._construct("GptOssForCausalLM", "llama")
         self.assertEqual(sa.dtype, "auto")
