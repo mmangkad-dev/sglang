@@ -76,9 +76,6 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     w13_weight_scale: torch.Tensor  # [E, 2*N, K/32]
     w2_weight_scale: torch.Tensor  # [E, K, N/32]
 
-    # SM120 uses MXFP8 activation scaling; SM90 uses W4A16 group scaling.
-    use_mxfp8_act_scaling: bool = False
-
     # The SM120 ABI requires a neutral per-expert global scale.
     mxfp4_weight_global_scale: Optional[torch.Tensor] = None
 
@@ -336,12 +333,7 @@ def fused_experts_none_to_flashinfer_mxfp4(
         )
 
     weight_global_scale = quant_info.mxfp4_weight_global_scale
-    use_mxfp8_act_scaling = quant_info.use_mxfp8_act_scaling
-    assert use_mxfp8_act_scaling == (weight_global_scale is not None), (
-        "FlashInfer CUTLASS MXFP4 layout mismatch: MXFP8 activation scaling "
-        "requires a per-expert weight global scale, while SM90 W4A16 must not "
-        "provide one."
-    )
+    use_mxfp8_act_scaling = weight_global_scale is not None
     input_sf = None
     fc1_expert_weights = quant_info.w13_weight
     fc2_expert_weights = quant_info.w2_weight

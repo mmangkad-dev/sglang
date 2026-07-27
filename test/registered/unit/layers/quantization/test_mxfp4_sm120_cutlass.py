@@ -105,28 +105,6 @@ def test_dsv4_sm120_load_contract(monkeypatch):
     assert captured["fp4_scale_dtype"] == torch.float8_e8m0fnu
 
 
-def test_gpt_oss_sm120_requires_flashinfer_cutlass_support(monkeypatch):
-    import sglang.srt.layers.quantization.mxfp4 as mxfp4_module
-    from sglang.srt.layers.moe.utils import MoeRunnerBackend
-
-    monkeypatch.setattr(
-        mxfp4_module,
-        "get_moe_runner_backend",
-        lambda: MoeRunnerBackend.FLASHINFER_MXFP4,
-    )
-    monkeypatch.setattr(
-        mxfp4_module,
-        "get_server_args",
-        lambda: SimpleNamespace(flashinfer_mxfp4_moe_precision="default"),
-    )
-    monkeypatch.setattr(mxfp4_module, "is_sm100_supported", lambda: False)
-    monkeypatch.setattr(mxfp4_module, "is_sm120_supported", lambda: True)
-    monkeypatch.setattr(mxfp4_module, "_FI_HAS_SM120_CUTLASS_MXFP4", False)
-
-    with pytest.raises(RuntimeError, match="MXFP8-by-MXFP4 support"):
-        mxfp4_module.Mxfp4MoEMethod("test")
-
-
 def test_gpt_oss_cutlass_runner_state_is_dwdp_rebindable():
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -215,7 +193,7 @@ def test_gpt_oss_cutlass_forwards_nondefault_topology():
         quant_info.moe_ep_size,
         quant_info.moe_ep_rank,
     ) == (2, 1, 4, 3)
-    assert quant_info.use_mxfp8_act_scaling
+    assert quant_info.mxfp4_weight_global_scale is tensor
 
 
 def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):

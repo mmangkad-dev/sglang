@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-import inspect
 import os
 from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional
@@ -74,6 +73,8 @@ has_triton_kernels = is_triton_kernels_available()
 
 if is_flashinfer_available():
     from flashinfer import (
+        block_scale_interleave,
+        mxfp8_quantize,
         nvfp4_block_scale_interleave,
         trtllm_fp4_block_scale_moe,
     )
@@ -95,23 +96,8 @@ if is_flashinfer_available():
         interleave_moe_weights_for_sm90_mixed_gemm = None
         _FI_HAS_SM90_CUTLASS_MXFP4 = False
 
-    try:
-        from flashinfer import block_scale_interleave, mxfp8_quantize
-        from flashinfer.fused_moe import cutlass_fused_moe
-
-        _FI_HAS_SM120_CUTLASS_MXFP4 = (
-            callable(block_scale_interleave)
-            and callable(mxfp8_quantize)
-            and "use_mxfp8_act_scaling"
-            in inspect.signature(cutlass_fused_moe).parameters
-        )
-    except (ImportError, TypeError, ValueError):
-        block_scale_interleave = None
-        mxfp8_quantize = None
-        _FI_HAS_SM120_CUTLASS_MXFP4 = False
 else:
     _FI_HAS_SM90_CUTLASS_MXFP4 = False
-    _FI_HAS_SM120_CUTLASS_MXFP4 = False
 
 _flashinfer_mxfp4_permute_indices_cache: dict[torch.Size, torch.Tensor] = {}
 _flashinfer_mxfp4_permute_indices_device_cache: dict[
@@ -363,13 +349,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if is_sm100_supported():
                 self._fi_kernel = "trtllm_sm100"
             elif is_sm120_supported():
-                if not _FI_HAS_SM120_CUTLASS_MXFP4:
-                    raise RuntimeError(
-                        "moe_runner_backend=flashinfer_mxfp4 on SM120 requires "
-                        "block_scale_interleave and cutlass_fused_moe with "
-                        "MXFP8-by-MXFP4 support. Upgrade flashinfer-python or "
-                        "pick a different backend (e.g. marlin)."
-                    )
                 self._fi_kernel = "cutlass_sm120"
             elif is_sm90_supported():
                 if not _FI_HAS_SM90_CUTLASS_MXFP4:
@@ -1208,7 +1187,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_weight=layer.w2_weight,
             w13_weight_scale=layer.w13_weight_scale,
             w2_weight_scale=layer.w2_weight_scale,
-            use_mxfp8_act_scaling=self._fi_kernel == "cutlass_sm120",
             mxfp4_weight_global_scale=layer.mxfp4_weight_global_scale,
             w13_bias=layer.w13_weight_bias,
             w2_bias=layer.w2_weight_bias,
