@@ -76,7 +76,7 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     w13_weight_scale: torch.Tensor  # [E, 2*N, K/32]
     w2_weight_scale: torch.Tensor  # [E, K, N/32]
 
-    # The SM120 ABI requires a neutral per-expert global scale.
+    # A non-None global scale selects the SM120 MXFP8 activation path.
     mxfp4_weight_global_scale: Optional[torch.Tensor] = None
 
     # Per-expert bias. GPT-OSS has both; DSv4 leaves both None.

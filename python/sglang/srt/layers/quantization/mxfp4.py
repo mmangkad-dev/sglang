@@ -95,7 +95,6 @@ if is_flashinfer_available():
         interleave_moe_scales_for_sm90_mixed_gemm = None
         interleave_moe_weights_for_sm90_mixed_gemm = None
         _FI_HAS_SM90_CUTLASS_MXFP4 = False
-
 else:
     _FI_HAS_SM90_CUTLASS_MXFP4 = False
 
