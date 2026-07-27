@@ -184,6 +184,7 @@ class Mxfp4FlashinferCutlassMoEMethod:
             w2_weight=layer.w2_weight,
             w13_weight_scale=layer.w13_weight_scale_inv,
             w2_weight_scale=layer.w2_weight_scale_inv,
+            use_mxfp8_act_scaling=self._use_mxfp8_act_scaling,
             mxfp4_weight_global_scale=self._mxfp4_weight_global_scale_tensor,
             w13_bias=None,
             w2_bias=None,

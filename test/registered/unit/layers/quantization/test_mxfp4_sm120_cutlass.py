@@ -105,6 +105,119 @@ def test_dsv4_sm120_load_contract(monkeypatch):
     assert captured["fp4_scale_dtype"] == torch.float8_e8m0fnu
 
 
+def test_gpt_oss_sm120_requires_flashinfer_cutlass_support(monkeypatch):
+    import sglang.srt.layers.quantization.mxfp4 as mxfp4_module
+    from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+    monkeypatch.setattr(
+        mxfp4_module,
+        "get_moe_runner_backend",
+        lambda: MoeRunnerBackend.FLASHINFER_MXFP4,
+    )
+    monkeypatch.setattr(
+        mxfp4_module,
+        "get_server_args",
+        lambda: SimpleNamespace(flashinfer_mxfp4_moe_precision="default"),
+    )
+    monkeypatch.setattr(mxfp4_module, "is_sm100_supported", lambda: False)
+    monkeypatch.setattr(mxfp4_module, "is_sm120_supported", lambda: True)
+    monkeypatch.setattr(mxfp4_module, "_FI_HAS_SM120_CUTLASS_MXFP4", False)
+
+    with pytest.raises(RuntimeError, match="MXFP8-by-MXFP4 support"):
+        mxfp4_module.Mxfp4MoEMethod("test")
+
+
+def test_gpt_oss_cutlass_runner_state_is_dwdp_rebindable():
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+    from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+    class _Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_local_experts = 2
+            self.w13_weight = torch.nn.Parameter(torch.zeros(2, 1), requires_grad=False)
+
+    layer = _Layer()
+    method = Mxfp4MoEMethod.__new__(Mxfp4MoEMethod)
+    method._fi_kernel = "cutlass_sm120"
+    config = MoeRunnerConfig(
+        gemm1_alpha=1.5,
+        gemm1_clamp_limit=None,
+        swiglu_limit=9.0,
+    )
+    method._initialize_cutlass_runner_state(layer, config)
+
+    per_expert = dict(FusedMoE.named_per_expert_tensors(layer, 2))
+    assert "mxfp4_weight_global_scale" in per_expert
+    assert "swiglu_alpha" in per_expert
+    assert "swiglu_beta" in per_expert
+    assert "swiglu_limit" in per_expert
+    assert torch.equal(layer.swiglu_alpha, torch.full((2,), 1.5))
+    assert torch.equal(layer.swiglu_limit, torch.full((2,), 9.0))
+
+    full_scale = torch.ones(4)
+    FusedMoE.replace_expert_tensor(layer, "mxfp4_weight_global_scale", full_scale)
+    assert isinstance(layer.mxfp4_weight_global_scale, torch.nn.Parameter)
+    assert layer.mxfp4_weight_global_scale.shape == (4,)
+
+    sm90_layer = _Layer()
+    method._fi_kernel = "cutlass_sm90"
+    sm90_config = MoeRunnerConfig(
+        gemm1_alpha=1.25,
+        gemm1_clamp_limit=8.0,
+        swiglu_limit=9.0,
+    )
+    method._initialize_cutlass_runner_state(sm90_layer, sm90_config)
+    assert sm90_layer.mxfp4_weight_global_scale is None
+    assert torch.equal(sm90_layer.swiglu_alpha, torch.full((2,), 1.25))
+    assert torch.equal(sm90_layer.swiglu_limit, torch.full((2,), 8.0))
+
+
+def test_gpt_oss_cutlass_forwards_nondefault_topology():
+    from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+    captured = {}
+
+    class _Runner:
+        def run(self, dispatch_output, quant_info):
+            captured["quant_info"] = quant_info
+            return dispatch_output
+
+    tensor = torch.empty(1)
+    layer = SimpleNamespace(
+        w13_weight=tensor,
+        w2_weight=tensor,
+        w13_weight_scale=tensor,
+        w2_weight_scale=tensor,
+        mxfp4_weight_global_scale=tensor,
+        w13_weight_bias=tensor,
+        w2_weight_bias=tensor,
+        swiglu_alpha=tensor,
+        swiglu_beta=tensor,
+        swiglu_limit=tensor,
+        moe_tp_size=2,
+        moe_tp_rank=1,
+        moe_ep_size=4,
+        moe_ep_rank=3,
+    )
+    method = Mxfp4MoEMethod.__new__(Mxfp4MoEMethod)
+    method._fi_kernel = "cutlass_sm120"
+    method._padded_hidden = 128
+    method.runner = _Runner()
+    dispatch_output = object()
+
+    assert method._apply_cutlass(layer, dispatch_output) is dispatch_output
+    quant_info = captured["quant_info"]
+    assert (
+        quant_info.moe_tp_size,
+        quant_info.moe_tp_rank,
+        quant_info.moe_ep_size,
+        quant_info.moe_ep_rank,
+    ) == (2, 1, 4, 3)
+    assert quant_info.use_mxfp8_act_scaling
+
+
 def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -247,7 +360,8 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
     assert torch.equal(actual, expected)
 
 
-def test_gpt_oss_sm120_matches_direct_flashinfer(monkeypatch):
+@pytest.mark.parametrize("hidden,intermediate", [(160, 160), (256, 256)])
+def test_gpt_oss_sm120_matches_direct_flashinfer(monkeypatch, hidden, intermediate):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability()[0] != 12:
@@ -272,7 +386,7 @@ def test_gpt_oss_sm120_matches_direct_flashinfer(monkeypatch):
     monkeypatch.setattr(runner_module, "is_allocation_symmetric", lambda: False)
     monkeypatch.setattr(runner_module, "get_tp_group", lambda: None)
 
-    num_experts, hidden, intermediate = 2, 160, 160
+    num_experts = 2
     padded_hidden = padded_intermediate = 256
     generator = torch.Generator(device="cuda").manual_seed(2)
     w13 = torch.randint(
@@ -346,10 +460,15 @@ def test_gpt_oss_sm120_matches_direct_flashinfer(monkeypatch):
     method._padded_hidden = padded_hidden
     method._padded_intermediate = padded_intermediate
     method.moe_runner_config = config
-    method._mxfp4_weight_global_scale = None
-    method._initialize_sm120_cutlass_runner_state(layer, config)
+    method._initialize_cutlass_runner_state(layer, config)
+    original_w2_weight = layer.w2_weight
+    original_w2_bias = layer.w2_weight_bias
     method._process_weights_for_sm120_cutlass(layer)
     method.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, config)
+
+    if hidden == padded_hidden and intermediate == padded_intermediate:
+        assert layer.w2_weight is original_w2_weight
+        assert layer.w2_weight_bias is original_w2_bias
 
     expected_w13 = torch.zeros(
         num_experts,
@@ -417,8 +536,6 @@ def test_gpt_oss_sm120_matches_direct_flashinfer(monkeypatch):
         device="cuda",
     )
     expected_w2_bias[:, :hidden] = w2_bias
-
-    assert layer._mxfp4_backend == "flashinfer_cutlass_sm120"
 
     x = torch.randn(4, hidden, dtype=torch.bfloat16, device="cuda", generator=generator)
     logits = torch.randn(

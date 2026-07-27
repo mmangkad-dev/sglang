@@ -146,7 +146,7 @@ def _round_up(x, base):
     return ((x + base - 1) // base) * base
 
 
-def _build_method(num_experts, hidden, inter):
+def _build_method(num_experts, hidden, inter, layer):
     from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
     method = Mxfp4MoEMethod.__new__(Mxfp4MoEMethod)
@@ -159,9 +159,9 @@ def _build_method(num_experts, hidden, inter):
     method.intermediate_size_per_partition = inter
     method._padded_hidden = _round_up(hidden, 128)
     method._padded_intermediate = _round_up(inter, 128)
-    method._mxfp4_weight_global_scale = None
     method.use_flashinfer = True
     method.runner = _build_flashinfer_mxfp4_runner(num_experts, hidden, inter)
+    method._initialize_cutlass_runner_state(layer, method.runner.config)
     return method
 
 
@@ -272,7 +272,7 @@ def test_process_weights_matches_direct_interleave(num_experts, hidden, inter):
     layer = _build_mock_layer(
         num_experts, hidden, inter, w13, w2, w13_s, w2_s, w13_b, w2_b
     )
-    method = _build_method(num_experts, hidden, inter)
+    method = _build_method(num_experts, hidden, inter, layer)
     method._process_weights_for_sm90_cutlass(layer)
 
     N_pad = _round_up(inter, 128)
@@ -350,7 +350,7 @@ def test_apply_cutlass_sm90_matches_flashinfer_direct(
     layer = _build_mock_layer(
         num_experts, hidden, inter, w13, w2, w13_s, w2_s, w13_b, w2_b
     )
-    method = _build_method(num_experts, hidden, inter)
+    method = _build_method(num_experts, hidden, inter, layer)
     method._process_weights_for_sm90_cutlass(layer)
 
     out_sglang = method._apply_cutlass(

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional
@@ -73,7 +74,6 @@ has_triton_kernels = is_triton_kernels_available()
 
 if is_flashinfer_available():
     from flashinfer import (
-        mxfp8_quantize,
         nvfp4_block_scale_interleave,
         trtllm_fp4_block_scale_moe,
     )
@@ -94,8 +94,24 @@ if is_flashinfer_available():
         interleave_moe_scales_for_sm90_mixed_gemm = None
         interleave_moe_weights_for_sm90_mixed_gemm = None
         _FI_HAS_SM90_CUTLASS_MXFP4 = False
+
+    try:
+        from flashinfer import block_scale_interleave, mxfp8_quantize
+        from flashinfer.fused_moe import cutlass_fused_moe
+
+        _FI_HAS_SM120_CUTLASS_MXFP4 = (
+            callable(block_scale_interleave)
+            and callable(mxfp8_quantize)
+            and "use_mxfp8_act_scaling"
+            in inspect.signature(cutlass_fused_moe).parameters
+        )
+    except (ImportError, TypeError, ValueError):
+        block_scale_interleave = None
+        mxfp8_quantize = None
+        _FI_HAS_SM120_CUTLASS_MXFP4 = False
 else:
     _FI_HAS_SM90_CUTLASS_MXFP4 = False
+    _FI_HAS_SM120_CUTLASS_MXFP4 = False
 
 _flashinfer_mxfp4_permute_indices_cache: dict[torch.Size, torch.Tensor] = {}
 _flashinfer_mxfp4_permute_indices_device_cache: dict[
@@ -343,11 +359,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         #   - SM90  (Hopper)     -> cutlass_fused_moe(use_w4_group_scaling=True)
         #                           (FlashInfer PR #3084, post-0.6.10)
         self._fi_kernel: Optional[str] = None
-        self._mxfp4_weight_global_scale: Optional[torch.Tensor] = None
         if self.use_flashinfer:
             if is_sm100_supported():
                 self._fi_kernel = "trtllm_sm100"
             elif is_sm120_supported():
+                if not _FI_HAS_SM120_CUTLASS_MXFP4:
+                    raise RuntimeError(
+                        "moe_runner_backend=flashinfer_mxfp4 on SM120 requires "
+                        "block_scale_interleave and cutlass_fused_moe with "
+                        "MXFP8-by-MXFP4 support. Upgrade flashinfer-python or "
+                        "pick a different backend (e.g. marlin)."
+                    )
                 self._fi_kernel = "cutlass_sm120"
             elif is_sm90_supported():
                 if not _FI_HAS_SM90_CUTLASS_MXFP4:
@@ -511,6 +533,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_bias", w2_weight_bias)
         set_weight_attrs(w2_weight_bias, extra_weight_attrs)
+        # SM120 fills this with a per-expert Parameter during runner creation.
+        # Registering it on the layer lets DWDP gather/rebind it together with
+        # the other expert-sharded side tensors. SM90 intentionally leaves it
+        # as None to select W4A16 execution.
+        layer.register_parameter("mxfp4_weight_global_scale", None)
 
     def process_weights_after_loading(self, layer):
         if self.use_marlin:
@@ -974,20 +1001,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w2_bias_padded = torch.zeros(E, K_pad, dtype=bias_dtype, device=device)
         w2_bias_padded[:, :K_un] = layer.w2_weight_bias.data
 
-        # ---- Per-expert SwiGLU scalars (GPT-OSS defaults) ------------------
-        layer.swiglu_alpha = Parameter(
-            torch.full((E,), 1.702, dtype=torch.float32, device=device),
-            requires_grad=False,
-        )
-        layer.swiglu_beta = Parameter(
-            torch.full((E,), 1.0, dtype=torch.float32, device=device),
-            requires_grad=False,
-        )
-        layer.swiglu_limit = Parameter(
-            torch.full((E,), 7.0, dtype=torch.float32, device=device),
-            requires_grad=False,
-        )
-
         # ---- FlashInfer SM90 byte / scale interleave -----------------------
         # The padded buffers above are contiguous by construction (allocated
         # via torch.zeros + slice assignment), so we feed them straight in.
@@ -1026,8 +1039,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layout.  Keep weights checkpoint-packed, rebuild padded tensors in the
         expected order, and interleave only their scales.
         """
-        from flashinfer import block_scale_interleave
-
         sf_block_size = 32
         N_un = layer.w13_weight.shape[1] // 2
         K_un = layer.w13_weight.shape[2] * 2
@@ -1036,11 +1047,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         E = layer.num_local_experts
         device = layer.w13_weight.device
         bias_dtype = layer.w13_weight_bias.dtype
+        is_aligned = N_un == N_pad and K_un == K_pad
 
         def _stack_up_gate_w13(unpadded_w13, last_pad, last_un):
             gate_rows = unpadded_w13[:, 0::2, :]
             up_rows = unpadded_w13[:, 1::2, :]
-            out = torch.zeros(
+            factory = torch.empty if is_aligned and last_pad == last_un else torch.zeros
+            out = factory(
                 E, 2 * N_pad, last_pad, dtype=unpadded_w13.dtype, device=device
             )
             out[:, :N_un, :last_un] = up_rows
@@ -1050,52 +1063,67 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w13_padded = _stack_up_gate_w13(
             layer.w13_weight.data.view(torch.uint8), K_pad // 2, K_un // 2
         )
+        layer.w13_weight = Parameter(w13_padded, requires_grad=False)
+
         w13_scale_padded = _stack_up_gate_w13(
             layer.w13_weight_scale.data,
             K_pad // sf_block_size,
             K_un // sf_block_size,
         )
-        w13_bias_padded = torch.zeros(E, 2 * N_pad, dtype=bias_dtype, device=device)
-        w13_bias_padded[:, :N_un] = layer.w13_weight_bias.data[:, 1::2]
-        w13_bias_padded[:, N_pad : N_pad + N_un] = layer.w13_weight_bias.data[:, 0::2]
-
-        w2_padded = torch.zeros(E, K_pad, N_pad // 2, dtype=torch.uint8, device=device)
-        w2_padded[:, :K_un, : N_un // 2] = layer.w2_weight.data.view(torch.uint8)
-        w2_scale_padded = torch.zeros(
-            E,
-            K_pad,
-            N_pad // sf_block_size,
-            dtype=torch.uint8,
-            device=device,
-        )
-        w2_scale_padded[:, :K_un, : N_un // sf_block_size] = layer.w2_weight_scale.data
-        w2_bias_padded = torch.zeros(E, K_pad, dtype=bias_dtype, device=device)
-        w2_bias_padded[:, :K_un] = layer.w2_weight_bias.data
-
-        layer.w13_weight = Parameter(w13_padded, requires_grad=False)
-        layer.w2_weight = Parameter(w2_padded, requires_grad=False)
         layer.w13_weight_scale = Parameter(
             block_scale_interleave(w13_scale_padded).reshape_as(w13_scale_padded),
             requires_grad=False,
         )
-        layer.w2_weight_scale = Parameter(
-            block_scale_interleave(w2_scale_padded).reshape_as(w2_scale_padded),
-            requires_grad=False,
-        )
+        del w13_scale_padded
+
+        bias_factory = torch.empty if is_aligned else torch.zeros
+        w13_bias_padded = bias_factory(E, 2 * N_pad, dtype=bias_dtype, device=device)
+        w13_bias_padded[:, :N_un] = layer.w13_weight_bias.data[:, 1::2]
+        w13_bias_padded[:, N_pad : N_pad + N_un] = layer.w13_weight_bias.data[:, 0::2]
         layer.w13_weight_bias = Parameter(w13_bias_padded, requires_grad=False)
-        layer.w2_weight_bias = Parameter(w2_bias_padded, requires_grad=False)
 
-        layer._mxfp4_backend = "flashinfer_cutlass_sm120"
-        torch.cuda.empty_cache()
+        if is_aligned:
+            # Down-projection weights and bias need no layout conversion.
+            # Interleave the only transformed tensor (its scale) in place.
+            w2_scale = layer.w2_weight_scale.data
+            w2_scale.copy_(block_scale_interleave(w2_scale).reshape_as(w2_scale))
+        else:
+            w2_padded = torch.zeros(
+                E, K_pad, N_pad // 2, dtype=torch.uint8, device=device
+            )
+            w2_padded[:, :K_un, : N_un // 2] = layer.w2_weight.data.view(torch.uint8)
+            layer.w2_weight = Parameter(w2_padded, requires_grad=False)
 
-    def _initialize_sm120_cutlass_runner_state(
+            w2_scale_padded = torch.zeros(
+                E,
+                K_pad,
+                N_pad // sf_block_size,
+                dtype=torch.uint8,
+                device=device,
+            )
+            w2_scale_padded[:, :K_un, : N_un // sf_block_size] = (
+                layer.w2_weight_scale.data
+            )
+            layer.w2_weight_scale = Parameter(
+                block_scale_interleave(w2_scale_padded).reshape_as(w2_scale_padded),
+                requires_grad=False,
+            )
+            del w2_scale_padded
+
+            w2_bias_padded = torch.zeros(E, K_pad, dtype=bias_dtype, device=device)
+            w2_bias_padded[:, :K_un] = layer.w2_weight_bias.data
+            layer.w2_weight_bias = Parameter(w2_bias_padded, requires_grad=False)
+
+    def _initialize_cutlass_runner_state(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ) -> None:
-        """Create per-expert tensors consumed by the SM120 CUTLASS runner."""
+        """Create per-expert tensors consumed by SM90 and SM120 CUTLASS."""
         E = layer.num_local_experts
         device = layer.w13_weight.device
         alpha = moe_runner_config.gemm1_alpha
         limit = moe_runner_config.gemm1_clamp_limit
+        if limit is None:
+            limit = moe_runner_config.swiglu_limit
         layer.swiglu_alpha = Parameter(
             torch.full(
                 (E,),
@@ -1117,9 +1145,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ),
             requires_grad=False,
         )
-        self._mxfp4_weight_global_scale = torch.ones(
-            E, dtype=torch.float32, device=device
-        )
+        if self._fi_kernel == "cutlass_sm120":
+            layer.mxfp4_weight_global_scale = Parameter(
+                torch.ones(E, dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
+        else:
+            layer.mxfp4_weight_global_scale = None
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -1154,8 +1186,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # lookup at `MoeRunner.__init__` finds it.
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
 
-            if self._fi_kernel == "cutlass_sm120":
-                self._initialize_sm120_cutlass_runner_state(layer, moe_runner_config)
+            self._initialize_cutlass_runner_state(layer, moe_runner_config)
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             # Legacy bypass path (e.g. SM100 trtllm-gen under flashinfer_mxfp4)
@@ -1177,7 +1208,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_weight=layer.w2_weight,
             w13_weight_scale=layer.w13_weight_scale,
             w2_weight_scale=layer.w2_weight_scale,
-            mxfp4_weight_global_scale=self._mxfp4_weight_global_scale,
+            use_mxfp8_act_scaling=self._fi_kernel == "cutlass_sm120",
+            mxfp4_weight_global_scale=layer.mxfp4_weight_global_scale,
             w13_bias=layer.w13_weight_bias,
             w2_bias=layer.w2_weight_bias,
             swiglu_alpha=layer.swiglu_alpha,
