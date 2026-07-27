@@ -1,7 +1,7 @@
 """Unit test for the SM90 cutlass MXFP4 path in :class:`Mxfp4MoEMethod`.
 
 Builds a single-layer GPT-OSS-style MoE with random MXFP4 weights, drives the
-SGLang plumbing (``_process_weights_for_sm90_cutlass`` + ``_apply_sm90_cutlass``)
+SGLang plumbing (``_process_weights_for_sm90_cutlass`` + ``_apply_cutlass``)
 and compares against a direct FlashInfer ``cutlass_fused_moe`` call with the
 same inputs. Both paths invoke the same SM90 kernel from FlashInfer PR #3084,
 so outputs must be bit-exact.
@@ -159,6 +159,7 @@ def _build_method(num_experts, hidden, inter):
     method.intermediate_size_per_partition = inter
     method._padded_hidden = _round_up(hidden, 128)
     method._padded_intermediate = _round_up(inter, 128)
+    method._mxfp4_weight_global_scale = None
     method.use_flashinfer = True
     method.runner = _build_flashinfer_mxfp4_runner(num_experts, hidden, inter)
     return method
@@ -316,10 +317,10 @@ def test_process_weights_matches_direct_interleave(num_experts, hidden, inter):
         (8, 4, 192, 192, 2),
     ],
 )
-def test_apply_sm90_cutlass_matches_flashinfer_direct(
+def test_apply_cutlass_sm90_matches_flashinfer_direct(
     tokens, num_experts, hidden, inter, top_k, monkeypatch
 ):
-    """End-to-end: SGLang's ``_apply_sm90_cutlass`` must produce the same
+    """End-to-end: SGLang's SM90 ``_apply_cutlass`` must produce the same
     output as a direct FlashInfer ``cutlass_fused_moe`` call fed with the
     same processed weights / scales / biases. The processing pipeline is
     covered separately by ``test_process_weights_matches_direct_interleave``;
@@ -352,7 +353,7 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
     method = _build_method(num_experts, hidden, inter)
     method._process_weights_for_sm90_cutlass(layer)
 
-    out_sglang = method._apply_sm90_cutlass(
+    out_sglang = method._apply_cutlass(
         layer, _MockDispatchOutput(x.clone(), topk_w, topk_i)
     ).hidden_states
 

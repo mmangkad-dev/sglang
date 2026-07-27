@@ -247,14 +247,16 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
     assert torch.equal(actual, expected)
 
 
-def test_gpt_oss_sm120_layout_and_kernel(monkeypatch):
+def test_gpt_oss_sm120_matches_direct_flashinfer(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability()[0] != 12:
         pytest.skip("SM120 required")
     pytest.importorskip("flashinfer.fused_moe")
 
-    from flashinfer import block_scale_interleave
+    from flashinfer import block_scale_interleave, mxfp8_quantize
+    from flashinfer.fused_moe import cutlass_fused_moe
+    from flashinfer.fused_moe.core import ActivationType
 
     import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as runner_module
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -340,9 +342,12 @@ def test_gpt_oss_sm120_layout_and_kernel(monkeypatch):
         gemm1_clamp_limit=7.0,
     )
     method = Mxfp4MoEMethod.__new__(Mxfp4MoEMethod)
+    method._fi_kernel = "cutlass_sm120"
     method._padded_hidden = padded_hidden
     method._padded_intermediate = padded_intermediate
     method.moe_runner_config = config
+    method._mxfp4_weight_global_scale = None
+    method._initialize_sm120_cutlass_runner_state(layer, config)
     method._process_weights_for_sm120_cutlass(layer)
     method.runner = MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, config)
 
@@ -357,7 +362,6 @@ def test_gpt_oss_sm120_layout_and_kernel(monkeypatch):
     expected_w13[
         :, padded_intermediate : padded_intermediate + intermediate, : hidden // 2
     ] = w13[:, 0::2]
-    assert torch.equal(layer.w13_weight, expected_w13)
 
     expected_w13_scale = torch.zeros(
         num_experts,
@@ -375,12 +379,48 @@ def test_gpt_oss_sm120_layout_and_kernel(monkeypatch):
     expected_w13_scale = block_scale_interleave(expected_w13_scale).reshape_as(
         expected_w13_scale
     )
-    assert torch.equal(layer.w13_weight_scale, expected_w13_scale)
+
+    expected_w2 = torch.zeros(
+        num_experts,
+        padded_hidden,
+        padded_intermediate // 2,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    expected_w2[:, :hidden, : intermediate // 2] = w2
+    expected_w2_scale = torch.zeros(
+        num_experts,
+        padded_hidden,
+        padded_intermediate // 32,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    expected_w2_scale[:, :hidden, : intermediate // 32] = w2_scale
+    expected_w2_scale = block_scale_interleave(expected_w2_scale).reshape_as(
+        expected_w2_scale
+    )
+
+    expected_w13_bias = torch.zeros(
+        num_experts,
+        2 * padded_intermediate,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    expected_w13_bias[:, :intermediate] = w13_bias[:, 1::2]
+    expected_w13_bias[:, padded_intermediate : padded_intermediate + intermediate] = (
+        w13_bias[:, 0::2]
+    )
+    expected_w2_bias = torch.zeros(
+        num_experts,
+        padded_hidden,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    expected_w2_bias[:, :hidden] = w2_bias
+
     assert layer._mxfp4_backend == "flashinfer_cutlass_sm120"
 
-    x = torch.randn(
-        4, hidden, dtype=torch.bfloat16, device="cuda", generator=generator
-    )
+    x = torch.randn(4, hidden, dtype=torch.bfloat16, device="cuda", generator=generator)
     logits = torch.randn(
         4, num_experts, dtype=torch.float32, device="cuda", generator=generator
     )
@@ -390,9 +430,52 @@ def test_gpt_oss_sm120_layout_and_kernel(monkeypatch):
         None,
         StandardTopKOutput(topk_weights, topk_ids.to(torch.int32), logits),
     )
-    output = method._apply_cutlass(layer, dispatch_output).hidden_states
-    assert output.shape == x.shape
-    assert torch.isfinite(output).all()
+    actual = method._apply_cutlass(layer, dispatch_output).hidden_states
+
+    x_padded = torch.nn.functional.pad(x, (0, padded_hidden - hidden))
+    x_quant, x_scale = mxfp8_quantize(
+        x_padded,
+        is_sf_swizzled_layout=True,
+        alignment=32,
+    )
+    expected_padded = torch.empty(
+        x.shape[0],
+        padded_hidden,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    expected_global_scale = torch.ones(num_experts, dtype=torch.float32, device="cuda")
+    cutlass_fused_moe(
+        input=x_quant,
+        token_selected_experts=topk_ids.to(torch.int32),
+        token_final_scales=topk_weights,
+        fc1_expert_weights=expected_w13.view(torch.int64),
+        fc2_expert_weights=expected_w2.view(torch.int64),
+        output_dtype=torch.bfloat16,
+        quant_scales=[
+            expected_w13_scale.view(torch.int32),
+            expected_global_scale,
+            expected_w2_scale.view(torch.int32),
+            expected_global_scale,
+        ],
+        input_sf=x_scale,
+        fc1_expert_biases=expected_w13_bias,
+        fc2_expert_biases=expected_w2_bias,
+        swiglu_alpha=torch.full(
+            (num_experts,), 1.702, dtype=torch.float32, device="cuda"
+        ),
+        swiglu_beta=torch.ones(num_experts, dtype=torch.float32, device="cuda"),
+        swiglu_limit=torch.full(
+            (num_experts,), 7.0, dtype=torch.float32, device="cuda"
+        ),
+        use_mxfp8_act_scaling=True,
+        activation_type=ActivationType.Swiglu,
+        tune_max_num_tokens=4,
+        output=expected_padded,
+    )
+    expected = expected_padded[:, :hidden].contiguous()
+
+    assert torch.equal(actual, expected)
 
 
 if __name__ == "__main__":

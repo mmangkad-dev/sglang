@@ -343,6 +343,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         #   - SM90  (Hopper)     -> cutlass_fused_moe(use_w4_group_scaling=True)
         #                           (FlashInfer PR #3084, post-0.6.10)
         self._fi_kernel: Optional[str] = None
+        self._mxfp4_weight_global_scale: Optional[torch.Tensor] = None
         if self.use_flashinfer:
             if is_sm100_supported():
                 self._fi_kernel = "trtllm_sm100"
@@ -1050,7 +1051,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w13_weight.data.view(torch.uint8), K_pad // 2, K_un // 2
         )
         w13_scale_padded = _stack_up_gate_w13(
-            layer.w13_weight_scale.data.view(torch.uint8),
+            layer.w13_weight_scale.data,
             K_pad // sf_block_size,
             K_un // sf_block_size,
         )
@@ -1067,9 +1068,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             dtype=torch.uint8,
             device=device,
         )
-        w2_scale_padded[:, :K_un, : N_un // sf_block_size] = (
-            layer.w2_weight_scale.data.view(torch.uint8)
-        )
+        w2_scale_padded[:, :K_un, : N_un // sf_block_size] = layer.w2_weight_scale.data
         w2_bias_padded = torch.zeros(E, K_pad, dtype=bias_dtype, device=device)
         w2_bias_padded[:, :K_un] = layer.w2_weight_bias.data
 
@@ -1086,8 +1085,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.w13_weight_bias = Parameter(w13_bias_padded, requires_grad=False)
         layer.w2_weight_bias = Parameter(w2_bias_padded, requires_grad=False)
 
-        alpha = self.moe_runner_config.gemm1_alpha
-        limit = self.moe_runner_config.gemm1_clamp_limit
+        layer._mxfp4_backend = "flashinfer_cutlass_sm120"
+        torch.cuda.empty_cache()
+
+    def _initialize_sm120_cutlass_runner_state(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ) -> None:
+        """Create per-expert tensors consumed by the SM120 CUTLASS runner."""
+        E = layer.num_local_experts
+        device = layer.w13_weight.device
+        alpha = moe_runner_config.gemm1_alpha
+        limit = moe_runner_config.gemm1_clamp_limit
         layer.swiglu_alpha = Parameter(
             torch.full(
                 (E,),
@@ -1112,8 +1120,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self._mxfp4_weight_global_scale = torch.ones(
             E, dtype=torch.float32, device=device
         )
-        layer._mxfp4_backend = "flashinfer_cutlass_sm120"
-        torch.cuda.empty_cache()
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -1140,14 +1146,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_marlin()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
-        elif (
-            moe_runner_backend.is_flashinfer_mxfp4()
-            and self._fi_kernel in ("cutlass_sm90", "cutlass_sm120")
+        elif moe_runner_backend.is_flashinfer_mxfp4() and self._fi_kernel in (
+            "cutlass_sm90",
+            "cutlass_sm120",
         ):
             # Register the fused func at runner construction so the FusedOpPool
             # lookup at `MoeRunner.__init__` finds it.
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
 
+            if self._fi_kernel == "cutlass_sm120":
+                self._initialize_sm120_cutlass_runner_state(layer, moe_runner_config)
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             # Legacy bypass path (e.g. SM100 trtllm-gen under flashinfer_mxfp4)
@@ -1155,7 +1163,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             pass
 
     def _apply_cutlass(self, layer, dispatch_output):
-        """Run the SM90 W4A16 or SM120 MXFP8-by-MXFP4 CUTLASS path."""
+        """Run the SM90 W4A16 or SM120 MXFP8-by-MXFP4 CUTLASS path.
+
+        This builds the quantization payload; the kernel call lives in
+        ``moe_runner/flashinfer_cutlass.py``.
+        """
         from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
             FlashInferCutlassMxfp4MoeQuantInfo,
         )
@@ -1165,7 +1177,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_weight=layer.w2_weight,
             w13_weight_scale=layer.w13_weight_scale,
             w2_weight_scale=layer.w2_weight_scale,
-            mxfp4_weight_global_scale=getattr(self, "_mxfp4_weight_global_scale", None),
+            mxfp4_weight_global_scale=self._mxfp4_weight_global_scale,
             w13_bias=layer.w13_weight_bias,
             w2_bias=layer.w2_weight_bias,
             swiglu_alpha=layer.swiglu_alpha,
