@@ -388,10 +388,11 @@ def silu_and_mul_masked_post_quant_fwd(
     ``output_scale``'s dtype selects the scale format and kernel schedule:
       float32 [E, token_num_padded, G]: row-major scales (rounded to powers of
         two when ``scale_ue8m0``); token axis grid-strides over the padded dim.
-      int32 [E, G // 4, token_num_padded]: packed UE8M0, 4 exponent bytes per
+      int32 [E, ceil(G / 4), token_num_padded]: packed UE8M0, 4 exponent bytes per
         int32 (deep_gemm's MN-major packed layout, no separate transform
-        needed). Requires ``scale_ue8m0``, ``G % 4 == 0``, and
-        ``num_real_tokens``/``topk`` to size the dense flat-work grid.
+        needed). The last word is zero-padded when ``G`` is not divisible by
+        four. Requires ``scale_ue8m0`` and ``num_real_tokens``/``topk`` to
+        size the dense flat-work grid.
 
     ``gemm1_alpha > 0`` switches the activation to the gpt-oss swiglu
     ``min(gate, limit) * sigmoid(alpha * gate) * (clamp(up, +-limit) + 1)``.
@@ -420,12 +421,8 @@ def silu_and_mul_masked_post_quant_fwd(
         ), "the packed schedule sizes its grid from num_real_tokens * topk"
         E, m_max, _ = input.shape
         G = size_n // quant_group_size
-        assert G % 4 == 0, "packed UE8M0 path requires num_groups % 4 == 0"
         BLOCK_N = quant_group_size * 4
-        assert (
-            size_n % BLOCK_N == 0
-        ), "packed UE8M0 path requires size_n % (4*group) == 0"
-        hidden_dim_split = size_n // BLOCK_N
+        hidden_dim_split = triton.cdiv(size_n, BLOCK_N)
         assert tuple(output_scale.shape) == (E, hidden_dim_split, m_max)
 
         grid = (num_real_tokens * topk, hidden_dim_split)
@@ -577,6 +574,8 @@ def _silu_and_mul_post_quant_packed_kernel(
     # get_mn_major_tma_aligned_packed_ue8m0_tensor (fp32>>23 -> uint8 -> 4-group int32 view).
     s_bits = output_s.to(tl.int32, bitcast=True)
     expo = (s_bits >> 23) & 0xFF
+    group_ids = hidden_dim_block_index * N_GROUPS + tl.arange(0, N_GROUPS)
+    expo = tl.where(group_ids < tl.cdiv(size_n, QUANT_GROUP_SIZE), expo, 0)
     shifts = tl.arange(0, N_GROUPS) * 8
     packed = tl.sum(expo << shifts)
     scale_off = (

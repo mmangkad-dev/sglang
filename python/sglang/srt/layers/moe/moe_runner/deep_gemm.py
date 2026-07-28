@@ -531,10 +531,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         num_real_tokens = (
             topk_ids_rs.shape[0]
             if (
-                use_mxfp8
-                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
                 and topk_ids_rs is not None
-                and "src2dst" in running_state
+                and (
+                    quant_info.is_fp4_experts
+                    or (use_mxfp8 and "src2dst" in running_state)
+                )
             )
             else None
         )
@@ -990,8 +992,9 @@ def _varlen_deep_gemm_silu_mul_quant(
 
     # oai-swiglu (gemm1_alpha) stays on the Triton kernel until
     # per_token_group_quant grows an activation-kind axis. The output_scale dtype picks the schedule: packed
-    # int32 UE8M0 (no follow-up transform; needs G % 4 == 0 and the
-    # num_real_tokens grid bound) when eligible, row-major fp32 otherwise.
+    # int32 UE8M0 (no follow-up transform; the last packed word is padded
+    # when G % 4 != 0) when the num_real_tokens grid bound is available,
+    # row-major fp32 otherwise.
     if gemm1_alpha is not None:
         assert (
             swiglu_limit is None
@@ -1002,16 +1005,13 @@ def _varlen_deep_gemm_silu_mul_quant(
         )
 
         use_packed = (
-            deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            and num_real_tokens is not None
-            and G % 4 == 0
-            and D % (group_size * 4) == 0
+            deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and num_real_tokens is not None
         )
         down_input = torch.empty(
             (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
         )
         down_input_scale = torch.empty(
-            (E, G // 4, N) if use_packed else (E, N, G),
+            (E, ceil_div(G, 4), N) if use_packed else (E, N, G),
             device=hidden_states_device,
             dtype=torch.int32 if use_packed else torch.float32,
         )

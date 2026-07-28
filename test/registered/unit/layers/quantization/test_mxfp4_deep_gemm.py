@@ -353,7 +353,9 @@ class TestMxfp4DeepGemmLayout(CustomTestCase):
 
         runner_input = DeepGemmRunnerInput(
             hidden_states=torch.zeros(num_experts, max_tokens, 4),
-            hidden_states_scale=torch.ones(num_experts, max_tokens, 1),
+            hidden_states_scale=torch.ones(
+                num_experts, max_tokens, 1, dtype=torch.int32
+            ),
             use_masked_gemm=True,
             masked_m=torch.full((num_experts,), max_tokens, dtype=torch.int32),
             expected_m=max_tokens,
@@ -368,16 +370,20 @@ class TestMxfp4DeepGemmLayout(CustomTestCase):
             w13_weight=torch.zeros(num_experts, gate_up_size, 2, dtype=torch.int8),
             w2_weight=torch.zeros(num_experts, output_size, 1, dtype=torch.int8),
             use_fp8=True,
-            w13_scale=torch.ones(num_experts, gate_up_size, 1),
-            w2_scale=torch.ones(num_experts, output_size, 1),
+            w13_scale=torch.ones(num_experts, gate_up_size, 1, dtype=torch.int32),
+            w2_scale=torch.ones(num_experts, output_size, 1, dtype=torch.int32),
             w13_bias=w13_bias,
             w2_bias=w2_bias,
             block_shape=[1, 32],
             is_fp4_experts=True,
         )
-        running_state = {"hidden_states_device": torch.device("cpu")}
+        running_state = {
+            "hidden_states_device": torch.device("cpu"),
+            "topk_ids": torch.zeros(max_tokens, 1, dtype=torch.int64),
+        }
         activation_input = None
         activation_group_size = None
+        activation_num_real_tokens = None
         gemm_recipes = []
 
         def fake_grouped_gemm(_lhs, _rhs, output, *_args, **_kwargs):
@@ -385,16 +391,19 @@ class TestMxfp4DeepGemmLayout(CustomTestCase):
             output.zero_()
 
         def fake_activation(gateup_output, *_args, **_kwargs):
-            nonlocal activation_group_size, activation_input
+            nonlocal activation_group_size
+            nonlocal activation_input
+            nonlocal activation_num_real_tokens
             activation_input = gateup_output.clone()
             activation_group_size = _kwargs["group_size"]
+            activation_num_real_tokens = _kwargs["num_real_tokens"]
             return (
                 torch.zeros(num_experts, max_tokens, gate_up_size // 2),
-                torch.ones(num_experts, max_tokens, 1),
+                torch.ones(num_experts, max_tokens, 1, dtype=torch.int32),
             )
 
         with (
-            patch.object(deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", False),
+            patch.object(deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", True),
             patch.object(deep_gemm_wrapper, "DEEPGEMM_NEED_TMA_ALIGNED_SCALES", False),
             patch.object(
                 deep_gemm_wrapper,
@@ -425,6 +434,7 @@ class TestMxfp4DeepGemmLayout(CustomTestCase):
             w13_bias[:, None, :].expand(-1, max_tokens, -1),
         )
         self.assertEqual(activation_group_size, 128)
+        self.assertEqual(activation_num_real_tokens, max_tokens)
         self.assertEqual(
             gemm_recipes,
             [((1, 128), (1, 32)), ((1, 128), (1, 32))],
@@ -433,6 +443,48 @@ class TestMxfp4DeepGemmLayout(CustomTestCase):
             output,
             w2_bias[:, None, :].expand(-1, max_tokens, -1),
         )
+
+    def test_gpt_oss_masked_activation_packs_partial_ue8m0_group(self):
+        num_experts, max_tokens, intermediate_size = 2, 3, 2944
+        gateup_output = torch.zeros(
+            num_experts,
+            max_tokens,
+            2 * intermediate_size,
+            dtype=torch.bfloat16,
+        )
+        masked_m = torch.full((num_experts,), max_tokens, dtype=torch.int32)
+
+        with (
+            patch.object(deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", True),
+            patch(
+                "sglang.kernels.ops.moe.ep_moe_kernels."
+                "silu_and_mul_masked_post_quant_fwd"
+            ) as activation,
+        ):
+            output, output_scale = deep_gemm_runner._varlen_deep_gemm_silu_mul_quant(
+                gateup_output,
+                masked_m,
+                group_size=128,
+                topk=4,
+                swiglu_limit=None,
+                swizzle=False,
+                gemm1_alpha=1.702,
+                gemm1_clamp_limit=7.0,
+                num_real_tokens=max_tokens,
+            )
+
+        self.assertEqual(
+            output.shape,
+            (num_experts, max_tokens, intermediate_size),
+        )
+        self.assertEqual(output.dtype, torch.float8_e4m3fn)
+        self.assertEqual(
+            output_scale.shape,
+            (num_experts, max_tokens, 6),
+        )
+        self.assertEqual(output_scale.dtype, torch.int32)
+        self.assertEqual(output_scale.stride(-2), 1)
+        activation.assert_called_once()
 
     def test_contiguous_runner_applies_biases_before_and_after_activation(self):
         num_experts, num_tokens, gate_up_size, output_size = 2, 3, 4, 5
