@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -134,17 +135,27 @@ def _validate_deepep_mxfp4_fp8_dispatch(dispatch_output: DispatchOutput) -> None
         )
 
 
-def _configure_deepep_mxfp4_fp8_dispatcher(layer: torch.nn.Module) -> None:
-    layer.dispatcher.set_quant_config(
-        {"dispatcher_output_dtype": DispatcherOutputDtype.FP8.value}
+def _validate_deepep_mxfp4_fp8_dispatcher_config() -> None:
+    effective_dtype = get_deepep_output_dtype(
+        SimpleNamespace(
+            quant_config={
+                "dispatcher_output_dtype": DispatcherOutputDtype.FP8.value,
+            }
+        )
     )
-    effective_dtype = get_deepep_output_dtype(layer.dispatcher)
     if effective_dtype != DispatcherOutputDtype.FP8:
         raise ValueError(
             "GPT-OSS MXFP4 with DeepGEMM and DeepEP requires FP8 dispatcher "
             "output, but the effective dispatcher dtype is "
             f"{effective_dtype.value!r}."
         )
+
+
+def _configure_deepep_mxfp4_fp8_dispatcher(layer: torch.nn.Module) -> None:
+    _validate_deepep_mxfp4_fp8_dispatcher_config()
+    layer.dispatcher.set_quant_config(
+        {"dispatcher_output_dtype": DispatcherOutputDtype.FP8.value}
+    )
 
 
 if is_flashinfer_available():
@@ -625,6 +636,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer):
         if self.use_deep_gemm:
+            if get_moe_a2a_backend().is_deepep():
+                _configure_deepep_mxfp4_fp8_dispatcher(layer)
             self._process_weights_for_deep_gemm(layer)
             return
 
@@ -1249,7 +1262,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
             if moe_runner_backend.is_deep_gemm() and get_moe_a2a_backend().is_deepep():
-                _configure_deepep_mxfp4_fp8_dispatcher(layer)
+                _validate_deepep_mxfp4_fp8_dispatcher_config()
         elif (
             moe_runner_backend.is_flashinfer_mxfp4()
             and self._fi_kernel == "cutlass_sm90"

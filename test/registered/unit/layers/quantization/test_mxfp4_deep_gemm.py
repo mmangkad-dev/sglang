@@ -36,6 +36,41 @@ def _parameter(data):
 
 
 class TestMxfp4DeepGemmLayout(CustomTestCase):
+    def test_runner_creation_does_not_require_initialized_dispatcher(self):
+        runner_backend = SimpleNamespace(
+            is_auto=lambda: False,
+            is_aiter=lambda: False,
+            is_triton_kernels=lambda: False,
+            is_triton=lambda: False,
+            is_marlin=lambda: False,
+            is_deep_gemm=lambda: True,
+            is_flashinfer_mxfp4=lambda: False,
+        )
+        a2a_backend = SimpleNamespace(is_deepep=lambda: True)
+        server_args = SimpleNamespace(deepep_dispatcher_output_dtype="fp8")
+        method = Mxfp4MoEMethod.__new__(Mxfp4MoEMethod)
+        layer = nn.Module()
+
+        with (
+            patch(
+                "sglang.srt.layers.quantization.mxfp4.get_moe_runner_backend",
+                return_value=runner_backend,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.mxfp4.get_moe_a2a_backend",
+                return_value=a2a_backend,
+            ),
+            patch(
+                "sglang.srt.layers.moe.utils.get_server_args",
+                return_value=server_args,
+            ),
+            patch("sglang.srt.layers.quantization.mxfp4.MoeRunner") as moe_runner,
+        ):
+            method.create_moe_runner(layer, SimpleNamespace())
+
+        moe_runner.assert_called_once()
+        self.assertNotIn("dispatcher", layer.__dict__)
+
     def test_bf16_dispatcher_override_is_rejected_at_configuration(self):
         class _Dispatcher:
             quant_config = None
@@ -54,6 +89,25 @@ class TestMxfp4DeepGemmLayout(CustomTestCase):
             self.assertRaisesRegex(ValueError, "effective dispatcher dtype is 'bf16'"),
         ):
             _configure_deepep_mxfp4_fp8_dispatcher(layer)
+
+    def test_dispatcher_is_configured_after_layer_initialization(self):
+        class _Dispatcher:
+            quant_config = None
+
+            def set_quant_config(self, quant_config):
+                self.quant_config = quant_config
+
+        dispatcher = _Dispatcher()
+        layer = SimpleNamespace(dispatcher=dispatcher)
+        server_args = SimpleNamespace(deepep_dispatcher_output_dtype="fp8")
+
+        with patch(
+            "sglang.srt.layers.moe.utils.get_server_args",
+            return_value=server_args,
+        ):
+            _configure_deepep_mxfp4_fp8_dispatcher(layer)
+
+        self.assertEqual(dispatcher.quant_config, {"dispatcher_output_dtype": "fp8"})
 
     def test_deep_gemm_rejects_non_deepep_a2a_backend(self):
         runner_backend = SimpleNamespace(
