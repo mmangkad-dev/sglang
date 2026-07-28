@@ -2,6 +2,8 @@
 # Install the dependency in CI.
 set -euxo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
 # Source (not bash) so that venv activation, $PIP_CMD, $CU_VERSION, $NVCC_VER, and
 # $PIP_INSTALL_SUFFIX all propagate into this shell. Without sourcing, the subshell
 # exits and this script would fall back to system Python.
@@ -103,12 +105,14 @@ if [ "$GRACE_BLACKWELL" = "1" ]; then
     git clone https://github.com/deepseek-ai/DeepEP.git -b ${GRACE_BLACKWELL_DEEPEP_BRANCH} ${DEEPEP_DIR} && \
     pushd ${DEEPEP_DIR} && \
     git checkout d28bd676c2120573c9f1425f0c16c39faa4117e6 && \
+    python3 "${SCRIPT_DIR}/patch_deepep_gpt_oss.py" . && \
     sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
     popd
 else
     git clone https://github.com/deepseek-ai/DeepEP.git ${DEEPEP_DIR} && \
     pushd ${DEEPEP_DIR} && \
     git checkout 9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee && \
+    python3 "${SCRIPT_DIR}/patch_deepep_gpt_oss.py" . && \
     popd
 fi
 

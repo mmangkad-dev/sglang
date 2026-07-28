@@ -267,6 +267,8 @@ RUN python3 -m pip install --ignore-installed --no-deps distro
 ########################################################
 FROM torch_deps AS deepep_builder
 
+COPY scripts/ci/cuda/patch_deepep_gpt_oss.py /tmp/patch_deepep_gpt_oss.py
+
 ARG CUDA_VERSION
 ARG BUILD_AND_DOWNLOAD_PARALLEL
 ARG GRACE_BLACKWELL
@@ -284,6 +286,7 @@ RUN set -eux; \
         git clone https://github.com/fzyzcjy/DeepEP.git && \
         cd DeepEP && \
         git checkout gb200_blog_part_2 && \
+        python3 /tmp/patch_deepep_gpt_oss.py . && \
         sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
         sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
         cd .. ; \
@@ -291,6 +294,7 @@ RUN set -eux; \
         git clone https://github.com/deepseek-ai/DeepEP.git -b hybrid-ep && \
         cd DeepEP && \
         git checkout d28bd676c2120573c9f1425f0c16c39faa4117e6 && \
+        python3 /tmp/patch_deepep_gpt_oss.py . && \
         sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
         sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
         cd .. ; \
@@ -306,6 +310,7 @@ RUN set -eux; \
         curl --retry 3 --retry-delay 2 -fsSL -o ${DEEPEP_COMMIT}.zip \
             https://${GITHUB_ARTIFACTORY}/deepseek-ai/DeepEP/archive/${DEEPEP_COMMIT}.zip && \
         unzip -q ${DEEPEP_COMMIT}.zip && rm ${DEEPEP_COMMIT}.zip && mv DeepEP-${DEEPEP_COMMIT} DeepEP && cd DeepEP && \
+        python3 /tmp/patch_deepep_gpt_oss.py . && \
         sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
         sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
         cd .. ; \

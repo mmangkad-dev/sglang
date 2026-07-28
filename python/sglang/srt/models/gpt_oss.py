@@ -33,6 +33,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -44,7 +45,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe import get_moe_a2a_backend, get_moe_runner_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
@@ -193,6 +194,24 @@ def _resolve_moe_input_pad_multiple(
     return 256
 
 
+def _validate_gpt_oss_deepep_config(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Return whether this block uses the one supported GPT-OSS DeepEP path."""
+    if not get_moe_a2a_backend().is_deepep():
+        return False
+
+    quant_config_name = quant_config.get_name() if quant_config is not None else None
+    if quant_config_name != "mxfp4" or not get_moe_runner_backend().is_deep_gemm():
+        raise ValueError(
+            "GPT-OSS DeepEP currently supports only MXFP4 experts with "
+            "--moe-runner-backend deep_gemm. BF16 and other MoE runners do "
+            "not implement GPT-OSS expert biases and its alpha/clamped "
+            "activation for DeepEP."
+        )
+    return True
+
+
 class GptOssSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -208,6 +227,7 @@ class GptOssSparseMoeBlock(nn.Module):
         self.activation = config.hidden_act
         self.gemm1_alpha = getattr(config, "hidden_act_alpha", 1.702)
         self.gemm1_clamp_limit = config.swiglu_limit
+        self.use_deepep_mxfp4 = _validate_gpt_oss_deepep_config(quant_config)
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -243,6 +263,11 @@ class GptOssSparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             **extra_kwargs,
         )
+        self.expert_hidden_size = (
+            self.experts.quant_method.hidden_size
+            if self.use_deepep_mxfp4
+            else self.hidden_size
+        )
 
         self.router = TinyGemmLinear(
             config.hidden_size,
@@ -263,8 +288,52 @@ class GptOssSparseMoeBlock(nn.Module):
 
         if not get_moe_a2a_backend().is_deepep():
             return self.forward_normal(hidden_states)
+        if forward_batch is None:
+            raise ValueError("GPT-OSS DeepEP forward requires a ForwardBatch")
+        return self.forward_deepep(hidden_states, forward_batch)
+
+    def forward_deepep(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        hidden_dim_unpadded = self.hidden_size
+        router_input = hidden_states[..., :hidden_dim_unpadded]
+
+        if hidden_states.shape[0] > 0:
+            router_logits, _ = self.router(router_input)
+            topk_output = self.topk(
+                router_input,
+                router_logits,
+                num_token_non_padded=forward_batch.num_token_non_padded,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
         else:
-            raise NotImplementedError("forward_deepep branch not implemented yet")
+            topk_output = self.topk.empty_topk_output(
+                hidden_states.device, layer_id=self.layer_id
+            )
+
+        expert_hidden_size = self.expert_hidden_size
+        if expert_hidden_size < hidden_states.shape[-1]:
+            raise ValueError(
+                "GPT-OSS expert hidden size cannot be smaller than its input: "
+                f"{expert_hidden_size} < {hidden_states.shape[-1]}"
+            )
+        if expert_hidden_size != hidden_states.shape[-1]:
+            expert_hidden_states = torch.nn.functional.pad(
+                hidden_states,
+                (0, expert_hidden_size - hidden_states.shape[-1]),
+            )
+        else:
+            expert_hidden_states = hidden_states
+
+        final_hidden_states = self.experts(
+            hidden_states=expert_hidden_states,
+            topk_output=topk_output,
+        )
+        return final_hidden_states[..., :hidden_dim_unpadded].contiguous()
 
     def forward_dwdp(
         self,

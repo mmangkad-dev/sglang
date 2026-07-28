@@ -100,6 +100,14 @@ class DeepEPMoE(FusedMoE):
         ):
             self.deprecate_flag = True
         elif (
+            get_moe_runner_backend().is_deep_gemm()
+            and quant_config is not None
+            and quant_config.get_name() == "mxfp4"
+        ):
+            # MXFP4 is implemented by the unified DeepGEMM runner. The legacy
+            # DeepEP core below only knows about its old FP8/CUTLASS paths.
+            self.deprecate_flag = True
+        elif (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
         ):

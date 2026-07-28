@@ -33,15 +33,26 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_deepep_mode,
+)
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    DispatcherOutputDtype,
+    get_deepep_output_dtype,
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -69,6 +80,71 @@ from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
 
 has_triton_kernels = is_triton_kernels_available()
+
+_DEEPEP_LOW_LATENCY_HIDDEN_SIZES = (
+    2048,
+    2560,
+    3072,
+    4096,
+    5120,
+    6144,
+    7168,
+    8192,
+)
+
+
+def _get_deep_gemm_mxfp4_padded_hidden_size(
+    hidden_size: int, *, use_deepep_low_latency: bool
+) -> int:
+    """Return a hidden size accepted by both DeepGEMM and DeepEP.
+
+    DeepGEMM FP8xFP4 needs a 128-element contraction alignment. DeepEP's
+    legacy low-latency kernels are instantiated only for a fixed set of
+    hidden sizes, so an AUTO/LOW_LATENCY deployment must use the next entry
+    in that set. In particular, GPT-OSS's 2880 columns become 3072, matching
+    DeepEP's GPT-OSS kernel rather than merely becoming 2944.
+    """
+    padded_hidden = round_up(hidden_size, 128)
+    if not use_deepep_low_latency:
+        return padded_hidden
+
+    for supported_hidden in _DEEPEP_LOW_LATENCY_HIDDEN_SIZES:
+        if supported_hidden >= padded_hidden:
+            return supported_hidden
+    raise ValueError(
+        "DeepEP low-latency mode does not support an MXFP4 hidden size above "
+        f"{_DEEPEP_LOW_LATENCY_HIDDEN_SIZES[-1]}, got {hidden_size}"
+    )
+
+
+def _validate_deepep_mxfp4_fp8_dispatch(dispatch_output: DispatchOutput) -> None:
+    """Enforce the activation ABI of DeepGEMM's FP8 x MXFP4 kernels."""
+    from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutputChecker
+
+    if not DispatchOutputChecker.format_is_deepep(dispatch_output):
+        return
+    if (
+        dispatch_output.hidden_states.dtype != torch.float8_e4m3fn
+        or dispatch_output.hidden_states_scale is None
+    ):
+        raise ValueError(
+            "GPT-OSS MXFP4 with DeepGEMM and DeepEP requires FP8 dispatcher "
+            "output with per-token scales. Remove "
+            "--deepep-dispatcher-output-dtype bf16 (or set it to fp8)."
+        )
+
+
+def _configure_deepep_mxfp4_fp8_dispatcher(layer: torch.nn.Module) -> None:
+    layer.dispatcher.set_quant_config(
+        {"dispatcher_output_dtype": DispatcherOutputDtype.FP8.value}
+    )
+    effective_dtype = get_deepep_output_dtype(layer.dispatcher)
+    if effective_dtype != DispatcherOutputDtype.FP8:
+        raise ValueError(
+            "GPT-OSS MXFP4 with DeepGEMM and DeepEP requires FP8 dispatcher "
+            "output, but the effective dispatcher dtype is "
+            f"{effective_dtype.value!r}."
+        )
 
 
 if is_flashinfer_available():
@@ -140,6 +216,7 @@ def _get_flashinfer_mxfp4_device_permute_indices(
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
+        DispatchOutput,
         StandardDispatchOutput,
     )
 
@@ -239,7 +316,6 @@ def quant_dequant_mxfp4(
 
 
 class Mxfp4Config(QuantizationConfig):
-
     def __init__(
         self,
         ignored_layers: Optional[list[str]] = None,
@@ -261,7 +337,6 @@ class Mxfp4Config(QuantizationConfig):
                     is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized
                 )
             else:
-
                 platform = torch.cuda.get_device_properties(0).gcnArchName
                 raise ValueError(
                     f"Current platform {platform} not support mxfp4 computation"
@@ -320,7 +395,6 @@ class Mxfp4Config(QuantizationConfig):
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
-
     def __init__(
         self,
         prefix: str,
@@ -332,7 +406,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
+        self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
         self.use_marlin = get_moe_runner_backend().is_marlin()
+        if self.use_deep_gemm:
+            a2a_backend = get_moe_a2a_backend()
+            if not (a2a_backend.is_none() or a2a_backend.is_deepep()):
+                raise ValueError(
+                    "GPT-OSS MXFP4 with the DeepGEMM runner supports only "
+                    "--moe-a2a-backend none or deepep; "
+                    f"got {a2a_backend.value!r}."
+                )
         self.flashinfer_mxfp4_moe_precision = (
             get_server_args().flashinfer_mxfp4_moe_precision
         )
@@ -389,6 +472,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad
                 - layer.intermediate_size_per_partition
             )
+        elif self.use_deep_gemm:
+            if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                raise RuntimeError(
+                    "MXFP4 DeepGEMM MoE requires DeepGEMM's Blackwell "
+                    "FP8 x FP4 recipe (DEEPGEMM_SCALE_UE8M0). SM120 is not "
+                    "supported because it has no TMEM/tcgen05."
+                )
+            # Keep the load buffers unpadded. GPT-OSS checkpoints store gate
+            # and up rows interleaved, so padding before the naive loader copy
+            # would move their logical split. Rebuild padded [gate; up]
+            # buffers after loading instead.
+            self._padded_intermediate = round_up(intermediate_size_per_partition, 128)
+            self._padded_hidden = _get_deep_gemm_mxfp4_padded_hidden_size(
+                hidden_size,
+                use_deepep_low_latency=(
+                    get_moe_a2a_backend().is_deepep()
+                    and get_deepep_mode().enable_low_latency()
+                ),
+            )
+            self.hidden_pad = self._padded_hidden - layer.hidden_size
+            self.intermediate_pad = (
+                self._padded_intermediate - layer.intermediate_size_per_partition
+            )
         elif is_sm100_supported():
             if self.use_flashinfer:
                 intermediate_size_per_partition_after_pad = round_up(
@@ -420,7 +526,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # naive-copy fast path is correct.
             intermediate_size_per_partition_after_pad = intermediate_size_per_partition
         elif _use_aiter:
-
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, 256
             )
@@ -436,9 +541,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition, triton_kernels_padding_alignment
             )
 
-        self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
-
-        self.hidden_size = hidden_size
+        self.intermediate_size_per_partition = (
+            self._padded_intermediate
+            if self.use_deep_gemm
+            else intermediate_size_per_partition_after_pad
+        )
+        self.hidden_size = self._padded_hidden if self.use_deep_gemm else hidden_size
+        if self.use_deep_gemm:
+            # The dispatcher is built after create_weights and must allocate
+            # for the transmitted padded width, especially in DeepEP AUTO
+            # mode where decode selects a fixed-shape low-latency kernel.
+            layer.moe_runner_config.hidden_size = self.hidden_size
+            layer.moe_runner_config.intermediate_size_per_partition = (
+                self.intermediate_size_per_partition
+            )
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.zeros(
@@ -508,6 +624,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        if self.use_deep_gemm:
+            self._process_weights_for_deep_gemm(layer)
+            return
+
         if self.use_marlin:
             from sglang.srt.layers.quantization.marlin_utils import (
                 check_moe_marlin_supports_layer,
@@ -805,7 +925,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             return
 
         if self.use_triton_kernels:
-
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
             w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
@@ -879,6 +998,101 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             del layer.w2_weight_scale
             layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
+        torch.cuda.empty_cache()
+
+    def _process_weights_for_deep_gemm(self, layer):
+        """Prepare GPT-OSS MXFP4 experts for DeepGEMM FP8xFP4 kernels."""
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        num_experts = layer.num_local_experts
+        intermediate_size = layer.w13_weight.shape[1] // 2
+        hidden_size = layer.w13_weight.shape[2] * 2
+        padded_intermediate = self.intermediate_size_per_partition
+        padded_hidden = self.hidden_size
+        device = layer.w13_weight.device
+
+        def pad_gate_up(
+            x: torch.Tensor, padded_last_dim: int, fill_value: int = 0
+        ) -> torch.Tensor:
+            # HF stores [gate_0, up_0, gate_1, up_1, ...]. DeepGEMM's
+            # non-interleaved GPT-OSS activation consumes [gate; up].
+            out = torch.full(
+                (num_experts, 2 * padded_intermediate, padded_last_dim),
+                fill_value,
+                dtype=x.dtype,
+                device=device,
+            )
+            out[:, :intermediate_size, : x.shape[-1]] = x[:, 0::2]
+            out[
+                :,
+                padded_intermediate : padded_intermediate + intermediate_size,
+                : x.shape[-1],
+            ] = x[:, 1::2]
+            return out
+
+        w13_weight = pad_gate_up(layer.w13_weight.data, padded_hidden // 2).view(
+            torch.int8
+        )
+        w2_weight = torch.zeros(
+            num_experts,
+            padded_hidden,
+            padded_intermediate // 2,
+            dtype=layer.w2_weight.dtype,
+            device=device,
+        )
+        w2_weight[:, :hidden_size, : layer.w2_weight.shape[-1]] = layer.w2_weight.data
+        w2_weight = w2_weight.view(torch.int8)
+
+        # An E8M0 exponent of 127 represents a dequantization scale of 1.
+        # Paired with zero FP4 padding, it keeps padded matrix regions zero.
+        w13_scale_raw = pad_gate_up(
+            layer.w13_weight_scale.data, padded_hidden // 32, fill_value=127
+        )
+        w2_scale_raw = torch.full(
+            (num_experts, padded_hidden, padded_intermediate // 32),
+            127,
+            dtype=torch.uint8,
+            device=device,
+        )
+        w2_scale_raw[:, :hidden_size, : layer.w2_weight_scale.shape[-1]] = (
+            layer.w2_weight_scale.data
+        )
+
+        w13_bias = pad_gate_up(layer.w13_weight_bias.data.unsqueeze(-1), 1).squeeze(-1)
+        w2_bias = torch.zeros(
+            num_experts,
+            padded_hidden,
+            dtype=layer.w2_weight_bias.dtype,
+            device=device,
+        )
+        w2_bias[:, :hidden_size] = layer.w2_weight_bias.data
+
+        def prepare_scale(scale: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            scale = torch.exp2(scale.float() - 127)
+            if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                from deep_gemm import transform_sf_into_required_layout
+
+                num_scale_experts, n, _ = scale.shape
+                scale = transform_sf_into_required_layout(
+                    scale,
+                    mn=n,
+                    k=weight.shape[2] * 2,
+                    recipe=(1, 32),
+                    num_groups=num_scale_experts,
+                    disable_ue8m0_cast=False,
+                )
+            return scale
+
+        layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+        layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+        layer.w13_weight_scale = Parameter(
+            prepare_scale(w13_scale_raw, w13_weight), requires_grad=False
+        )
+        layer.w2_weight_scale = Parameter(
+            prepare_scale(w2_scale_raw, w2_weight), requires_grad=False
+        )
+        layer.w13_weight_bias = Parameter(w13_bias, requires_grad=False)
+        layer.w2_weight_bias = Parameter(w2_bias, requires_grad=False)
         torch.cuda.empty_cache()
 
     def _process_weights_for_sm90_cutlass(self, layer):
@@ -1031,8 +1245,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             moe_runner_backend.is_triton_kernels()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_marlin()
+            or moe_runner_backend.is_deep_gemm()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+            if moe_runner_backend.is_deep_gemm() and get_moe_a2a_backend().is_deepep():
+                _configure_deepep_mxfp4_fp8_dispatcher(layer)
         elif (
             moe_runner_backend.is_flashinfer_mxfp4()
             and self._fi_kernel == "cutlass_sm90"
@@ -1077,13 +1294,52 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        dispatch_output: StandardDispatchOutput,
+        dispatch_output: DispatchOutput,
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutputChecker
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         x = dispatch_output.hidden_states
+        if self.use_deep_gemm:
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+                DeepGemmMoeQuantInfo,
+            )
+
+            _validate_deepep_mxfp4_fp8_dispatch(dispatch_output)
+            if x.shape[-1] != self.hidden_size:
+                if x.shape[-1] > self.hidden_size:
+                    raise ValueError(
+                        "MXFP4 DeepGEMM input is wider than its padded weights: "
+                        f"{x.shape[-1]} > {self.hidden_size}"
+                    )
+                x = torch.nn.functional.pad(
+                    x,
+                    (0, self.hidden_size - x.shape[-1]),
+                    mode="constant",
+                    value=0.0,
+                )
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                use_fp8=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                w13_bias=layer.w13_weight_bias,
+                w2_bias=layer.w2_weight_bias,
+                block_shape=[1, 32],
+                is_fp4_experts=True,
+            )
+            return self.runner.run(
+                dispatch_output._replace(hidden_states=x), quant_info
+            )
+
+        if not DispatchOutputChecker.format_is_standard(dispatch_output):
+            raise ValueError(
+                "This MXFP4 runner requires standard dispatch output; "
+                f"got {dispatch_output.format.value!r}."
+            )
         topk_output = dispatch_output.topk_output
         if _is_cpu:
             if use_intel_amx_backend(layer):
