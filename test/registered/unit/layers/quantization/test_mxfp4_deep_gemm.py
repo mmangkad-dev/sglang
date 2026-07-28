@@ -377,13 +377,17 @@ class TestMxfp4DeepGemmLayout(CustomTestCase):
         )
         running_state = {"hidden_states_device": torch.device("cpu")}
         activation_input = None
+        activation_group_size = None
+        gemm_recipes = []
 
         def fake_grouped_gemm(_lhs, _rhs, output, *_args, **_kwargs):
+            gemm_recipes.append((_kwargs["recipe_a"], _kwargs["recipe_b"]))
             output.zero_()
 
         def fake_activation(gateup_output, *_args, **_kwargs):
-            nonlocal activation_input
+            nonlocal activation_group_size, activation_input
             activation_input = gateup_output.clone()
+            activation_group_size = _kwargs["group_size"]
             return (
                 torch.zeros(num_experts, max_tokens, gate_up_size // 2),
                 torch.ones(num_experts, max_tokens, 1),
@@ -419,6 +423,11 @@ class TestMxfp4DeepGemmLayout(CustomTestCase):
         torch.testing.assert_close(
             activation_input,
             w13_bias[:, None, :].expand(-1, max_tokens, -1),
+        )
+        self.assertEqual(activation_group_size, 128)
+        self.assertEqual(
+            gemm_recipes,
+            [((1, 128), (1, 32)), ((1, 128), (1, 32))],
         )
         torch.testing.assert_close(
             output,

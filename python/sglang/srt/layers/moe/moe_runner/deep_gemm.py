@@ -438,7 +438,16 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_device = running_state["hidden_states_device"]
 
         use_mxfp8 = quant_info.use_mxfp8
-        scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
+        # FP8 activations paired with FP4 experts use 128-column scales, while
+        # the FP4 weights use 32-column scales. ``block_shape`` describes the
+        # latter for is_fp4_experts and must not shrink the down-activation
+        # quantization group to 32 while recipe_a remains (1, 128).
+        if quant_info.is_fp4_experts:
+            scale_block_size = 128
+        elif quant_info.block_shape:
+            scale_block_size = quant_info.block_shape[1]
+        else:
+            scale_block_size = 128
 
         if use_mxfp8:
             recipe_b = tuple(quant_info.block_shape)
