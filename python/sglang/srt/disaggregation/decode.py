@@ -289,6 +289,10 @@ class DecodeRequest:
     def priority(self) -> Optional[int]:
         return self.req.priority
 
+    @property
+    def metrics_priority(self) -> Optional[int]:
+        return getattr(self.req, "metrics_priority", self.req.priority)
+
 
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """

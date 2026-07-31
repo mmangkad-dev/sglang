@@ -862,6 +862,11 @@ class Req(ReqDllmMixin):
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
+        # Preserve the API-level priority for observability. The scheduler may
+        # replace None in `priority` with an extreme integer so unspecified
+        # requests remain sortable, but that internal sentinel must not leak
+        # into metric labels.
+        self.metrics_priority = priority
         self.priority = priority
 
         # For incremental decoding
@@ -1618,7 +1623,9 @@ class Req(ReqDllmMixin):
             "bootstrap_host": self.bootstrap_host,
             "bootstrap_port": self.bootstrap_port,
             "bootstrap_room": self.bootstrap_room,
-            "priority": self.priority,
+            # Send the API-level value. The destination scheduler will derive
+            # its own effective ordering sentinel when this is None.
+            "priority": getattr(self, "metrics_priority", self.priority),
             "extra_key": self.extra_key,
             "routing_key": self.routing_key,
             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,

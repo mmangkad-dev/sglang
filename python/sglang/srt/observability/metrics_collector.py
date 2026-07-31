@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.label_transform import transform_priority
 from sglang.srt.observability.utils import exponential_buckets, generate_buckets
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
@@ -46,15 +47,20 @@ class QueueCount:
     """Holds both the total count and optional per-priority breakdown for a queue."""
 
     total: int = 0
-    by_priority: Optional[Dict[int, int]] = None
+    by_priority: Optional[Dict[str, int]] = None
 
     @classmethod
     def from_reqs(cls, reqs: List[Req], enable_priority_scheduling: bool = False):
-        # NOTE: If requests have priority=None (no --default-priority-value set),
-        # Counter will produce {None: N}, resulting in priority="None" Prometheus labels.
-        # Set --default-priority-value when enabling priority scheduling to avoid this.
+        # Count the API-level priority preserved by Req, not the scheduler's
+        # effective ordering sentinel. Transform before counting so raw values
+        # that share a bounded label bucket remain additive.
         by_priority = (
-            dict(Counter(req.priority for req in reqs))
+            dict(
+                Counter(
+                    transform_priority(getattr(req, "metrics_priority", req.priority))
+                    for req in reqs
+                )
+            )
             if enable_priority_scheduling
             else None
         )
@@ -261,22 +267,39 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.enable_hierarchical_cache = enable_hierarchical_cache
         self.enable_streaming_session = enable_streaming_session
         self.last_log_time = time.perf_counter()
-        self._known_priorities: Set[int] = set()
+        self._known_priorities: Set[str] = set()
+        self._priority_enabled = "priority" in labels
+
+        def queue_gauges(name: str, documentation: str):
+            """Create separate aggregate and per-priority metric families."""
+            total = Gauge(
+                name=name,
+                documentation=documentation,
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            by_priority = (
+                Gauge(
+                    name=f"{name}_by_priority",
+                    documentation=f"{documentation} Broken down by request priority.",
+                    labelnames=labels.keys(),
+                    multiprocess_mode="mostrecent",
+                )
+                if self._priority_enabled
+                else None
+            )
+            return total, by_priority
 
         # =================================================================
         # Basics
         # =================================================================
-        self.num_running_reqs = Gauge(
-            name="sglang:num_running_reqs",
-            documentation="The number of running requests.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+        self.num_running_reqs, self.num_running_reqs_by_priority = queue_gauges(
+            "sglang:num_running_reqs",
+            "The number of running requests.",
         )
-        self.num_queue_reqs = Gauge(
-            name="sglang:num_queue_reqs",
-            documentation="The number of requests in the waiting queue.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+        self.num_queue_reqs, self.num_queue_reqs_by_priority = queue_gauges(
+            "sglang:num_queue_reqs",
+            "The number of requests in the waiting queue.",
         )
         self.num_grammar_queue_reqs = Gauge(
             name="sglang:num_grammar_queue_reqs",
@@ -484,29 +507,33 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # =================================================================
         # PD disaggregation
         # =================================================================
-        self.num_prefill_bootstrap_queue_reqs = Gauge(
-            name="sglang:num_prefill_bootstrap_queue_reqs",
-            documentation="The number of requests in the prefill bootstrap queue.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+        (
+            self.num_prefill_bootstrap_queue_reqs,
+            self.num_prefill_bootstrap_queue_reqs_by_priority,
+        ) = queue_gauges(
+            "sglang:num_prefill_bootstrap_queue_reqs",
+            "The number of requests in the prefill bootstrap queue.",
         )
-        self.num_prefill_inflight_queue_reqs = Gauge(
-            name="sglang:num_prefill_inflight_queue_reqs",
-            documentation="The number of requests in the prefill inflight queue.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+        (
+            self.num_prefill_inflight_queue_reqs,
+            self.num_prefill_inflight_queue_reqs_by_priority,
+        ) = queue_gauges(
+            "sglang:num_prefill_inflight_queue_reqs",
+            "The number of requests in the prefill inflight queue.",
         )
-        self.num_decode_prealloc_queue_reqs = Gauge(
-            name="sglang:num_decode_prealloc_queue_reqs",
-            documentation="The number of requests in the decode prealloc queue.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+        (
+            self.num_decode_prealloc_queue_reqs,
+            self.num_decode_prealloc_queue_reqs_by_priority,
+        ) = queue_gauges(
+            "sglang:num_decode_prealloc_queue_reqs",
+            "The number of requests in the decode prealloc queue.",
         )
-        self.num_decode_transfer_queue_reqs = Gauge(
-            name="sglang:num_decode_transfer_queue_reqs",
-            documentation="The number of requests in the decode transfer queue.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+        (
+            self.num_decode_transfer_queue_reqs,
+            self.num_decode_transfer_queue_reqs_by_priority,
+        ) = queue_gauges(
+            "sglang:num_decode_transfer_queue_reqs",
+            "The number of requests in the decode transfer queue.",
         )
         self.kv_transfer_speed_gb_s = Histogram(
             name="sglang:kv_transfer_speed_gb_s",
@@ -1102,19 +1129,24 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Convenience function for logging a scalar to gauge.
         gauge.labels(**self.labels).set(data)
 
-    def _log_gauge_queue_count(self, gauge: Gauge, data: QueueCount) -> None:
-        # Log a QueueCount to gauge: total under default labels, per-priority breakdown under priority="<int>".
-        # NOTE: When priority scheduling is enabled, the total is recorded under
-        # priority="" (the default label value). Per-priority breakdowns are recorded
-        # with priority="<int>". Grafana queries should use priority="" for totals.
+    def _log_gauge_queue_count(
+        self,
+        gauge: Gauge,
+        data: QueueCount,
+        by_priority_gauge: Optional[Gauge] = None,
+    ) -> None:
+        # Keep the total and breakdown in separate metric families to prevent
+        # ordinary sums from counting every request twice.
         gauge.labels(**self.labels).set(data.total)
-        if data.by_priority is not None:
-            self._known_priorities.update(data.by_priority.keys())
-            for priority in self._known_priorities:
-                value = data.by_priority.get(priority, 0)
-                labels = dict(self.labels)
-                labels["priority"] = str(priority)
-                gauge.labels(**labels).set(value)
+        if by_priority_gauge is None or data.by_priority is None:
+            return
+        # Re-emit drained priorities as zero instead of leaving stale values.
+        self._known_priorities.update(data.by_priority.keys())
+        for priority in self._known_priorities:
+            value = data.by_priority.get(priority, 0)
+            labels = dict(self.labels)
+            labels["priority"] = priority
+            by_priority_gauge.labels(**labels).set(value)
 
     def _log_histogram(self, histogram, data: Union[int, float]) -> None:
         histogram.labels(**self.labels).observe(data)
@@ -1273,8 +1305,16 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
     def log_stats(self, stats: SchedulerStats) -> None:
         # Basics
-        self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)
-        self._log_gauge_queue_count(self.num_queue_reqs, stats.num_queue_reqs)
+        self._log_gauge_queue_count(
+            self.num_running_reqs,
+            stats.num_running_reqs,
+            self.num_running_reqs_by_priority,
+        )
+        self._log_gauge_queue_count(
+            self.num_queue_reqs,
+            stats.num_queue_reqs,
+            self.num_queue_reqs_by_priority,
+        )
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
@@ -1314,15 +1354,22 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge_queue_count(
             self.num_prefill_bootstrap_queue_reqs,
             stats.num_prefill_bootstrap_queue_reqs,
+            self.num_prefill_bootstrap_queue_reqs_by_priority,
         )
         self._log_gauge_queue_count(
-            self.num_prefill_inflight_queue_reqs, stats.num_prefill_inflight_queue_reqs
+            self.num_prefill_inflight_queue_reqs,
+            stats.num_prefill_inflight_queue_reqs,
+            self.num_prefill_inflight_queue_reqs_by_priority,
         )
         self._log_gauge_queue_count(
-            self.num_decode_prealloc_queue_reqs, stats.num_decode_prealloc_queue_reqs
+            self.num_decode_prealloc_queue_reqs,
+            stats.num_decode_prealloc_queue_reqs,
+            self.num_decode_prealloc_queue_reqs_by_priority,
         )
         self._log_gauge_queue_count(
-            self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
+            self.num_decode_transfer_queue_reqs,
+            stats.num_decode_transfer_queue_reqs,
+            self.num_decode_transfer_queue_reqs_by_priority,
         )
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage

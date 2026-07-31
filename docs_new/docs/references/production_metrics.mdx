@@ -240,6 +240,42 @@ to generate some requests.
 
 Then you should be able to see the metrics in the Grafana dashboard.
 
+## Priority queue metric migration
+
+When priority scheduling is enabled, aggregate queue gauges and per-priority
+gauges use separate metric families. This prevents Prometheus aggregations from
+counting both the total and its priority breakdown.
+
+The aggregate metric names remain unchanged. Update queries that select a
+non-empty `priority` label to use the corresponding `_by_priority` metric:
+
+| Aggregate metric | Per-priority metric |
+| --- | --- |
+| `sglang:num_running_reqs` | `sglang:num_running_reqs_by_priority` |
+| `sglang:num_queue_reqs` | `sglang:num_queue_reqs_by_priority` |
+| `sglang:num_prefill_bootstrap_queue_reqs` | `sglang:num_prefill_bootstrap_queue_reqs_by_priority` |
+| `sglang:num_prefill_inflight_queue_reqs` | `sglang:num_prefill_inflight_queue_reqs_by_priority` |
+| `sglang:num_decode_prealloc_queue_reqs` | `sglang:num_decode_prealloc_queue_reqs_by_priority` |
+| `sglang:num_decode_transfer_queue_reqs` | `sglang:num_decode_transfer_queue_reqs_by_priority` |
+
+For example, replace:
+
+```promql
+sglang:num_running_reqs{priority="5"}
+```
+
+with:
+
+```promql
+sglang:num_running_reqs_by_priority{priority="5"}
+```
+
+Priority labels represent the request priority after
+`--default-priority-value` is applied. If a request omits priority and no
+default is configured, its label is `UNKNOWN`. Values below `0` use `LOW`,
+values from `0` through `30` use their numeric value, and values at or above
+`31` use `HIGH`.
+
 ## Estimated Performance Metrics (MFU-related)
 
 SGLang exports the following estimated per-GPU counters that can be used to derive

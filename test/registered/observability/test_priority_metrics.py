@@ -1,12 +1,18 @@
+import sys
 import unittest
+from types import SimpleNamespace
 from typing import Dict, List
-from unittest.mock import Mock
 
 import requests
+from prometheus_client import CollectorRegistry, Gauge
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 
-from sglang.srt.observability.metrics_collector import QueueCount
+from sglang.srt.observability.label_transform import UNKNOWN_PRIORITY_VALUE
+from sglang.srt.observability.metrics_collector import (
+    QueueCount,
+    SchedulerMetricsCollector,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -21,12 +27,12 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(
-    est_time=60,
+    est_time=120,
     stage="base-b",
     runner_config="1-gpu-small",
 )
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=179, suite="base-c-test-cpu")
+register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=240, suite="base-c-test-cpu")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
 
@@ -52,25 +58,98 @@ def _get_sample_value_by_labels(samples: List[Sample], labels: Dict[str, str]) -
     raise KeyError(f"No sample found with labels {labels}")
 
 
+def _assert_missing_priority_metrics(test_case: unittest.TestCase) -> None:
+    """Exercise the production tokenizer and scheduler path without a default."""
+    response = requests.post(
+        f"{DEFAULT_URL_FOR_TEST}/generate",
+        json={
+            "text": "Hello world",
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": 512,
+                "ignore_eos": True,
+            },
+        },
+    )
+    test_case.assertEqual(response.status_code, 200)
+
+    metrics_response = requests.get(f"{DEFAULT_URL_FOR_TEST}/metrics")
+    test_case.assertEqual(metrics_response.status_code, 200)
+    metrics = _parse_prometheus_metrics(metrics_response.text)
+
+    e2e_count = _get_samples_by_name(
+        metrics, "sglang:e2e_request_latency_seconds_count"
+    )
+    unknown_histograms = [
+        sample
+        for sample in e2e_count
+        if sample.labels.get("priority") == UNKNOWN_PRIORITY_VALUE
+    ]
+    test_case.assertTrue(
+        unknown_histograms,
+        f"Expected tokenizer priority={UNKNOWN_PRIORITY_VALUE!r}, "
+        f"got {[sample.labels.get('priority') for sample in e2e_count]}",
+    )
+    test_case.assertGreater(unknown_histograms[0].value, 0)
+
+    for metric_name in ["sglang:num_running_reqs", "sglang:num_queue_reqs"]:
+        samples = _get_samples_by_name(metrics, f"{metric_name}_by_priority")
+        priorities = {sample.labels.get("priority") for sample in samples}
+        test_case.assertIn(
+            UNKNOWN_PRIORITY_VALUE,
+            priorities,
+            f"{metric_name}_by_priority used priorities {priorities}",
+        )
+
+
 class TestQueueCount(CustomTestCase):
     """Unit tests for QueueCount (no server needed)."""
 
     def test_queue_count_from_reqs(self):
         """QueueCount correctly counts per-priority breakdown."""
         reqs = [
-            Mock(priority=1),
-            Mock(priority=1),
-            Mock(priority=5),
-            Mock(priority=5),
-            Mock(priority=10),
+            SimpleNamespace(priority=1, metrics_priority=1),
+            SimpleNamespace(priority=1, metrics_priority=1),
+            SimpleNamespace(priority=5, metrics_priority=5),
+            SimpleNamespace(priority=5, metrics_priority=5),
+            SimpleNamespace(priority=10, metrics_priority=10),
         ]
         qc = QueueCount.from_reqs(reqs, enable_priority_scheduling=True)
         self.assertEqual(qc.total, 5)
-        self.assertEqual(qc.by_priority, {1: 2, 5: 2, 10: 1})
+        self.assertEqual(qc.by_priority, {"1": 2, "5": 2, "10": 1})
+
+    def test_queue_count_buckets_out_of_range_priorities(self):
+        reqs = [
+            SimpleNamespace(priority=100, metrics_priority=100),
+            SimpleNamespace(priority=999, metrics_priority=999),
+            SimpleNamespace(priority=-5, metrics_priority=-5),
+        ]
+        qc = QueueCount.from_reqs(reqs, enable_priority_scheduling=True)
+        self.assertEqual(qc.total, 3)
+        self.assertEqual(qc.by_priority, {"HIGH": 2, "LOW": 1})
+
+    def test_queue_count_missing_priority(self):
+        qc = QueueCount.from_reqs(
+            [SimpleNamespace(priority=None, metrics_priority=None)] * 2, True
+        )
+        self.assertEqual(qc.by_priority, {UNKNOWN_PRIORITY_VALUE: 2})
+
+    def test_queue_count_uses_api_priority_not_scheduler_sentinel(self):
+        for effective_priority in [-sys.maxsize - 1, sys.maxsize]:
+            with self.subTest(effective_priority=effective_priority):
+                req = SimpleNamespace(
+                    priority=effective_priority,
+                    metrics_priority=None,
+                )
+                qc = QueueCount.from_reqs([req], enable_priority_scheduling=True)
+                self.assertEqual(qc.by_priority, {UNKNOWN_PRIORITY_VALUE: 1})
 
     def test_queue_count_from_reqs_disabled(self):
         """Priority scheduling disabled → no breakdown."""
-        reqs = [Mock(priority=1), Mock(priority=5)]
+        reqs = [
+            SimpleNamespace(priority=1, metrics_priority=1),
+            SimpleNamespace(priority=5, metrics_priority=5),
+        ]
         qc = QueueCount.from_reqs(reqs, enable_priority_scheduling=False)
         self.assertEqual(qc.total, 2)
         self.assertIsNone(qc.by_priority)
@@ -80,6 +159,40 @@ class TestQueueCount(CustomTestCase):
         qc = QueueCount.from_reqs([], enable_priority_scheduling=True)
         self.assertEqual(qc.total, 0)
         self.assertEqual(qc.by_priority, {})
+
+    def test_total_and_priority_breakdown_use_separate_gauges(self):
+        registry = CollectorRegistry()
+        total = Gauge("test_queue", "total", ["priority"], registry=registry)
+        by_priority = Gauge(
+            "test_queue_by_priority",
+            "breakdown",
+            ["priority"],
+            registry=registry,
+        )
+        collector = SchedulerMetricsCollector.__new__(SchedulerMetricsCollector)
+        collector.labels = {"priority": ""}
+        collector._known_priorities = set()
+
+        collector._log_gauge_queue_count(
+            total,
+            QueueCount(total=3, by_priority={"1": 2, "5": 1}),
+            by_priority,
+        )
+
+        samples = {
+            sample.name: sample
+            for family in registry.collect()
+            for sample in family.samples
+        }
+        self.assertEqual(samples["test_queue"].labels, {"priority": ""})
+        self.assertEqual(samples["test_queue"].value, 3)
+        breakdown = [
+            sample
+            for family in registry.collect()
+            for sample in family.samples
+            if sample.name == "test_queue_by_priority"
+        ]
+        self.assertEqual(sum(sample.value for sample in breakdown), 3)
 
 
 class TestPriorityMetrics(CustomTestCase):
@@ -95,8 +208,6 @@ class TestPriorityMetrics(CustomTestCase):
             other_args=[
                 "--enable-metrics",
                 "--enable-priority-scheduling",
-                "--default-priority-value",
-                "0",
             ],
         )
 
@@ -126,19 +237,34 @@ class TestPriorityMetrics(CustomTestCase):
         self.assertEqual(metrics_response.status_code, 200)
         metrics = _parse_prometheus_metrics(metrics_response.text)
 
-        # Verify priority label exists on queue gauge metrics
+        # Aggregate metrics contain totals only; priority breakdowns use a
+        # separate family so summing the aggregate cannot double count.
         for metric_name in ["sglang:num_running_reqs", "sglang:num_queue_reqs"]:
             samples = _get_samples_by_name(metrics, metric_name)
             self.assertGreater(len(samples), 0, f"No samples found for {metric_name}")
-
-            # Should have at least one sample with a non-empty priority label
-            # (the total has priority="" and per-priority has priority="<int>")
             priority_labels = {s.labels.get("priority", "") for s in samples}
-            self.assertIn(
-                "",
+            self.assertEqual(
                 priority_labels,
-                f"{metric_name}: missing total (priority='') sample",
+                {""},
+                f"{metric_name}: per-priority series leaked into aggregate",
             )
+
+            by_priority = _get_samples_by_name(metrics, f"{metric_name}_by_priority")
+            self.assertGreater(
+                len(by_priority), 0, f"No samples found for {metric_name}_by_priority"
+            )
+            for sample in by_priority:
+                self.assertNotEqual(sample.labels.get("priority"), "")
+            for total in samples:
+                keys = [key for key in total.labels if key != "priority"]
+                matching = [
+                    sample
+                    for sample in by_priority
+                    if all(sample.labels.get(key) == total.labels[key] for key in keys)
+                ]
+                self.assertAlmostEqual(
+                    sum(sample.value for sample in matching), total.value
+                )
 
     def test_priority_label_in_histogram_metrics(self):
         """Send requests with different priorities and verify that
@@ -194,33 +320,33 @@ class TestPriorityMetrics(CustomTestCase):
                     f"{count_name}: priority='{expected_priority}' count should be > 0",
                 )
 
-    def test_default_priority_value(self):
-        """Requests without explicit priority should use --default-priority-value (0)."""
+    def test_missing_priority_is_unknown(self):
+        """No configured default is labeled UNKNOWN throughout the request."""
+        _assert_missing_priority_metrics(self)
 
-        # Send request WITHOUT priority — should get default priority 0
-        response = requests.post(
-            f"{DEFAULT_URL_FOR_TEST}/generate",
-            json={
-                "text": "Hello world",
-                "sampling_params": {"temperature": 0, "max_new_tokens": 5},
-            },
-        )
-        self.assertEqual(response.status_code, 200)
 
-        metrics_response = requests.get(f"{DEFAULT_URL_FOR_TEST}/metrics")
-        self.assertEqual(metrics_response.status_code, 200)
-        metrics = _parse_prometheus_metrics(metrics_response.text)
+class TestPriorityMetricsLowValuesFirst(CustomTestCase):
+    """Check missing-priority labels with the opposite scheduler ordering."""
 
-        # Check that e2e latency has samples with priority="0" (the default)
-        e2e_count = _get_samples_by_name(
-            metrics, "sglang:e2e_request_latency_seconds_count"
+    @classmethod
+    def setUpClass(cls):
+        cls.process = popen_launch_server(
+            _MODEL_NAME,
+            DEFAULT_URL_FOR_TEST,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--enable-metrics",
+                "--enable-priority-scheduling",
+                "--schedule-low-priority-values-first",
+            ],
         )
-        priority_values = {s.labels.get("priority", "") for s in e2e_count}
-        self.assertIn(
-            "0",
-            priority_values,
-            f"Expected priority='0' from default, got: {priority_values}",
-        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_missing_priority_is_unknown(self):
+        _assert_missing_priority_metrics(self)
 
 
 if __name__ == "__main__":

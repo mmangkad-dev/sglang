@@ -96,6 +96,7 @@ from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
 from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.observability.label_transform import transform_priority
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
     TokenizerMetricsCollector,
@@ -2604,9 +2605,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if custom_labels:
             labels.update(custom_labels)
         if self.enable_priority_scheduling:
-            priority = getattr(state.obj, "priority", None)
-            if priority is not None:
-                labels["priority"] = str(priority)
+            # Priority comes from the request payload, so bound its label value
+            # set before observing histograms. None is an API-level missing
+            # priority and maps to UNKNOWN rather than the aggregate label "".
+            labels["priority"] = transform_priority(
+                getattr(state.obj, "priority", None)
+            )
         if (
             not state.ttft_observed
             and self.disaggregation_mode != DisaggregationMode.PREFILL

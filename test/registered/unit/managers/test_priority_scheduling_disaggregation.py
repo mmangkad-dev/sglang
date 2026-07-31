@@ -255,6 +255,7 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
             bootstrap_port=30000,
             bootstrap_room=7,
             priority=10,
+            metrics_priority=10,
             extra_key=None,
             routing_key=None,
             disagg_prefill_dp_rank=None,
@@ -272,6 +273,7 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
         self.assertTrue(all(type(x) is int for x in payload["input_ids"]))
         self.assertEqual(payload["sampling_params"]["max_new_tokens"], 1)
         self.assertEqual(payload["bootstrap_room"], 7)
+        self.assertEqual(payload["priority"], 10)
         # The prefill /generate URL is derived from bootstrap info on the decode
         # side, not sent in the payload; and the boundary token is replayed via
         # the decode-side override, so neither belongs in the payload.
@@ -279,6 +281,15 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
         self.assertNotIn("pd_rebootstrap_forced_output_id", payload)
         # Must be JSON-serializable (numpy scalars would raise here).
         json.dumps(payload)
+
+    def test_build_rebootstrap_payload_uses_api_priority(self):
+        req = self._new_req()
+        req.priority = -sys.maxsize - 1
+        req.metrics_priority = None
+
+        payload = Req.build_rebootstrap_payload(req)
+
+        self.assertIsNone(payload["priority"])
 
 
 class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
