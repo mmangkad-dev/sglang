@@ -525,6 +525,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     _original_num_tokens: Optional[int] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
+    # Capture-stable per-DP-rank real counts, kept separate from padded layout
+    # metadata in global_num_tokens_gpu.
+    global_num_tokens_unpadded_gpu: Optional[torch.Tensor] = None
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
@@ -840,6 +843,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
                 global_num_tokens, dtype=torch.int64
+            ).to(device, non_blocking=True)
+            ret.global_num_tokens_unpadded_gpu = torch.tensor(
+                global_num_tokens, dtype=torch.int32
             ).to(device, non_blocking=True)
 
             ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
@@ -1212,6 +1218,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         global_num_tokens = list(self.global_num_tokens_cpu)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
+
+        # Preserve the post-spec-scaling count before alignment and MAX_LEN
+        # padding rewrite global_num_tokens_{cpu,gpu}. CUDA graph registries
+        # copy these counts into graph-stable storage before every replay.
+        if self.global_num_tokens_unpadded_gpu is None:
+            self.global_num_tokens_unpadded_gpu = torch.tensor(
+                global_num_tokens,
+                dtype=torch.int32,
+                device=self.global_num_tokens_gpu.device,
+            )
+        else:
+            unpadded_counts = torch.tensor(global_num_tokens, pin_memory=True)
+            self.global_num_tokens_unpadded_gpu.copy_(
+                unpadded_counts, non_blocking=True
+            )
 
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.

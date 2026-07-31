@@ -679,6 +679,15 @@ def build_decode_registry(
             if require_mlp_tp_gather
             else (lambda _bs, _mt: (1,))
         )
+        if require_gathered_buffer:
+            slots.append(
+                GraphSlot(
+                    "global_num_tokens_unpadded_gpu",
+                    _global_shape,
+                    torch.int32,
+                    axis="none",
+                )
+            )
         for _global_name in (
             "global_num_tokens_gpu",
             "global_num_tokens_for_logprob_gpu",
@@ -790,6 +799,8 @@ def build_prefill_registry(
     enable_mamba_track: bool = False,
     enable_num_token_non_padded: bool = False,
     require_gathered_buffer: bool = False,
+    require_mlp_tp_gather: bool = False,
+    dp_size: int = 1,
     enable_prefill_cp: bool = False,
     register_input_embeds: bool = True,
     share_pool: bool = True,
@@ -906,6 +917,19 @@ def build_prefill_registry(
                 torch.int32,
                 axis="none",
                 post_fill=_prefill_num_token_non_padded_post_fill,
+            )
+        )
+    if require_gathered_buffer:
+        slots.append(
+            GraphSlot(
+                "global_num_tokens_unpadded_gpu",
+                (
+                    (lambda _bs, _mt: (dp_size,))
+                    if require_mlp_tp_gather
+                    else (lambda _bs, _mt: (1,))
+                ),
+                torch.int32,
+                axis="none",
             )
         )
 

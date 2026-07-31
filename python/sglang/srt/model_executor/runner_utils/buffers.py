@@ -76,6 +76,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
     mamba_track_indices: Optional[torch.Tensor]
     mamba_track_mask: Optional[torch.Tensor]
     global_num_tokens_gpu: torch.Tensor
+    global_num_tokens_unpadded_gpu: torch.Tensor
     global_num_tokens_for_logprob_gpu: torch.Tensor
     encoder_lens: Optional[torch.Tensor]
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
@@ -160,6 +161,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             else:
                 global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
                 global_num_tokens_for_logprob_gpu = torch.zeros((1,), dtype=torch.int32)
+            global_num_tokens_unpadded_gpu = torch.zeros_like(global_num_tokens_gpu)
 
             ngram_embedding_info = (
                 NgramEmbeddingInfo(
@@ -204,6 +206,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             mamba_track_mask=mamba_track_mask,
             encoder_lens=encoder_lens,
             global_num_tokens_gpu=global_num_tokens_gpu,
+            global_num_tokens_unpadded_gpu=global_num_tokens_unpadded_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             pp_proxy_tensors=pp_proxy_tensors,
             ngram_embedding_info=ngram_embedding_info,
@@ -328,6 +331,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
     input_ids: torch.Tensor
     out_cache_loc: torch.Tensor
     num_token_non_padded: torch.Tensor
+    global_num_tokens_unpadded_gpu: torch.Tensor
     mamba_track_indices: Optional[torch.Tensor]
     mamba_track_mask: Optional[torch.Tensor]
     mamba_track_seqlens: Optional[torch.Tensor]
@@ -347,11 +351,16 @@ class PrefillInputBuffers(ForwardInputBuffers):
         hidden_size: int,
         dtype: torch.dtype,
         enable_mamba_track: bool,
+        dp_size: int,
+        require_mlp_tp_gather: bool,
     ) -> PrefillInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_tokens,), dtype=torch.int64)
             out_cache_loc = torch.zeros((max_num_tokens,), dtype=cache_loc_dtype)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+            global_num_tokens_unpadded_gpu = torch.zeros(
+                (dp_size if require_mlp_tp_gather else 1,), dtype=torch.int32
+            )
             mamba_track_indices = (
                 torch.zeros((max_bs,), dtype=torch.int64)
                 if enable_mamba_track
@@ -378,6 +387,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
             input_ids=input_ids,
             out_cache_loc=out_cache_loc,
             num_token_non_padded=num_token_non_padded,
+            global_num_tokens_unpadded_gpu=global_num_tokens_unpadded_gpu,
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             mamba_track_seqlens=mamba_track_seqlens,

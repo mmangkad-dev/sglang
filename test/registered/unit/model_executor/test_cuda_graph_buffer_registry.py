@@ -47,6 +47,7 @@ class _MiniForwardBatch:
     num_token_non_padded: Optional[torch.Tensor] = None
     num_token_non_padded_cpu: Optional[int] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
+    global_num_tokens_unpadded_gpu: Optional[torch.Tensor] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     ngram_embedding_info: Optional[object] = None
     rids_int: Optional[torch.Tensor] = None
@@ -788,6 +789,7 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
             num_token_non_padded=ntnp,
             global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
+            global_num_tokens_unpadded_gpu=torch.zeros(1, dtype=torch.int32),
             global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
         )
         # Gathered (DP) path: post_fill overwrites the FB copy with the local
@@ -1397,19 +1399,28 @@ class TestComputedSlots(unittest.TestCase):
             seq_len_fill_value=5,
             cache_loc_dtype=torch.int64,
             require_gathered_buffer=True,
+            require_mlp_tp_gather=True,
+            dp_size=2,
         )
         self.assertTrue(reg.has_slot("global_num_tokens_gpu"))
         # FB carries a stale value; copy_from_fb=False means it's ignored and
         # the slot is filled with padded_num_tokens by post_fill.
         fb = _MiniForwardBatch(
             batch_size=2,
-            global_num_tokens_gpu=torch.tensor([999], dtype=torch.int32),
+            global_num_tokens_gpu=torch.tensor([999, 999], dtype=torch.int32),
+            global_num_tokens_unpadded_gpu=torch.tensor([1, 8], dtype=torch.int32),
         )
-        reg.fill_from(fb, raw_bs=2, padded_bs=4, raw_num_tokens=2, padded_num_tokens=4)
+        reg.fill_from(fb, raw_bs=2, padded_bs=4, raw_num_tokens=2, padded_num_tokens=8)
         self.assertTrue(
             torch.equal(
                 reg.get_slot("global_num_tokens_gpu").buffer,
-                torch.tensor([4], dtype=torch.int32),
+                torch.tensor([8, 8], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                reg.get_slot("global_num_tokens_unpadded_gpu").buffer,
+                torch.tensor([1, 8], dtype=torch.int32),
             )
         )
 

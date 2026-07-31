@@ -441,6 +441,7 @@ def get_dp_local_slice_cpu(
 
 
 from sglang.kernels.ops.memory.memcpy_triton import memcpy_triton
+from sglang.kernels.ops.memory.zero_padded_rows import zero_padded_rows
 
 
 def _dp_gather_via_all_reduce(
@@ -493,6 +494,16 @@ def _dp_gather_via_all_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
+    # MAX_LEN buffers retain their padded shape during CUDA graph replay. The
+    # separate local count remains unpadded and is refreshed in its static graph
+    # buffer before replay, so valid rows are untouched and only padding clears.
+    if forward_batch.global_num_tokens_unpadded_gpu is not None:
+        dp_rank = get_attention_dp_rank()
+        zero_padded_rows(
+            local_tokens,
+            forward_batch.global_num_tokens_unpadded_gpu[dp_rank : dp_rank + 1],
+        )
+
     use_world = world_dp_gather_enabled()
 
     if get_attn_tensor_model_parallel_world_size() == 1:

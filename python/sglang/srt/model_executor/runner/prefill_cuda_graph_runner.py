@@ -294,6 +294,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=self.model_runner.model_config.hidden_size,
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
+            dp_size=model_runner.server_args.dp_size,
+            require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
@@ -310,6 +312,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             enable_mamba_track=self.mamba_track_enabled,
             enable_num_token_non_padded=enable_num_token_non_padded(),
             require_gathered_buffer=require_gathered_buffer(model_runner.server_args),
+            require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
+            dp_size=model_runner.server_args.dp_size,
             enable_prefill_cp=(
                 is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
             ),
@@ -1125,6 +1129,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
             global_num_tokens_gpu = num_tokens_tensor
             global_num_tokens_for_logprob_gpu = num_tokens_tensor
+            if registry.has_slot("global_num_tokens_unpadded_gpu"):
+                _slot("global_num_tokens_unpadded_gpu").copy_(num_tokens_tensor)
         else:
             global_dp_buffer_len = None
             global_num_tokens_gpu = None
@@ -1171,6 +1177,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 extend_logprob_start_lens_cpu=list(lens_cpu),
                 positions=_slot("positions"),
                 global_num_tokens_gpu=global_num_tokens_gpu,
+                global_num_tokens_unpadded_gpu=(
+                    _slot("global_num_tokens_unpadded_gpu")
+                    if registry.has_slot("global_num_tokens_unpadded_gpu")
+                    else None
+                ),
                 global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
                 global_num_tokens_cpu=global_num_tokens_cpu,
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
@@ -1405,6 +1416,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             positions=positions,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
+            global_num_tokens_unpadded_gpu=(
+                _slot("global_num_tokens_unpadded_gpu")
+                if registry.has_slot("global_num_tokens_unpadded_gpu")
+                else forward_batch.global_num_tokens_unpadded_gpu
+            ),
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             dp_padding_mode=forward_batch.dp_padding_mode,
