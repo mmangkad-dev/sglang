@@ -1,9 +1,11 @@
 import socket
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 
-from sglang.kernels.ops.memory.zero_padded_rows import zero_padded_rows
+import sglang.srt.layers.dp_attention as dp_attention
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="2-gpu-large")
@@ -28,22 +30,12 @@ def _run_uneven_gather(rank: int, world_size: int, port: int) -> None:
         local_tokens = torch.empty(
             max_rows, width, device=f"cuda:{rank}", dtype=torch.bfloat16
         )
-        local_num_tokens = torch.tensor(
-            [max_rows], device=f"cuda:{rank}", dtype=torch.int32
+        global_num_tokens_unpadded_gpu = torch.tensor(
+            [1, max_rows], device=f"cuda:{rank}", dtype=torch.int32
         )
-
-        # Capture with the padded count, then replay with unequal live counts.
-        zero_padded_rows(local_tokens, local_num_tokens)
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            zero_padded_rows(local_tokens, local_num_tokens)
-
         real_rows = 1 if rank == 0 else max_rows
         local_tokens.fill_(float("nan"))
         local_tokens[:real_rows].fill_(rank + 1)
-        local_num_tokens.fill_(real_rows)
-        graph.replay()
 
         gathered = torch.empty(
             world_size * max_rows,
@@ -51,7 +43,26 @@ def _run_uneven_gather(rank: int, world_size: int, port: int) -> None:
             device=f"cuda:{rank}",
             dtype=torch.bfloat16,
         )
-        torch.distributed.all_gather_into_tensor(gathered, local_tokens)
+
+        class _Group:
+            @staticmethod
+            def all_gather_into_tensor(output, input_):
+                torch.distributed.all_gather_into_tensor(output, input_)
+
+        forward_batch = SimpleNamespace(
+            global_num_tokens_unpadded_gpu=global_num_tokens_unpadded_gpu
+        )
+        with (
+            patch.object(
+                dp_attention, "get_attn_tensor_model_parallel_world_size", lambda: 1
+            ),
+            patch.object(dp_attention, "get_attention_dp_rank", lambda: rank),
+            patch.object(dp_attention, "world_dp_gather_enabled", lambda: False),
+            patch.object(dp_attention, "get_tp_group", lambda: _Group()),
+        ):
+            dp_attention._dp_gather_via_all_gather(
+                gathered, local_tokens, forward_batch, is_partial=True
+            )
 
         assert torch.all(gathered[0] == 1)
         assert torch.count_nonzero(gathered[1:max_rows]).item() == 0
@@ -61,7 +72,7 @@ def _run_uneven_gather(rank: int, world_size: int, port: int) -> None:
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Two CUDA GPUs required")
-def test_uneven_dp_counts_zero_padding_before_graph_replay_gather():
+def test_uneven_dp_counts_zero_padding_in_production_gather():
     torch.multiprocessing.spawn(
         _run_uneven_gather,
         args=(2, _find_free_port()),

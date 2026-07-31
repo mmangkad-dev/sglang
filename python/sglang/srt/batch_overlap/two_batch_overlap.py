@@ -786,6 +786,7 @@ class TboForwardBatchPreparer:
                 _original_forward_mode=None,
                 _original_num_tokens=None,
                 global_num_tokens_gpu=None,
+                global_num_tokens_unpadded_gpu=None,
                 global_num_tokens_cpu=None,
                 global_dp_buffer_len=global_dp_buffer_len,
                 global_num_tokens_for_logprob_gpu=None,

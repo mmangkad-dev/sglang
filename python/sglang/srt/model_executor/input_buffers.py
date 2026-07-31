@@ -102,3 +102,18 @@ class ForwardInputBuffers:
                 ), f"Field {name} is expected to be a torch.Tensor, a dict of torch.Tensor, or a dataclass of torch.Tensor, but got {type(buffer)}."
                 new_buffer = self._share_one_buffer(name, buffer)
                 setattr(self, name, new_buffer)
+
+
+def refresh_global_num_tokens_unpadded(buffers, forward_batch) -> None:
+    """Refresh a graph buffer from a live batch's unpadded DP token counts."""
+    dst = buffers.global_num_tokens_unpadded_gpu
+    if dst is None:
+        return
+    src = forward_batch.global_num_tokens_unpadded_gpu
+    if src is None:
+        raise RuntimeError("Missing unpadded DP token counts for graph replay")
+    if dst.shape != src.shape:
+        raise RuntimeError(
+            f"Unpadded DP token count shape mismatch: {dst.shape=} {src.shape=}"
+        )
+    dst.copy_(src)

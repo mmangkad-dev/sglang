@@ -19,7 +19,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.model_executor.input_buffers import (
+    ForwardInputBuffers,
+    refresh_global_num_tokens_unpadded,
+)
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
@@ -66,6 +69,7 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     num_accept_tokens: torch.Tensor
     next_token_logits_buffer: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
+    global_num_tokens_unpadded_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
 
@@ -206,6 +210,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             else:
                 global_num_tokens_gpu = None
                 global_num_tokens_for_logprob_gpu = None
+            global_num_tokens_unpadded_gpu = (
+                torch.zeros_like(global_num_tokens_gpu)
+                if global_num_tokens_gpu is not None
+                else None
+            )
 
             hot_token_id = getattr(self.eagle_worker, "hot_token_id", None)
             if hasattr(
@@ -258,6 +267,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             num_accept_tokens=num_accept_tokens,
             next_token_logits_buffer=next_token_logits_buffer,
             global_num_tokens_gpu=global_num_tokens_gpu,
+            global_num_tokens_unpadded_gpu=global_num_tokens_unpadded_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dsa_seed_topk_capture=dsa_seed_topk_capture,
         )
@@ -360,6 +370,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     device=buffers.input_ids.device,
                 )
             )
+            buffers.global_num_tokens_unpadded_gpu.copy_(buffers.global_num_tokens_gpu)
             buffers.global_num_tokens_for_logprob_gpu.copy_(
                 torch.tensor(
                     [num_tokens_for_logprob] * len(global_num_tokens_cpu),
@@ -394,6 +405,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             positions=positions,
             mrope_positions=mrope_positions,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
+            global_num_tokens_unpadded_gpu=buffers.global_num_tokens_unpadded_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
@@ -538,6 +550,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
+            refresh_global_num_tokens_unpadded(buffers, forward_batch)
             buffers.global_num_tokens_gpu.fill_(bs * self.captured_req_width)
             buffers.global_num_tokens_for_logprob_gpu.fill_(
                 bs * self.captured_req_width

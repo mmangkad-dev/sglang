@@ -44,7 +44,10 @@ from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
 )
-from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.model_executor.input_buffers import (
+    ForwardInputBuffers,
+    refresh_global_num_tokens_unpadded,
+)
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
@@ -122,6 +125,7 @@ class MultiLayerEagleDraftExtendInputBuffers(ForwardInputBuffers):
     hidden_states: torch.Tensor
     next_token_logits_buffer: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
+    global_num_tokens_unpadded_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
     # Rejection sampling with the single-CG runner only, else None (the presence
     # of draft_probs selects the in-graph proposal branch in _run_step_body).
@@ -300,6 +304,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     device=buffers.input_ids.device,
                 )
             )
+            buffers.global_num_tokens_unpadded_gpu.copy_(buffers.global_num_tokens_gpu)
             buffers.global_num_tokens_for_logprob_gpu.copy_(
                 torch.tensor(
                     global_num_tokens_for_logprob_cpu,
@@ -342,6 +347,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             positions=positions,
             mrope_positions=mrope_positions,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
+            global_num_tokens_unpadded_gpu=buffers.global_num_tokens_unpadded_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
@@ -686,6 +692,11 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             else:
                 global_num_tokens_gpu = None
                 global_num_tokens_for_logprob_gpu = None
+            global_num_tokens_unpadded_gpu = (
+                torch.zeros_like(global_num_tokens_gpu)
+                if global_num_tokens_gpu is not None
+                else None
+            )
 
         return MultiLayerEagleDraftExtendInputBuffers(
             input_ids=input_ids,
@@ -703,6 +714,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             hidden_states=hidden_states,
             next_token_logits_buffer=next_token_logits_buffer,
             global_num_tokens_gpu=global_num_tokens_gpu,
+            global_num_tokens_unpadded_gpu=global_num_tokens_unpadded_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             temperatures=temperatures,
             draft_probs=draft_probs,
@@ -766,6 +778,8 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             self.num_front_tokens,
             self.seq_len_fill_value,
         )
+        if self.require_gathered_buffer:
+            refresh_global_num_tokens_unpadded(buffers, forward_batch)
 
         # Refresh the host mirror only when published; hand replay None
         # otherwise so no consumer reads a stale buffer.

@@ -17,7 +17,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.model_executor.input_buffers import (
+    ForwardInputBuffers,
+    refresh_global_num_tokens_unpadded,
+)
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     DeepEPCudaGraphRunnerAdapter,
@@ -60,6 +63,7 @@ class FrozenKVMTPInputBuffers(ForwardInputBuffers):
     # Consumed by the captured seed iter; see `FrozenKVMTPDraftWorker.draft_forward`.
     bonus_tokens: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
+    global_num_tokens_unpadded_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
 
@@ -168,6 +172,11 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
             else:
                 global_num_tokens_gpu = None
                 global_num_tokens_for_logprob_gpu = None
+            global_num_tokens_unpadded_gpu = (
+                torch.zeros_like(global_num_tokens_gpu)
+                if global_num_tokens_gpu is not None
+                else None
+            )
 
         self.buffers = FrozenKVMTPInputBuffers(
             req_pool_indices=req_pool_indices,
@@ -180,6 +189,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
             hidden_states=hidden_states,
             bonus_tokens=bonus_tokens,
             global_num_tokens_gpu=global_num_tokens_gpu,
+            global_num_tokens_unpadded_gpu=global_num_tokens_unpadded_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         )
         self.buffers.share_buffers()
@@ -273,6 +283,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
                 device=buffers.positions.device,
             )
             buffers.global_num_tokens_gpu.copy_(num_tokens_tensor)
+            buffers.global_num_tokens_unpadded_gpu.copy_(num_tokens_tensor)
             buffers.global_num_tokens_for_logprob_gpu.copy_(num_tokens_tensor)
             global_num_tokens = buffers.global_num_tokens_gpu
             global_num_tokens_for_logprob = buffers.global_num_tokens_for_logprob_gpu
@@ -306,6 +317,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
             positions=positions,
             mrope_positions=mrope_positions,
             global_num_tokens_gpu=global_num_tokens,
+            global_num_tokens_unpadded_gpu=buffers.global_num_tokens_unpadded_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
@@ -418,6 +430,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         buffers.req_pool_indices[:raw_expanded_bs].copy_(forward_batch.req_pool_indices)
 
         if self.require_gathered_buffer:
+            refresh_global_num_tokens_unpadded(buffers, forward_batch)
             buffers.global_num_tokens_gpu.fill_(expanded_bs)
             buffers.global_num_tokens_for_logprob_gpu.fill_(expanded_bs)
 

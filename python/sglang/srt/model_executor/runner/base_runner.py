@@ -139,6 +139,7 @@ def _allocate_decode_buffers(
         else:
             global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
             global_num_tokens_for_logprob_gpu = torch.zeros((1,), dtype=torch.int32)
+        global_num_tokens_unpadded_gpu = torch.zeros_like(global_num_tokens_gpu)
 
         ngram_embedding_info = (
             NgramEmbeddingInfo(
@@ -183,6 +184,7 @@ def _allocate_decode_buffers(
         mamba_track_mask=mamba_track_mask,
         encoder_lens=encoder_lens,
         global_num_tokens_gpu=global_num_tokens_gpu,
+        global_num_tokens_unpadded_gpu=global_num_tokens_unpadded_gpu,
         global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
         pp_proxy_tensors=pp_proxy_tensors,
         ngram_embedding_info=ngram_embedding_info,
