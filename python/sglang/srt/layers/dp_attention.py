@@ -10,6 +10,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.memory.memcpy_triton import memcpy_triton
+from sglang.kernels.ops.memory.zero_padded_rows import zero_padded_rows
 from sglang.srt.distributed import (
     GroupCoordinator,
     get_attn_cp_group,
@@ -438,10 +440,6 @@ def get_dp_local_slice_cpu(
     else:
         local_start_pos = sum(global_num_tokens[:dp_rank])
     return local_start_pos, local_num_tokens
-
-
-from sglang.kernels.ops.memory.memcpy_triton import memcpy_triton
-from sglang.kernels.ops.memory.zero_padded_rows import zero_padded_rows
 
 
 def _dp_gather_via_all_reduce(

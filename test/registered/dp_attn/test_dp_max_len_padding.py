@@ -1,12 +1,13 @@
 import socket
+import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
 import torch
 
 import sglang.srt.layers.dp_attention as dp_attention
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="2-gpu-large")
 
@@ -71,15 +72,16 @@ def _run_uneven_gather(rank: int, world_size: int, port: int) -> None:
         torch.distributed.destroy_process_group()
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Two CUDA GPUs required")
-def test_uneven_dp_counts_zero_padding_in_production_gather():
-    torch.multiprocessing.spawn(
-        _run_uneven_gather,
-        args=(2, _find_free_port()),
-        nprocs=2,
-        join=True,
-    )
+class TestDpMaxLenPadding(CustomTestCase):
+    @unittest.skipUnless(torch.cuda.device_count() >= 2, "Two CUDA GPUs required")
+    def test_uneven_dp_counts_zero_padding_in_production_gather(self):
+        torch.multiprocessing.spawn(
+            _run_uneven_gather,
+            args=(2, _find_free_port()),
+            nprocs=2,
+            join=True,
+        )
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
+    unittest.main()
