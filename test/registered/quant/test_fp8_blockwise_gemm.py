@@ -8,7 +8,6 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
     popen_launch_server,
     try_cached_model,
 )
@@ -21,7 +20,6 @@ MXFP8_MODEL_PATH = "zianglih/Qwen3-4B-Instruct-2507-MXFP8"
 
 class FP8BlockwiseGemmBase:
     backend = None
-    process = None
 
     @classmethod
     def setUpClass(cls):
@@ -43,8 +41,7 @@ class FP8BlockwiseGemmBase:
 
     @classmethod
     def tearDownClass(cls):
-        if cls.process is not None:
-            kill_process_tree(cls.process.pid)
+        kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
         parsed_url = urlparse(self.base_url)
@@ -66,7 +63,6 @@ class FP8BlockwiseGemmBase:
 
 class MXFP8GemmBase:
     backend = None
-    process = None
 
     @classmethod
     def setUpClass(cls):
@@ -91,8 +87,7 @@ class MXFP8GemmBase:
 
     @classmethod
     def tearDownClass(cls):
-        if cls.process is not None:
-            kill_process_tree(cls.process.pid)
+        kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
         parsed_url = urlparse(self.base_url)
@@ -112,45 +107,42 @@ class MXFP8GemmBase:
         self.assertGreaterEqual(metrics["score"], 0.8)
 
 
-class TestFP8BlockwiseGemmTriton(FP8BlockwiseGemmBase, CustomTestCase):
+class TestFP8BlockwiseGemmTriton(FP8BlockwiseGemmBase, unittest.TestCase):
     backend = "triton"
 
 
-class TestFP8BlockwiseGemmDeepGemm(FP8BlockwiseGemmBase, CustomTestCase):
+class TestFP8BlockwiseGemmDeepGemm(FP8BlockwiseGemmBase, unittest.TestCase):
     backend = "deep_gemm"
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestFP8BlockwiseGemmFlashinferTrtllm(FP8BlockwiseGemmBase, CustomTestCase):
+class TestFP8BlockwiseGemmFlashinferTrtllm(FP8BlockwiseGemmBase, unittest.TestCase):
     backend = "flashinfer_trtllm"
 
 
 @unittest.skipIf(get_device_sm() != 90, "Test requires CUDA SM 90")
-class TestFP8BlockwiseGemmFlashinferDeepGemm(FP8BlockwiseGemmBase, CustomTestCase):
+class TestFP8BlockwiseGemmFlashinferDeepGemm(FP8BlockwiseGemmBase, unittest.TestCase):
     backend = "flashinfer_deepgemm"
 
 
 @unittest.skip("Currently PCG capture takes too long to complete, disable until fixed")
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestMXFP8GemmTriton(MXFP8GemmBase, CustomTestCase):
+class TestMXFP8GemmTriton(MXFP8GemmBase, unittest.TestCase):
     backend = "triton"
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestMXFP8GemmFlashinferTrtllm(MXFP8GemmBase, CustomTestCase):
+class TestMXFP8GemmFlashinferTrtllm(MXFP8GemmBase, unittest.TestCase):
     backend = "flashinfer_trtllm"
 
 
-@unittest.skipIf(
-    get_device_sm() not in (100, 103, 110, 120, 121),
-    "Test requires FlashInfer CUTLASS MXFP8 support",
-)
-class TestMXFP8GemmFlashinferCutlass(MXFP8GemmBase, CustomTestCase):
+@unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
+class TestMXFP8GemmFlashinferCutlass(MXFP8GemmBase, unittest.TestCase):
     backend = "flashinfer_cutlass"
 
 
 @unittest.skipIf(get_device_sm() not in (100, 103), "Test requires CUDA SM 100/103")
-class TestMXFP8GemmCuteDSL(MXFP8GemmBase, CustomTestCase):
+class TestMXFP8GemmCuteDSL(MXFP8GemmBase, unittest.TestCase):
     backend = "flashinfer_cutedsl"
 
 
