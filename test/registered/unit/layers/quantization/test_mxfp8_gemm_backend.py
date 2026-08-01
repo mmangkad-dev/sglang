@@ -22,7 +22,6 @@ class TestMXFP8GemmBackend(CustomTestCase):
         *,
         cli_quantization=None,
         effective_quantization=None,
-        co_resident_quantizations=None,
     ):
         server_args = SimpleNamespace(
             fp8_gemm_runner_backend="auto", quantization=cli_quantization
@@ -35,7 +34,6 @@ class TestMXFP8GemmBackend(CustomTestCase):
             fp8_utils.initialize_fp8_gemm_config(
                 server_args,
                 effective_quantization=effective_quantization,
-                co_resident_quantizations=co_resident_quantizations,
             )
         return fp8_utils.get_fp8_gemm_runner_backend()
 
@@ -57,34 +55,6 @@ class TestMXFP8GemmBackend(CustomTestCase):
 
     def test_cli_mxfp8_remains_supported(self):
         backend = self._initialize(103, cli_quantization="mxfp8")
-        self.assertIs(backend, fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL)
-
-    def test_mixed_mxfp8_target_and_fp8_draft_selects_cutlass(self):
-        backend = self._initialize(
-            100,
-            effective_quantization="mxfp8",
-            co_resident_quantizations=["fp8"],
-        )
-        self.assertIs(backend, fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_CUTLASS)
-
-    def test_composite_block_fp8_drafts_select_cutlass(self):
-        for draft_quantization in ("w4afp8", "compressed-tensors"):
-            with self.subTest(draft_quantization=draft_quantization):
-                backend = self._initialize(
-                    103,
-                    effective_quantization="mxfp8",
-                    co_resident_quantizations=[draft_quantization],
-                )
-                self.assertIs(
-                    backend, fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
-                )
-
-    def test_unquantized_draft_keeps_cutedsl(self):
-        backend = self._initialize(
-            100,
-            effective_quantization="mxfp8",
-            co_resident_quantizations=[None],
-        )
         self.assertIs(backend, fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL)
 
     def test_cutedsl_dispatches_flashinfer_mxfp8(self):

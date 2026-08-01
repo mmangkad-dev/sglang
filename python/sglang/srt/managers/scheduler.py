@@ -650,18 +650,6 @@ class Scheduler(
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
-        self.draft_model_config = None
-        if (
-            not self.spec_algorithm.is_none()
-            and not self.spec_algorithm.is_ngram()
-            and get_spec().speculative_draft_model_path is not None
-        ):
-            self.draft_model_config = ModelConfig.from_server_args(
-                self.server_args,
-                model_path=get_spec().speculative_draft_model_path,
-                model_revision=get_spec().speculative_draft_model_revision,
-                is_draft_model=True,
-            )
         if _is_npu:
             # make sure the page size is not larger than block_size and chunked_prefill_size on NPU backend
             # the npu backend request the defined page size to be no larger than block_size and chunked_prefill_size
@@ -834,19 +822,9 @@ class Scheduler(
             initialize_moe_config(self.server_args)
 
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
-        co_resident_quantizations = (
-            [self.draft_model_config.quantization]
-            if self.draft_model_config is not None
-            else (
-                [self.server_args.speculative_draft_model_quantization]
-                if not self.spec_algorithm.is_none()
-                else None
-            )
-        )
         initialize_fp8_gemm_config(
             self.server_args,
             effective_quantization=self.model_config.quantization,
-            co_resident_quantizations=co_resident_quantizations,
         )
         initialize_fp4_gemm_config(self.server_args)
         initialize_bf16_gemm_config(self.server_args)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from enum import Enum
 from functools import lru_cache
-from typing import TYPE_CHECKING, Callable, Iterable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
 
 import torch
 
@@ -633,24 +633,17 @@ def _dispatch_auto_backend() -> Callable:
 def initialize_fp8_gemm_config(
     server_args: ServerArgs,
     effective_quantization: Optional[str] = None,
-    co_resident_quantizations: Optional[Iterable[Optional[str]]] = None,
 ) -> None:
     """Initialize FP8 GEMM configuration using the resolved model format."""
     global FP8_GEMM_RUNNER_BACKEND
 
     backend = server_args.fp8_gemm_runner_backend
     quantization = effective_quantization or server_args.quantization
-    quantizations = {quantization}
-    if co_resident_quantizations is not None:
-        quantizations.update(co_resident_quantizations)
 
     # Prefer split-K CuTe DSL on SM100/SM103. Other Blackwell architectures use
     # FlashInfer CUTLASS.
-    if backend == "auto" and "mxfp8" in quantizations:
-        # The backend is process-global. Select CuTe DSL only when every model
-        # is compatible with its MXFP8-only contract; CUTLASS supports mixed
-        # MXFP8/block-FP8 processes on the same architectures.
-        if is_sm100_supported() and all(q in (None, "mxfp8") for q in quantizations):
+    if backend == "auto" and quantization == "mxfp8":
+        if is_sm100_supported():
             backend = "flashinfer_cutedsl"
         elif is_blackwell_supported():
             backend = "flashinfer_cutlass"
