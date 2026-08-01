@@ -20,6 +20,12 @@ jobs:
     if: github.event.label.name == 'run-ci'
     runs-on: ubuntu-latest
     steps:
+      - name: Check out trusted listener code
+        uses: actions/checkout@v4
+        with:
+          # pull_request_target must never check out untrusted PR code.
+          ref: ${{ github.event.repository.default_branch }}
+
       - name: Rerun gated PR workflows
         uses: actions/github-script@v8
         with:
@@ -28,8 +34,11 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const headSha = context.payload.pull_request.head.sha;
-            const pullNumber = context.payload.pull_request.number;
+            const pullRequest = context.payload.pull_request;
             const rerunIds = new Set();
+            const { isAllowedRunForPull } = require(
+              `${process.env.GITHUB_WORKSPACE}/scripts/ci/utils/run_ci_label_listener.js`
+            );
 
             // Gate-only runs normally finish quickly, but the label can be
             // applied while they are still completing. Poll briefly so a
@@ -41,10 +50,7 @@ jobs:
               );
 
               for (const run of runs) {
-                const belongsToPull = (run.pull_requests || []).some(
-                  pull => pull.number === pullNumber
-                );
-                if (!belongsToPull) continue;
+                if (!isAllowedRunForPull(run, pullRequest)) continue;
                 if (rerunIds.has(run.id) || run.status !== 'completed') continue;
                 if (!['failure', 'skipped'].includes(run.conclusion)) continue;
 
