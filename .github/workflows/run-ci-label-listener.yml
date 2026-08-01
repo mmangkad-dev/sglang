@@ -1,0 +1,65 @@
+name: Run CI Label Listener
+
+# Keep label events out of workflows that publish required checks. A
+# pull_request workflow cannot filter `labeled` by label name before its
+# concurrency and job graph are created, so an unrelated label could cancel
+# real CI and replace its required check. This non-required workflow admits
+# only `run-ci`, then reruns the original pull_request workflows. Their shared
+# runtime gate fetches the PR's current labels and observes the new label.
+on:
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  rerun-pr-ci:
+    if: github.event.label.name == 'run-ci'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rerun gated PR workflows
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const headSha = context.payload.pull_request.head.sha;
+            const pullNumber = context.payload.pull_request.number;
+            const rerunIds = new Set();
+
+            // Gate-only runs normally finish quickly, but the label can be
+            // applied while they are still completing. Poll briefly so a
+            // maintainer does not need to remove and re-add the label.
+            for (let attempt = 0; attempt < 7; attempt++) {
+              const runs = await github.paginate(
+                github.rest.actions.listWorkflowRunsForRepo,
+                { owner, repo, head_sha: headSha, event: 'pull_request', per_page: 100 }
+              );
+
+              for (const run of runs) {
+                const belongsToPull = (run.pull_requests || []).some(
+                  pull => pull.number === pullNumber
+                );
+                if (!belongsToPull) continue;
+                if (rerunIds.has(run.id) || run.status !== 'completed') continue;
+                if (!['failure', 'skipped'].includes(run.conclusion)) continue;
+
+                core.info(`Rerunning ${run.name} (${run.id}, ${run.conclusion})`);
+                await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
+                rerunIds.add(run.id);
+              }
+
+              if (attempt < 6) {
+                await new Promise(resolve => setTimeout(resolve, 10000));
+              }
+            }
+
+            if (rerunIds.size === 0) {
+              core.warning(`No completed failed/skipped PR workflows found for ${headSha}`);
+            } else {
+              core.info(`Rerun ${rerunIds.size} PR workflow(s) for ${headSha}`);
+            }

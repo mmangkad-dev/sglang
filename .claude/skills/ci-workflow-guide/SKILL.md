@@ -396,11 +396,8 @@ Handled by `scripts/ci/utils/slash_command_handler.py` → `.github/workflows/sl
 
 ### Label-gated workflow dispatch (pr-test, pr-test-extra)
 
-`pr-test.yml` and `pr-test-extra.yml` both listen for `pull_request.labeled` (in addition to `opened`/`synchronize`/`reopened`). The `check-changes.if` gate has two clauses:
+Protected-check workflows must not subscribe directly to `pull_request.labeled`: GitHub creates the workflow and applies concurrency before job-level label guards run, so an unrelated label could cancel valid CI and publish a misleading replacement required check.
 
-1. **For `labeled` events**: the just-added label must be one of the gating labels (`run-ci` for pr-test, `run-ci` or `run-ci-extra` for pr-test-extra) — otherwise every unrelated label addition would dispatch a full CI run.
-2. **All events**: the PR must currently carry the required labels.
+A manually applied `run-ci` label is handled by the non-required `run-ci-label-listener.yml`. It verifies the event label, then reruns failed/skipped workflows from the PR's current head SHA. `pr-gate.yml` fetches current PR labels at runtime, so those reruns see the newly applied label even though the original `pull_request` event payload is frozen.
 
-This is what lets `/tag-run-ci-label` (and the `extra` variant) trigger a fresh CI run without an extra push.
-
-**Caveat — skipped runs cannot be un-skipped by `run.rerun()`:** GitHub's rerun API reuses the original event payload, so rerunning a `pull_request`-event run that was skipped because of missing labels will skip again (label set in the frozen payload doesn't update). The only way to recover a label-skipped run is to add the missing label, which fires a fresh `labeled` event with the current label set. `handle_rerun_failed_ci` in the slash handler is for rerunning failed/non-label-skipped runs; it cannot revive label-skipped ones.
+Labels added by `/tag-run-ci-label` use `GITHUB_TOKEN`; GitHub suppresses new workflow runs caused by that token. Therefore `/tag-run-ci-label` only adds labels. Use `/tag-and-rerun-ci` when CI must also start: it adds the labels and explicitly invokes the rerun API. The `extra` variants also add `run-ci-extra`; extra workflows retain their own carefully gated opt-in handling.

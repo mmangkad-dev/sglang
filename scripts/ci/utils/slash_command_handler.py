@@ -317,15 +317,13 @@ def handle_tag_run_ci(
     we always add `run-ci` alongside `run-ci-extra`. Reuses the same
     `can_tag_run_ci_label` permission.
 
-    How fresh runs get dispatched: pr-test.yml and pr-test-extra.yml both
-    include `labeled` in `on.pull_request.types`, so adding a label fires a
-    new `pull_request.labeled` event with the up-to-date label set in its
-    payload, which spawns a fresh workflow run that satisfies the
-    `check-changes.if` gate. Note that this is the ONLY way to "un-skip" a
-    label-gated run — `run.rerun()` on a previously-skipped pull_request run
-    reuses the original event payload (frozen labels), so it would skip
-    again. handle_rerun_failed_ci can't recover label-skipped runs; the
-    labeled event is the recovery mechanism.
+    How fresh runs get dispatched: a label applied manually in the GitHub UI
+    fires run-ci-label-listener.yml, which validates `run-ci` before rerunning
+    the original pull_request workflows. Events caused by this workflow's
+    GITHUB_TOKEN do not start other workflow runs, so the combined
+    /tag-and-rerun-ci command calls handle_rerun_failed_ci directly. The
+    shared gate fetches current PR labels at runtime, allowing either rerun
+    path to observe labels added after the original event payload.
 
     Returns True if action was taken, False otherwise.
     """
@@ -413,13 +411,10 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     # - skipped: the entire run was skipped (no jobs ran), so there are no
     #   failed jobs for rerun_failed_jobs() to target. Use run.rerun().
     #
-    #   Caveat: GitHub's `run.rerun()` reuses the original event payload, so
-    #   reruns of `pull_request`-event runs that were skipped because their
-    #   `if` evaluated to false (e.g. missing label) will skip again — the
-    #   label set in the frozen payload doesn't update. To un-skip a
-    #   label-gated workflow, add the missing label (the `labeled` event
-    #   dispatches a fresh run with the current label set); this function
-    #   cannot recover those by rerun alone.
+    #   GitHub's `run.rerun()` reuses the original event payload. Runtime
+    #   gates that live-fetch labels (pr-gate.yml) can observe newly-added
+    #   labels, but workflow/job-level conditions using github.event still
+    #   see the frozen payload and may skip again.
     # - kernel wheel escape: if the PR touches sgl-kernel and not all wheel
     #   builds are success yet, full-rerun failure runs too — Build Wheel
     #   lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml, and
