@@ -1330,7 +1330,8 @@ def flashinfer_mxfp8_blockscaled_linear(
     # Ensure transposed tensors are contiguous for FlashInfer's internal runner.
     weight_t = weight.contiguous().t()
 
-    if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+    backend = get_fp8_gemm_runner_backend()
+    if backend.is_flashinfer_trtllm():
         weight_scale_t = weight_scale.contiguous().view(-1)
         output = flashinfer_mm_mxfp8(
             q_input,
@@ -1341,10 +1342,7 @@ def flashinfer_mxfp8_blockscaled_linear(
             use_8x4_sf_layout=False,
             backend="trtllm",
         )
-    elif (
-        get_fp8_gemm_runner_backend().is_flashinfer_cutlass()
-        or get_fp8_gemm_runner_backend().is_flashinfer_cutedsl()
-    ):
+    elif backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
         weight_scale_t = (
             weight_scale.contiguous().t()
             if weight_scale.ndim == 2
@@ -1357,11 +1355,7 @@ def flashinfer_mxfp8_blockscaled_linear(
             weight_scale_t,
             out_dtype=output_dtype,
             use_8x4_sf_layout=False,
-            backend=(
-                "cute-dsl"
-                if get_fp8_gemm_runner_backend().is_flashinfer_cutedsl()
-                else "cutlass"
-            ),
+            backend="cute-dsl" if backend.is_flashinfer_cutedsl() else "cutlass",
         )
 
     if bias is not None:
