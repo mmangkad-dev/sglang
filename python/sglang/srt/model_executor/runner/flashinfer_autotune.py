@@ -30,9 +30,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Keep dense MXFP8 on FlashInfer's heuristic tactic selection. CuTe DSL's
-# split-K defaults cover low-M shapes well, while compiling every tactic adds a
-# large startup cost; CUTLASS also has an autotuning IMA on affected systems.
+# Keep dense MXFP8 on FlashInfer's heuristic tactic selection. Compiling every
+# tactic adds a large startup cost; CUTLASS also has an autotuning IMA on
+# affected systems.
 FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset({"mxfp8_gemm"})
 
 

@@ -636,7 +636,7 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
     global FP8_GEMM_RUNNER_BACKEND
 
     backend = server_args.fp8_gemm_runner_backend
-    # Prefer split-K CuTe DSL on SM100/SM103. Other Blackwell architectures use
+    # Prefer CuTe DSL on SM100/SM103. Other Blackwell architectures use
     # FlashInfer CUTLASS.
     if backend == "auto" and server_args.quantization == "mxfp8":
         if _is_sm100_supported:
