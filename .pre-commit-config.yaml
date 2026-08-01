@@ -93,6 +93,12 @@ repos:
         language: system
         files: ^\.github/workflows/.*\.yml$
         pass_filenames: false
+      - id: test-run-ci-label-listener
+        name: test run-ci label listener selection
+        entry: node --test scripts/ci/utils/run_ci_label_listener.test.js
+        language: system
+        files: ^(\.github/workflows/run-ci-label-listener\.yml|scripts/ci/utils/run_ci_label_listener(\.test)?\.js)$
+        pass_filenames: false
       - id: check-registered-tests
         name: validate registered test CI registries
         entry: python3 scripts/ci/check_registered_tests.py
