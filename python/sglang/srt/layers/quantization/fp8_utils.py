@@ -490,25 +490,6 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
 
 def dispatch_w8a8_mxfp8_linear() -> Callable:
     backend = get_fp8_gemm_runner_backend()
-    if backend.is_flashinfer_cutedsl() or backend.is_flashinfer_cutlass():
-        flashinfer_available = is_flashinfer_available()
-        sm = _get_cuda_sm() if flashinfer_available else -1
-        if backend.is_flashinfer_cutedsl() and (
-            not flashinfer_available or sm not in _FLASHINFER_CUTEDSL_MXFP8_SMS
-        ):
-            raise RuntimeError(
-                "FlashInfer CuTe DSL MXFP8 GEMM requested via "
-                "--fp8-gemm-backend=flashinfer_cutedsl, but it requires an "
-                "SM100/SM103 GPU and FlashInfer."
-            )
-        if backend.is_flashinfer_cutlass() and (
-            not flashinfer_available or sm not in _FLASHINFER_CUTLASS_MXFP8_SMS
-        ):
-            raise RuntimeError(
-                "FlashInfer CUTLASS MXFP8 GEMM requested via "
-                "--fp8-gemm-backend=flashinfer_cutlass, but it requires an "
-                "SM100/SM103/SM110/SM120/SM121 GPU and FlashInfer."
-            )
     if backend.is_deep_gemm():
         return _deepgemm_w8a8_mxfp8_linear_with_fallback
     elif (
@@ -594,12 +575,6 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
             )
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
 
-    elif backend.is_flashinfer_cutedsl():
-        raise RuntimeError(
-            "--fp8-gemm-backend=flashinfer_cutedsl supports MXFP8 GEMM only. "
-            "Use --quantization=mxfp8 or select another FP8 GEMM backend."
-        )
-
     elif backend.is_flashinfer_deepgemm():
         if not (is_sm90_supported() and is_flashinfer_available()):
             raise RuntimeError(
@@ -680,7 +655,7 @@ def initialize_fp8_gemm_config(
     # Prefer split-K CuTe DSL on SM100/SM103. Other architectures supported by
     # FlashInfer MXFP8 use CUTLASS, avoiding the Triton fallback without sending
     # unsupported SM10x variants into CuTe DSL.
-    if backend == "auto" and "mxfp8" in quantizations and is_flashinfer_available():
+    if backend == "auto" and "mxfp8" in quantizations:
         sm = _get_cuda_sm()
         # The backend is process-global. Select CuTe DSL only when every model
         # is compatible with its MXFP8-only contract; CUTLASS supports mixed

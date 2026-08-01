@@ -32,7 +32,6 @@ class TestMXFP8GemmBackend(CustomTestCase):
                 fp8_utils, "get_device_capability", return_value=divmod(sm, 10)
             ),
             patch.object(fp8_utils, "is_sm120_supported", return_value=sm // 10 == 12),
-            patch.object(fp8_utils, "is_flashinfer_available", return_value=True),
         ):
             fp8_utils.initialize_fp8_gemm_config(
                 server_args,
@@ -93,47 +92,19 @@ class TestMXFP8GemmBackend(CustomTestCase):
         )
         self.assertIs(backend, fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL)
 
-    def test_cutedsl_dispatch_uses_exact_sm_contract(self):
+    def test_cutedsl_dispatches_flashinfer_mxfp8(self):
         fp8_utils.FP8_GEMM_RUNNER_BACKEND = (
             fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL
         )
-        with (
-            patch.object(fp8_utils, "get_device_capability", return_value=(10, 3)),
-            patch.object(fp8_utils, "is_flashinfer_available", return_value=True),
-        ):
-            implementation = fp8_utils.dispatch_w8a8_mxfp8_linear()
+        implementation = fp8_utils.dispatch_w8a8_mxfp8_linear()
         self.assertIs(implementation, fp8_utils.flashinfer_mxfp8_blockscaled_linear)
 
-        with (
-            patch.object(fp8_utils, "get_device_capability", return_value=(10, 7)),
-            patch.object(fp8_utils, "is_flashinfer_available", return_value=True),
-            self.assertRaisesRegex(RuntimeError, "SM100/SM103"),
-        ):
-            fp8_utils.dispatch_w8a8_mxfp8_linear()
-
-    def test_cutedsl_rejects_non_mxfp8_dispatch(self):
-        with self.assertRaisesRegex(RuntimeError, "supports MXFP8 GEMM only"):
-            fp8_utils._dispatch_explicit_backend(
-                fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL
-            )
-
-    def test_cutlass_dispatch_uses_flashinfer_sm_contract(self):
+    def test_cutlass_dispatches_flashinfer_mxfp8(self):
         fp8_utils.FP8_GEMM_RUNNER_BACKEND = (
             fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
         )
-        with (
-            patch.object(fp8_utils, "get_device_capability", return_value=(11, 0)),
-            patch.object(fp8_utils, "is_flashinfer_available", return_value=True),
-        ):
-            implementation = fp8_utils.dispatch_w8a8_mxfp8_linear()
+        implementation = fp8_utils.dispatch_w8a8_mxfp8_linear()
         self.assertIs(implementation, fp8_utils.flashinfer_mxfp8_blockscaled_linear)
-
-        with (
-            patch.object(fp8_utils, "get_device_capability", return_value=(10, 7)),
-            patch.object(fp8_utils, "is_flashinfer_available", return_value=True),
-            self.assertRaisesRegex(RuntimeError, "SM100/SM103/SM110/SM120/SM121"),
-        ):
-            fp8_utils.dispatch_w8a8_mxfp8_linear()
 
     def test_one_batch_uses_checkpoint_detected_quantization(self):
         import sglang.benchmark.one_batch as one_batch
