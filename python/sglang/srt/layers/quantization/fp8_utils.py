@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from enum import Enum
 from functools import lru_cache
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
 
@@ -266,6 +266,7 @@ class Fp8GemmRunnerBackend(Enum):
     AUTO = "auto"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
+    FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_DEEPGEMM = "flashinfer_deepgemm"
     CUTLASS = "cutlass"
     DEEP_GEMM = "deep_gemm"
@@ -280,6 +281,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_flashinfer_cutlass(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
+
+    def is_flashinfer_cutedsl(self) -> bool:
+        return self == Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL
 
     def is_flashinfer_deepgemm(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_DEEPGEMM
@@ -298,6 +302,14 @@ class Fp8GemmRunnerBackend(Enum):
 
 
 FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
+
+_FLASHINFER_CUTEDSL_MXFP8_SMS = frozenset({100, 103})
+_FLASHINFER_CUTLASS_MXFP8_SMS = frozenset({100, 103, 110, 120, 121})
+
+
+def _get_cuda_sm() -> int:
+    major, minor = get_device_capability()
+    return major * 10 + minor
 
 
 if is_blackwell_supported() and is_flashinfer_available():
@@ -478,9 +490,32 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
 
 def dispatch_w8a8_mxfp8_linear() -> Callable:
     backend = get_fp8_gemm_runner_backend()
+    if backend.is_flashinfer_cutedsl() or backend.is_flashinfer_cutlass():
+        flashinfer_available = is_flashinfer_available()
+        sm = _get_cuda_sm() if flashinfer_available else -1
+        if backend.is_flashinfer_cutedsl() and (
+            not flashinfer_available or sm not in _FLASHINFER_CUTEDSL_MXFP8_SMS
+        ):
+            raise RuntimeError(
+                "FlashInfer CuTe DSL MXFP8 GEMM requested via "
+                "--fp8-gemm-backend=flashinfer_cutedsl, but it requires an "
+                "SM100/SM103 GPU and FlashInfer."
+            )
+        if backend.is_flashinfer_cutlass() and (
+            not flashinfer_available or sm not in _FLASHINFER_CUTLASS_MXFP8_SMS
+        ):
+            raise RuntimeError(
+                "FlashInfer CUTLASS MXFP8 GEMM requested via "
+                "--fp8-gemm-backend=flashinfer_cutlass, but it requires an "
+                "SM100/SM103/SM110/SM120/SM121 GPU and FlashInfer."
+            )
     if backend.is_deep_gemm():
         return _deepgemm_w8a8_mxfp8_linear_with_fallback
-    elif backend.is_flashinfer_cutlass() or backend.is_flashinfer_trtllm():
+    elif (
+        backend.is_flashinfer_cutlass()
+        or backend.is_flashinfer_trtllm()
+        or backend.is_flashinfer_cutedsl()
+    ):
         return flashinfer_mxfp8_blockscaled_linear
     elif backend.is_triton():
         return triton_mxfp8_blockscaled_linear
@@ -559,6 +594,12 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
             )
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
 
+    elif backend.is_flashinfer_cutedsl():
+        raise RuntimeError(
+            "--fp8-gemm-backend=flashinfer_cutedsl supports MXFP8 GEMM only. "
+            "Use --quantization=mxfp8 or select another FP8 GEMM backend."
+        )
+
     elif backend.is_flashinfer_deepgemm():
         if not (is_sm90_supported() and is_flashinfer_available()):
             raise RuntimeError(
@@ -622,23 +663,38 @@ def _dispatch_auto_backend() -> Callable:
         return triton_w8a8_block_fp8_linear
 
 
-def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
-    """Initialize FP8 GEMM configuration."""
+def initialize_fp8_gemm_config(
+    server_args: ServerArgs,
+    effective_quantization: Optional[str] = None,
+    co_resident_quantizations: Optional[Iterable[Optional[str]]] = None,
+) -> None:
+    """Initialize FP8 GEMM configuration using the resolved model format."""
     global FP8_GEMM_RUNNER_BACKEND
 
     backend = server_args.fp8_gemm_runner_backend
-    if backend == "auto" and is_sm120_supported():
+    quantization = effective_quantization or server_args.quantization
+    quantizations = {quantization}
+    if co_resident_quantizations is not None:
+        quantizations.update(co_resident_quantizations)
+
+    # Prefer split-K CuTe DSL on SM100/SM103. Other architectures supported by
+    # FlashInfer MXFP8 use CUTLASS, avoiding the Triton fallback without sending
+    # unsupported SM10x variants into CuTe DSL.
+    if backend == "auto" and "mxfp8" in quantizations and is_flashinfer_available():
+        sm = _get_cuda_sm()
+        # The backend is process-global. Select CuTe DSL only when every model
+        # is compatible with its MXFP8-only contract; CUTLASS supports mixed
+        # MXFP8/block-FP8 processes on the same architectures.
+        if sm in _FLASHINFER_CUTEDSL_MXFP8_SMS and all(
+            q in (None, "mxfp8") for q in quantizations
+        ):
+            backend = "flashinfer_cutedsl"
+        elif sm in _FLASHINFER_CUTLASS_MXFP8_SMS:
+            backend = "flashinfer_cutlass"
+    elif backend == "auto" and is_sm120_supported():
         backend = "cutlass"
 
     backend = Fp8GemmRunnerBackend(backend)
-
-    if (
-        backend.is_auto()
-        and server_args.quantization == "mxfp8"
-        and _is_sm100_supported
-        and is_flashinfer_available()
-    ):
-        backend = Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
 
     FP8_GEMM_RUNNER_BACKEND = backend
 
@@ -1322,7 +1378,8 @@ def flashinfer_mxfp8_blockscaled_linear(
     # Ensure transposed tensors are contiguous for FlashInfer's internal runner.
     weight_t = weight.contiguous().t()
 
-    if get_fp8_gemm_runner_backend().is_flashinfer_trtllm():
+    backend = get_fp8_gemm_runner_backend()
+    if backend.is_flashinfer_trtllm():
         weight_scale_t = weight_scale.contiguous().view(-1)
         output = flashinfer_mm_mxfp8(
             q_input,
@@ -1333,7 +1390,7 @@ def flashinfer_mxfp8_blockscaled_linear(
             use_8x4_sf_layout=False,
             backend="trtllm",
         )
-    elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+    elif backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
         weight_scale_t = (
             weight_scale.contiguous().t()
             if weight_scale.ndim == 2
@@ -1346,7 +1403,7 @@ def flashinfer_mxfp8_blockscaled_linear(
             weight_scale_t,
             out_dtype=output_dtype,
             use_8x4_sf_layout=False,
-            backend="cutlass",
+            backend="cute-dsl" if backend.is_flashinfer_cutedsl() else "cutlass",
         )
 
     if bias is not None:

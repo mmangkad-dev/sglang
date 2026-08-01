@@ -296,12 +296,13 @@ class BenchArgs:
         return cls(**result)
 
 
-def load_model(server_args, port_args, gpu_id, tp_rank):
+def load_model(server_args, port_args, gpu_id, tp_rank, model_config=None):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
-    model_config = ModelConfig.from_server_args(server_args)
+    if model_config is None:
+        model_config = ModelConfig.from_server_args(server_args)
     attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
         compute_dp_attention_world_info(
             server_args.enable_dp_attention,
@@ -367,6 +368,17 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         model_runner = _TorchBenchRunner(model_runner)
 
     return model_runner, tokenizer
+
+
+def initialize_latency_test_gemm_configs(server_args):
+    """Resolve checkpoint quantization once, then initialize GEMM backends."""
+    model_config = ModelConfig.from_server_args(server_args)
+    initialize_moe_config(server_args)
+    initialize_fp8_gemm_config(
+        server_args, effective_quantization=model_config.quantization
+    )
+    initialize_fp4_gemm_config(server_args)
+    return model_config
 
 
 def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
@@ -876,9 +888,7 @@ def latency_test(
     gpu_id,
     tp_rank,
 ):
-    initialize_moe_config(server_args)
-    initialize_fp8_gemm_config(server_args)
-    initialize_fp4_gemm_config(server_args)
+    model_config = initialize_latency_test_gemm_configs(server_args)
 
     # Set CPU affinity
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
@@ -891,7 +901,9 @@ def latency_test(
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
-    model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
+    model_runner, tokenizer = load_model(
+        server_args, port_args, gpu_id, tp_rank, model_config=model_config
+    )
 
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(

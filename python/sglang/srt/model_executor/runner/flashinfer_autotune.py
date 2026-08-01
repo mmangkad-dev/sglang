@@ -30,7 +30,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# TODO: Remove after FlashInfer fixes the mxfp8_gemm autotuning IMA.
+# Keep dense MXFP8 on FlashInfer's heuristic tactic selection. CuTe DSL's
+# split-K defaults cover low-M shapes well, while compiling every tactic adds a
+# large startup cost; CUTLASS also has an autotuning IMA on affected systems.
 FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset({"mxfp8_gemm"})
 
 
