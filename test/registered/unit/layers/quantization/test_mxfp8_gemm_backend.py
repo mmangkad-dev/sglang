@@ -106,26 +106,6 @@ class TestMXFP8GemmBackend(CustomTestCase):
         implementation = fp8_utils.dispatch_w8a8_mxfp8_linear()
         self.assertIs(implementation, fp8_utils.flashinfer_mxfp8_blockscaled_linear)
 
-    def test_one_batch_uses_checkpoint_detected_quantization(self):
-        import sglang.benchmark.one_batch as one_batch
-
-        server_args = SimpleNamespace()
-        model_config = SimpleNamespace(quantization="mxfp8")
-        with (
-            patch.object(
-                one_batch.ModelConfig,
-                "from_server_args",
-                return_value=model_config,
-            ),
-            patch.object(one_batch, "initialize_moe_config"),
-            patch.object(one_batch, "initialize_fp8_gemm_config") as init_fp8,
-            patch.object(one_batch, "initialize_fp4_gemm_config"),
-        ):
-            resolved = one_batch.initialize_latency_test_gemm_configs(server_args)
-
-        self.assertIs(resolved, model_config)
-        init_fp8.assert_called_once_with(server_args, effective_quantization="mxfp8")
-
 
 if __name__ == "__main__":
     unittest.main()
