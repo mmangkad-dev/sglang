@@ -21,7 +21,6 @@ class TestMXFP8GemmBackend(CustomTestCase):
         sm,
         *,
         cli_quantization=None,
-        effective_quantization=None,
     ):
         server_args = SimpleNamespace(
             fp8_gemm_runner_backend="auto", quantization=cli_quantization
@@ -31,24 +30,21 @@ class TestMXFP8GemmBackend(CustomTestCase):
             patch.object(fp8_utils, "is_sm120_supported", return_value=sm // 10 == 12),
             patch.object(fp8_utils, "is_blackwell_supported", return_value=sm >= 100),
         ):
-            fp8_utils.initialize_fp8_gemm_config(
-                server_args,
-                effective_quantization=effective_quantization,
-            )
+            fp8_utils.initialize_fp8_gemm_config(server_args)
         return fp8_utils.get_fp8_gemm_runner_backend()
 
-    def test_checkpoint_detected_mxfp8_selects_cutedsl_on_sm100(self):
-        backend = self._initialize(100, effective_quantization="mxfp8")
+    def test_mxfp8_selects_cutedsl_on_sm100(self):
+        backend = self._initialize(100, cli_quantization="mxfp8")
         self.assertIs(backend, fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL)
 
-    def test_checkpoint_detected_mxfp8_selects_cutlass_on_sm110(self):
-        backend = self._initialize(110, effective_quantization="mxfp8")
+    def test_mxfp8_selects_cutlass_on_sm110(self):
+        backend = self._initialize(110, cli_quantization="mxfp8")
         self.assertIs(backend, fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_CUTLASS)
 
-    def test_checkpoint_detected_mxfp8_selects_cutlass_on_sm12x(self):
+    def test_mxfp8_selects_cutlass_on_sm12x(self):
         for sm in (120, 121):
             with self.subTest(sm=sm):
-                backend = self._initialize(sm, effective_quantization="mxfp8")
+                backend = self._initialize(sm, cli_quantization="mxfp8")
                 self.assertIs(
                     backend, fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
                 )

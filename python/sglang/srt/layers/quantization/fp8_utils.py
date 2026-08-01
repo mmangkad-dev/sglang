@@ -630,19 +630,14 @@ def _dispatch_auto_backend() -> Callable:
         return triton_w8a8_block_fp8_linear
 
 
-def initialize_fp8_gemm_config(
-    server_args: ServerArgs,
-    effective_quantization: Optional[str] = None,
-) -> None:
-    """Initialize FP8 GEMM configuration using the resolved model format."""
+def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
+    """Initialize FP8 GEMM configuration."""
     global FP8_GEMM_RUNNER_BACKEND
 
     backend = server_args.fp8_gemm_runner_backend
-    quantization = effective_quantization or server_args.quantization
-
     # Prefer split-K CuTe DSL on SM100/SM103. Other Blackwell architectures use
     # FlashInfer CUTLASS.
-    if backend == "auto" and quantization == "mxfp8":
+    if backend == "auto" and server_args.quantization == "mxfp8":
         if is_sm100_supported():
             backend = "flashinfer_cutedsl"
         elif is_blackwell_supported():
