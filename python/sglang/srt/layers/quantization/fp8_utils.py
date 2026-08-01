@@ -59,6 +59,7 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_blackwell_supported = is_blackwell_supported()
 _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _is_gfx95_supported = is_gfx95_supported()
@@ -304,7 +305,7 @@ class Fp8GemmRunnerBackend(Enum):
 FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
 
 
-if is_blackwell_supported() and is_flashinfer_available():
+if _is_blackwell_supported and is_flashinfer_available():
     from flashinfer import SfLayout
     from flashinfer import bmm_fp8 as _raw_flashinfer_bmm_fp8
     from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
@@ -550,7 +551,7 @@ def _deepgemm_w8a8_mxfp8_linear_with_fallback(
 def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
     """Dispatch based on explicitly selected backend."""
     if backend.is_flashinfer_trtllm():
-        if not (is_sm100_supported() and is_flashinfer_available()):
+        if not (_is_sm100_supported and is_flashinfer_available()):
             raise RuntimeError(
                 "FlashInfer FP8 GEMM requested via --fp8-gemm-backend=flashinfer_trtllm, "
                 "but FlashInfer is not available or not supported on this hardware. "
@@ -559,7 +560,7 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
 
     elif backend.is_flashinfer_cutlass():
-        if not (is_blackwell_supported() and is_flashinfer_available()):
+        if not (_is_blackwell_supported and is_flashinfer_available()):
             raise RuntimeError(
                 "FlashInfer FP8 GEMM requested via --fp8-gemm-backend=flashinfer_cutlass, "
                 "but FlashInfer is not available or not supported on this hardware. "
@@ -577,7 +578,7 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         return flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback
 
     elif backend.is_cutlass():
-        if not is_sm120_supported():
+        if not _is_sm120_supported:
             raise RuntimeError(
                 "--fp8-gemm-backend=cutlass is deprecated on this hardware. "
                 "Please switch to DeepGEMM or FlashInfer TRTLLM on SM90/SM100."
@@ -620,9 +621,9 @@ def _dispatch_auto_backend() -> Callable:
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
         return deepgemm_w8a8_block_fp8_linear_with_fallback
-    elif is_blackwell_supported() and is_flashinfer_available():
+    elif _is_blackwell_supported and is_flashinfer_available():
         return flashinfer_gemm_w8a8_block_fp8_linear_with_fallback
-    elif is_sm120_supported():
+    elif _is_sm120_supported:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
@@ -638,11 +639,11 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
     # Prefer split-K CuTe DSL on SM100/SM103. Other Blackwell architectures use
     # FlashInfer CUTLASS.
     if backend == "auto" and server_args.quantization == "mxfp8":
-        if is_sm100_supported():
+        if _is_sm100_supported:
             backend = "flashinfer_cutedsl"
-        elif is_blackwell_supported():
+        elif _is_blackwell_supported:
             backend = "flashinfer_cutlass"
-    elif backend == "auto" and is_sm120_supported():
+    elif backend == "auto" and _is_sm120_supported:
         backend = "cutlass"
 
     backend = Fp8GemmRunnerBackend(backend)
