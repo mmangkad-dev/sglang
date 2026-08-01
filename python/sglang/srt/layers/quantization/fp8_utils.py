@@ -303,14 +303,6 @@ class Fp8GemmRunnerBackend(Enum):
 
 FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
 
-_FLASHINFER_CUTEDSL_MXFP8_SMS = frozenset({100, 103})
-_FLASHINFER_CUTLASS_MXFP8_SMS = frozenset({100, 103, 110, 120, 121})
-
-
-def _get_cuda_sm() -> int:
-    major, minor = get_device_capability()
-    return major * 10 + minor
-
 
 if is_blackwell_supported() and is_flashinfer_available():
     from flashinfer import SfLayout
@@ -652,19 +644,15 @@ def initialize_fp8_gemm_config(
     if co_resident_quantizations is not None:
         quantizations.update(co_resident_quantizations)
 
-    # Prefer split-K CuTe DSL on SM100/SM103. Other architectures supported by
-    # FlashInfer MXFP8 use CUTLASS, avoiding the Triton fallback without sending
-    # unsupported SM10x variants into CuTe DSL.
+    # Prefer split-K CuTe DSL on SM100/SM103. Other Blackwell architectures use
+    # FlashInfer CUTLASS.
     if backend == "auto" and "mxfp8" in quantizations:
-        sm = _get_cuda_sm()
         # The backend is process-global. Select CuTe DSL only when every model
         # is compatible with its MXFP8-only contract; CUTLASS supports mixed
         # MXFP8/block-FP8 processes on the same architectures.
-        if sm in _FLASHINFER_CUTEDSL_MXFP8_SMS and all(
-            q in (None, "mxfp8") for q in quantizations
-        ):
+        if is_sm100_supported() and all(q in (None, "mxfp8") for q in quantizations):
             backend = "flashinfer_cutedsl"
-        elif sm in _FLASHINFER_CUTLASS_MXFP8_SMS:
+        elif is_blackwell_supported():
             backend = "flashinfer_cutlass"
     elif backend == "auto" and is_sm120_supported():
         backend = "cutlass"

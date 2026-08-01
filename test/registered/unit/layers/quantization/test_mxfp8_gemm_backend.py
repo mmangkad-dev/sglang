@@ -28,10 +28,9 @@ class TestMXFP8GemmBackend(CustomTestCase):
             fp8_gemm_runner_backend="auto", quantization=cli_quantization
         )
         with (
-            patch.object(
-                fp8_utils, "get_device_capability", return_value=divmod(sm, 10)
-            ),
+            patch.object(fp8_utils, "is_sm100_supported", return_value=sm // 10 == 10),
             patch.object(fp8_utils, "is_sm120_supported", return_value=sm // 10 == 12),
+            patch.object(fp8_utils, "is_blackwell_supported", return_value=sm >= 100),
         ):
             fp8_utils.initialize_fp8_gemm_config(
                 server_args,
@@ -55,10 +54,6 @@ class TestMXFP8GemmBackend(CustomTestCase):
                 self.assertIs(
                     backend, fp8_utils.Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
                 )
-
-    def test_unsupported_sm107_keeps_fallback(self):
-        backend = self._initialize(107, effective_quantization="mxfp8")
-        self.assertIs(backend, fp8_utils.Fp8GemmRunnerBackend.AUTO)
 
     def test_cli_mxfp8_remains_supported(self):
         backend = self._initialize(103, cli_quantization="mxfp8")
