@@ -643,7 +643,7 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
             backend = "flashinfer_cutedsl"
         elif _is_blackwell_supported:
             backend = "flashinfer_cutlass"
-    elif backend == "auto" and is_sm120_supported():
+    elif backend == "auto" and _is_sm120_supported:
         backend = "cutlass"
 
     backend = Fp8GemmRunnerBackend(backend)
