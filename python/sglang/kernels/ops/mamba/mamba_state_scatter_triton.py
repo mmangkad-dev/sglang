@@ -12,6 +12,95 @@ import triton.language as tl
 
 
 @triton.jit
+def _copy_state_rows_with_padding_kernel(
+    src_ptr,
+    dst_ptr,
+    state_indices_ptr,
+    src_row_stride,
+    dst_row_stride,
+    row_numel: tl.constexpr,
+    GATHER: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    block_idx = tl.program_id(1)
+    state_idx = tl.load(state_indices_ptr + batch_idx).to(tl.int64)
+    valid = state_idx >= 0
+    safe_state_idx = tl.where(valid, state_idx, 0)
+    offsets = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    element_mask = offsets < row_numel
+
+    if GATHER:
+        data = tl.load(
+            src_ptr + safe_state_idx * src_row_stride + offsets,
+            mask=element_mask & valid,
+            other=0.0,
+        )
+        tl.store(
+            dst_ptr + batch_idx * dst_row_stride + offsets,
+            data,
+            mask=element_mask,
+        )
+    else:
+        data = tl.load(
+            src_ptr + batch_idx * src_row_stride + offsets,
+            mask=element_mask,
+        )
+        tl.store(
+            dst_ptr + safe_state_idx * dst_row_stride + offsets,
+            data,
+            mask=element_mask & valid,
+        )
+
+
+def _state_rows_have_contiguous_inner_layout(state: torch.Tensor) -> bool:
+    expected_stride = 1
+    for size, stride in zip(reversed(state.shape[1:]), reversed(state.stride()[1:])):
+        if size > 1 and stride != expected_stride:
+            return False
+        expected_stride *= size
+    return True
+
+
+def copy_state_rows_with_padding(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    state_indices: torch.Tensor,
+    *,
+    gather: bool,
+) -> None:
+    """Fixed-shape row copy where negative pool indices gather zero / skip stores."""
+    pool, compact = (src, dst) if gather else (dst, src)
+    if pool.shape[1:] != compact.shape[1:]:
+        raise ValueError(f"State row shape mismatch: {pool.shape=} {compact.shape=}")
+    if compact.shape[0] != state_indices.shape[0]:
+        raise ValueError(
+            f"Batch/index size mismatch: {compact.shape[0]=} {state_indices.shape[0]=}"
+        )
+    if not compact.is_contiguous():
+        raise ValueError("The compact state buffer must be contiguous")
+    if not _state_rows_have_contiguous_inner_layout(pool):
+        raise ValueError(
+            "The state pool must have contiguous inner dimensions; only its slot "
+            "stride may be non-contiguous"
+        )
+
+    row_numel = compact[0].numel()
+    block_size = 256
+    grid = (compact.shape[0], triton.cdiv(row_numel, block_size))
+    _copy_state_rows_with_padding_kernel[grid](
+        src,
+        dst,
+        state_indices,
+        src.stride(0),
+        dst.stride(0),
+        row_numel,
+        GATHER=gather,
+        BLOCK_SIZE=block_size,
+    )
+
+
+@triton.jit
 def track_mamba_state_if_needed_kernel(
     conv_states_ptr,
     ssm_states_ptr,

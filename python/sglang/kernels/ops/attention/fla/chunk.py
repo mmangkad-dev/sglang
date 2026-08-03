@@ -87,7 +87,7 @@ def chunk_gated_delta_rule_fwd(
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
 
     @staticmethod
-    @input_guard
+    @input_guard(preserve_tensor_args=("initial_state",))
     @autocast_custom_fwd
     def forward(
         ctx,
@@ -102,9 +102,6 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
     ):
-        q_orig = q
-        k_orig = k
-
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
             k = l2norm_fwd(k)
@@ -160,6 +157,8 @@ def chunk_gated_delta_rule(
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
         initial_state (Optional[torch.Tensor]):
             Initial state of shape `[N, H, V, K]` for `N` input sequences.
+            The inner `[H, V, K]` dimensions must be contiguous; a non-standard
+            stride is supported only for the leading state-pool dimension.
             For equal-length input sequences, `N` equals the batch size `B`.
             Default: `None`.
         output_final_state (Optional[bool]):
@@ -245,6 +244,17 @@ def chunk_gated_delta_rule(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
+    if initial_state is not None:
+        expected_inner_strides = (
+            initial_state.shape[2] * initial_state.shape[3],
+            initial_state.shape[3],
+            1,
+        )
+        if initial_state.stride()[1:] != expected_inner_strides:
+            raise ValueError(
+                "initial_state must have contiguous [H, V, K] dimensions; "
+                f"only stride(0) may be non-contiguous, got {initial_state.stride()}"
+            )
     o, h = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,

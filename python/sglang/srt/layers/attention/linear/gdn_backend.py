@@ -7,6 +7,9 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+    copy_state_rows_with_padding,
+)
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
@@ -495,34 +498,37 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
-        # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
-        # chunk_gated_delta_rule) write state back in place assuming a contiguous
-        # slot layout, so they silently drop the write to the strided envelope
-        # pool. Run them on contiguous per-sequence copies (identity-indexed) and
-        # scatter the result back. No-op for the default contiguous pool.
-        # CPU kernels (causal_conv1d_fwd_cpu, chunk_gated_delta_rule_cpu) use
-        # proper indexed writes and handle non-contiguous pools directly via
-        # cache_indices, so the gather/scatter round-trip is unnecessary on CPU.
-        # TODO(ch-wan): drop these .contiguous() copies by making the prefill conv
-        # and chunk_gated_delta_rule kernels honor the pool's real slot stride +
-        # int64 indexing, like packed_decode / causal_conv1d_update already do.
-        needs_state_gather = (
+        # CUDA causal_conv1d_fwd still assumes a contiguous slot layout. Gather
+        # only its state when needed. The delta-rule kernel accepts the real SSM
+        # pool stride and int64 cache indices; copying SSM state here creates a
+        # short-lived allocation whose address is unsafe across a breakable CUDA
+        # graph replay. It also copied SSM unnecessarily whenever only the conv
+        # view was non-contiguous (the normal hybrid-pool layout).
+        needs_conv_state_gather = (
             (not is_target_verify)
             and (not is_cpu())
-            and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
+            and not conv_states.is_contiguous()
         )
-        if needs_state_gather:
-            conv_states_contig = conv_states[cache_indices].contiguous()
-            ssm_states_contig = ssm_states[cache_indices].contiguous()
-            state_cache_indices = torch.arange(
+        if needs_conv_state_gather:
+            conv_states_contig = torch.empty(
+                (cache_indices.shape[0], *conv_states.shape[1:]),
+                dtype=conv_states.dtype,
+                device=conv_states.device,
+            )
+            copy_state_rows_with_padding(
+                conv_states,
+                conv_states_contig,
+                cache_indices,
+                gather=True,
+            )
+            conv_state_cache_indices = torch.arange(
                 cache_indices.shape[0],
                 device=cache_indices.device,
                 dtype=cache_indices.dtype,
             )
         else:
             conv_states_contig = conv_states
-            ssm_states_contig = ssm_states
-            state_cache_indices = cache_indices
+            conv_state_cache_indices = cache_indices
 
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
@@ -561,7 +567,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 activation=layer.activation,
                 conv_states=conv_states_contig,
                 has_initial_state=has_initial_states,
-                cache_indices=state_cache_indices,
+                cache_indices=conv_state_cache_indices,
                 query_start_loc=query_start_loc,
                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             ).transpose(0, 1)[:seq_len]
@@ -665,8 +671,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 v=value,
                 g=g,
                 beta=beta,
-                ssm_states=ssm_states_contig,
-                cache_indices=state_cache_indices,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
                 state_checkpoint_cu_starts=(
                     forward_metadata.state_checkpoint_cu_starts
@@ -683,11 +689,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
                 ssm_states[cache_indices] = last_recurrent_state
 
-            if needs_state_gather:
-                # Scatter the in-place-updated contiguous copies back to the
-                # strided envelope pool (advanced indexing handles the strides).
-                conv_states[cache_indices] = conv_states_contig
-                ssm_states[cache_indices] = ssm_states_contig
+            if needs_conv_state_gather:
+                # Scatter the conv kernel's in-place update back to the pool.
+                copy_state_rows_with_padding(
+                    conv_states_contig,
+                    conv_states,
+                    cache_indices,
+                    gather=False,
+                )
 
             if forward_metadata.has_mamba_track_mask:
                 self._track_mamba_state_extend(

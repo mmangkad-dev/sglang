@@ -41,6 +41,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
     h,
     initial_state,
     initial_state_indices,
+    stride_init_state,
     cu_seqlens,
     chunk_offsets,
     T,
@@ -111,13 +112,13 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
             block_shape=(BT, BV),
         )
 
-    index = tl.load(initial_state_indices + i_n).to(tl.int32)
-    h0 = initial_state + index * stride_h
-    ht = initial_state + index * stride_h
+    index = tl.load(initial_state_indices + i_n).to(tl.int64)
+    valid_state = index >= 0
+    safe_index = tl.where(valid_state, index, 0)
+    h0 = initial_state + safe_index * stride_init_state
     if USE_INITIAL_STATE:
         h0 = h0 + i_h * V * K
-    if INPLACE_UPDATE:
-        ht = ht + i_h * V * K
+    ht = initial_state + safe_index * stride_init_state + i_h * V * K
 
     # main recurrence — time is the outer loop
     for i_t in range(NT):
@@ -129,17 +130,26 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
             # Load h: from initial_state (i_t==0) or scratch (i_t>0)
             if i_t == 0:
                 if USE_INITIAL_STATE:
-                    p_hs = tl.make_block_ptr(
+                    p_h0_phase1 = tl.make_block_ptr(
                         h0, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
                     )
-                    b_h = tl.load(p_hs, boundary_check=(0, 1)).to(tl.float32)
+                    b_h = tl.where(
+                        valid_state,
+                        tl.load(p_h0_phase1, boundary_check=(0, 1)).to(tl.float32),
+                        0.0,
+                    )
                 else:
                     b_h = tl.zeros([BV, 64], dtype=tl.float32)
             else:
-                p_hs = tl.make_block_ptr(
-                    ht, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
+                p_h_scratch_phase1 = tl.make_block_ptr(
+                    h + i_t * stride_h,
+                    (V, K),
+                    (K, 1),
+                    (i_v * BV, k_blk),
+                    (BV, 64),
+                    (1, 0),
                 )
-                b_h = tl.load(p_hs, boundary_check=(0, 1)).to(tl.float32)
+                b_h = tl.load(p_h_scratch_phase1, boundary_check=(0, 1)).to(tl.float32)
 
             # Store pre-update h to output
             p_ho = tl.make_block_ptr(
@@ -182,17 +192,26 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
             # Reload h (same source as Phase 1)
             if i_t == 0:
                 if USE_INITIAL_STATE:
-                    p_hs = tl.make_block_ptr(
+                    p_h0_phase2 = tl.make_block_ptr(
                         h0, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
                     )
-                    b_h = tl.load(p_hs, boundary_check=(0, 1)).to(tl.float32)
+                    b_h = tl.where(
+                        valid_state,
+                        tl.load(p_h0_phase2, boundary_check=(0, 1)).to(tl.float32),
+                        0.0,
+                    )
                 else:
                     b_h = tl.zeros([BV, 64], dtype=tl.float32)
             else:
-                p_hs = tl.make_block_ptr(
-                    ht, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
+                p_h_scratch_phase2 = tl.make_block_ptr(
+                    h + i_t * stride_h,
+                    (V, K),
+                    (K, 1),
+                    (i_v * BV, k_blk),
+                    (BV, 64),
+                    (1, 0),
                 )
-                b_h = tl.load(p_hs, boundary_check=(0, 1)).to(tl.float32)
+                b_h = tl.load(p_h_scratch_phase2, boundary_check=(0, 1)).to(tl.float32)
 
             # Gate decay on h
             if USE_G:
@@ -214,12 +233,32 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
             b_k = tl.trans(k_desc.load([i_t * BT, k_blk]))
             b_h += tl.trans(tl.dot(b_k, b_v))
 
-            # Save updated h to scratch (initial_state) for next time step
-            if INPLACE_UPDATE:
-                p_hs = tl.make_block_ptr(
-                    ht, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
+            # Keep cross-chunk recurrence in h, which is per sequence and safe
+            # for padded rows. Only the final state is written to the pool.
+            if i_t + 1 < NT:
+                p_h_scratch_store = tl.make_block_ptr(
+                    h + (i_t + 1) * stride_h,
+                    (V, K),
+                    (K, 1),
+                    (i_v * BV, k_blk),
+                    (BV, 64),
+                    (1, 0),
                 )
-                tl.store(p_hs, b_h.to(p_hs.dtype.element_ty), boundary_check=(0, 1))
+                tl.store(
+                    p_h_scratch_store,
+                    b_h.to(p_h_scratch_store.dtype.element_ty),
+                    boundary_check=(0, 1),
+                )
+            elif INPLACE_UPDATE:
+                if valid_state:
+                    p_ht_store = tl.make_block_ptr(
+                        ht, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
+                    )
+                    tl.store(
+                        p_ht_store,
+                        b_h.to(p_ht_store.dtype.element_ty),
+                        boundary_check=(0, 1),
+                    )
 
 
 def chunk_gated_delta_rule_fwd_h(
@@ -274,6 +313,7 @@ def chunk_gated_delta_rule_fwd_h(
         h=h,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
+        stride_init_state=(initial_state.stride(0) if initial_state is not None else 0),
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
