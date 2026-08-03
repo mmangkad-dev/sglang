@@ -103,22 +103,38 @@ logger = logging.getLogger(__name__)
 
 # ServerArgs is exposed by several public introspection APIs. Keep the denylist
 # next to the dataclass so every transport uses the same security boundary.
-SERVER_ARGS_SECRET_FIELDS = frozenset(
+SERVER_INFO_EXCLUDED_FIELDS = frozenset(
     {
         "api_key",
         "admin_api_key",
         "ssl_keyfile_password",
+        # This is an opaque, backend-defined config bag. Some supported
+        # backends accept object-storage credentials in it, and arbitrary
+        # plugin schemas make selective recursive redaction unsafe.
+        "hicache_storage_backend_extra_config",
     }
 )
 
 
-def redact_server_args_secrets(server_args_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a copy safe for public introspection and diagnostic metadata."""
-    return {
-        key: value
-        for key, value in server_args_dict.items()
-        if key not in SERVER_ARGS_SECRET_FIELDS
-    }
+def sanitize_server_info(value: Any) -> Any:
+    """Return a recursively sanitized copy for public introspection APIs.
+
+    Scheduler internal-state responses contain another full ServerArgs dump,
+    so sanitizing only the top-level response is insufficient. Opaque config
+    bags are removed as a whole rather than parsed because plugins define their
+    own credential names and may accept inline data or config-file references.
+    """
+    if isinstance(value, dict):
+        return {
+            key: sanitize_server_info(item)
+            for key, item in value.items()
+            if key not in SERVER_INFO_EXCLUDED_FIELDS
+        }
+    if isinstance(value, list):
+        return [sanitize_server_info(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(sanitize_server_info(item) for item in value)
+    return value
 
 
 # Define constants

@@ -14,10 +14,10 @@ Current coverage:
   port edge cases / missing-or-non-positive page_size) because the
   helper has no separate test target; the handler is its only caller.
 
-* `TestServerInfoExistingFieldsPreserved` — regression guard that no
-  field existing consumers depend on is silently dropped: every
-  `ServerArgs` dataclass field, `internal_states`, `version`, and the
-  pre-existing flat `kv_events_config` string all remain visible.
+* `TestServerInfoExistingFieldsPreserved` — regression guard that every
+  non-sensitive `ServerArgs` dataclass field, `internal_states`, `version`,
+  and the pre-existing flat `kv_events_config` string remain visible.
+  Security-sensitive fields are deliberately excluded.
 """
 
 import asyncio
@@ -27,9 +27,11 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.entrypoints import http_server
+from sglang.srt.entrypoints.engine import Engine
+from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.server_args import SERVER_ARGS_SECRET_FIELDS, ServerArgs
+from sglang.srt.server_args import SERVER_INFO_EXCLUDED_FIELDS, ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -254,8 +256,7 @@ class TestServerInfoControlPlaneUpdates(CustomTestCase):
 
 
 class TestServerInfoExistingFieldsPreserved(CustomTestCase):
-    """Regression guard: the new `kv_events` field is additive — none of
-    the fields existing consumers depend on may be silently dropped.
+    """Regression guard for the non-sensitive public response contract.
 
     Existing `/server_info` consumers in the wild include:
       * SGLang's own deprecated `/get_server_info` (forwards to the
@@ -267,15 +268,14 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
     """
 
     def test_every_server_args_field_appears_in_response(self):
-        # `dataclasses.asdict(server_args)` is spread into the response;
-        # asserting every dataclass field surfaces is the strongest
-        # backward-compat guarantee that's still implementation-agnostic.
+        # Every dataclass field except the explicitly security-sensitive set
+        # remains part of the backward-compatible response.
         args = ServerArgs(model_path="dummy")
 
         info = _call_server_info_with(args)
 
         for field in dataclasses.fields(ServerArgs):
-            if field.name in SERVER_ARGS_SECRET_FIELDS:
+            if field.name in SERVER_INFO_EXCLUDED_FIELDS:
                 continue
             self.assertIn(
                 field.name,
@@ -295,7 +295,7 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
 
         info = _call_server_info_with(args)
 
-        for field in SERVER_ARGS_SECRET_FIELDS:
+        for field in SERVER_INFO_EXCLUDED_FIELDS:
             self.assertNotIn(field, info)
         self.assertNotIn("user-secret", json.dumps(info))
         self.assertNotIn("admin-secret", json.dumps(info))
@@ -313,8 +313,42 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
             },
         )
 
-        for field in SERVER_ARGS_SECRET_FIELDS:
+        for field in SERVER_INFO_EXCLUDED_FIELDS:
             self.assertNotIn(field, info)
+
+    def test_scheduler_internal_state_is_recursively_sanitized(self):
+        args = ServerArgs(
+            model_path="dummy",
+            api_key="user-secret",
+            admin_api_key="admin-secret",
+            ssl_keyfile_password="tls-secret",
+            hicache_storage_backend_extra_config=(
+                '{"access_key":"access-secret","secret_key":"storage-secret",'
+                '"session_token":"session-secret"}'
+            ),
+        )
+        scheduler_state = dataclasses.asdict(args)
+        scheduler_state["nested"] = {
+            "api_key": "nested-user-secret",
+            "hicache_storage_backend_extra_config": "nested-storage-secret",
+        }
+
+        info = _call_server_info_with(args, internal_states=[scheduler_state])
+        serialized = json.dumps(info)
+
+        for field in SERVER_INFO_EXCLUDED_FIELDS:
+            self.assertNotIn(field, info["internal_states"][0])
+        for secret in (
+            "user-secret",
+            "admin-secret",
+            "tls-secret",
+            "access-secret",
+            "storage-secret",
+            "session-secret",
+            "nested-user-secret",
+            "nested-storage-secret",
+        ):
+            self.assertNotIn(secret, serialized)
 
     def test_internal_states_and_version_keys_preserved(self):
         # These two top-level keys predate the kv_events patch and are
@@ -372,6 +406,62 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
         self.assertEqual(info["lora_paths"], [expected])
         self.assertEqual(info["internal_states"][0]["lora_paths"], [expected])
         json.dumps(info)
+
+
+class TestServerInfoOtherTransports(CustomTestCase):
+    def setUp(self):
+        self.args = ServerArgs(
+            model_path="dummy",
+            api_key="user-secret",
+            admin_api_key="admin-secret",
+            ssl_keyfile_password="tls-secret",
+            hicache_storage_backend_extra_config=(
+                '{"access_key":"access-secret","secret_key":"storage-secret",'
+                '"session_token":"session-secret"}'
+            ),
+        )
+        self.manager = TokenizerManager.__new__(TokenizerManager)
+        self.manager.server_args = self.args
+        self.manager.model_path = self.args.model_path
+        self.manager.served_model_name = self.args.served_model_name
+        self.manager._config_updates = []
+
+    def assert_no_credentials(self, payload):
+        serialized = json.dumps(payload)
+        for field in SERVER_INFO_EXCLUDED_FIELDS:
+            self.assertNotIn(field, payload)
+        for secret in (
+            "user-secret",
+            "admin-secret",
+            "tls-secret",
+            "access-secret",
+            "storage-secret",
+            "session-secret",
+        ):
+            self.assertNotIn(secret, serialized)
+
+    def test_engine_sanitizes_top_level_and_internal_state(self):
+        async def get_internal_state():
+            return [dataclasses.asdict(self.args)]
+
+        self.manager.get_internal_state = get_internal_state
+        engine = SimpleNamespace(
+            tokenizer_manager=self.manager,
+            loop=SimpleNamespace(run_until_complete=asyncio.run),
+            _scheduler_init_result=SimpleNamespace(scheduler_infos=[{}]),
+        )
+
+        payload = Engine.get_server_info(engine)
+
+        self.assert_no_credentials(payload)
+        self.assert_no_credentials(payload["internal_states"][0])
+
+    def test_grpc_bridge_omits_opaque_credentials(self):
+        bridge = SimpleNamespace(tokenizer_manager=self.manager, scheduler_info={})
+
+        payload = json.loads(RuntimeHandle.get_server_info(bridge))
+
+        self.assert_no_credentials(payload)
 
 
 if __name__ == "__main__":

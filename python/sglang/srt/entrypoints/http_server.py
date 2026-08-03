@@ -164,7 +164,7 @@ from sglang.srt.observability.trace import (
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.template_manager import TemplateManager
-from sglang.srt.server_args import PortArgs, ServerArgs, redact_server_args_secrets
+from sglang.srt.server_args import PortArgs, ServerArgs, sanitize_server_info
 from sglang.srt.utils import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
@@ -789,20 +789,20 @@ async def server_info():
 
     # server_args.model_config is not serializable but should be excluded by asdict.
     return msgspec_to_builtins(
-        {
-            **redact_server_args_secrets(
-                _global_state.tokenizer_manager.resolved_config_dict(
+        sanitize_server_info(
+            {
+                **_global_state.tokenizer_manager.resolved_config_dict(
                     dataclasses.asdict(server_args)
-                )
-            ),
-            **_global_state.scheduler_info,
-            "internal_states": internal_states,
-            "version": __version__,
-            # Structured KV-event publisher descriptor for KV-aware routers.
-            # `None` when publishing is disabled or misconfigured; see
-            # `ServerArgs.describe_kv_events_publisher` for the precise contract.
-            "kv_events": server_args.describe_kv_events_publisher(),
-        }
+                ),
+                **_global_state.scheduler_info,
+                "internal_states": internal_states,
+                "version": __version__,
+                # Structured KV-event publisher descriptor for KV-aware routers.
+                # `None` when publishing is disabled or misconfigured; see
+                # `ServerArgs.describe_kv_events_publisher` for the precise contract.
+                "kv_events": server_args.describe_kv_events_publisher(),
+            }
+        )
     )
 
 
