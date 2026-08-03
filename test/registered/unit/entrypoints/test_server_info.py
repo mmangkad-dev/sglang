@@ -29,7 +29,7 @@ from types import SimpleNamespace
 from sglang.srt.entrypoints import http_server
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import SERVER_ARGS_SECRET_FIELDS, ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -275,6 +275,8 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
         info = _call_server_info_with(args)
 
         for field in dataclasses.fields(ServerArgs):
+            if field.name in SERVER_ARGS_SECRET_FIELDS:
+                continue
             self.assertIn(
                 field.name,
                 info,
@@ -282,6 +284,37 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
                 f"/server_info response — kv_events patch must not "
                 f"shadow or drop ServerArgs fields",
             )
+
+    def test_secret_fields_are_omitted(self):
+        args = ServerArgs(
+            model_path="dummy",
+            api_key="user-secret",
+            admin_api_key="admin-secret",
+            ssl_keyfile_password="tls-secret",
+        )
+
+        info = _call_server_info_with(args)
+
+        for field in SERVER_ARGS_SECRET_FIELDS:
+            self.assertNotIn(field, info)
+        self.assertNotIn("user-secret", json.dumps(info))
+        self.assertNotIn("admin-secret", json.dumps(info))
+        self.assertNotIn("tls-secret", json.dumps(info))
+
+    def test_runtime_updates_cannot_reintroduce_secret_fields(self):
+        args = ServerArgs(model_path="dummy")
+
+        info = _call_server_info_with(
+            args,
+            config_updates={
+                "api_key": "updated-user-secret",
+                "admin_api_key": "updated-admin-secret",
+                "ssl_keyfile_password": "updated-tls-secret",
+            },
+        )
+
+        for field in SERVER_ARGS_SECRET_FIELDS:
+            self.assertNotIn(field, info)
 
     def test_internal_states_and_version_keys_preserved(self):
         # These two top-level keys predate the kv_events patch and are

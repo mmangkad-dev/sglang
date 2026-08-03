@@ -97,7 +97,7 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.plugins import load_plugins
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs, redact_server_args_secrets
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     SerializedTensorPayload,
@@ -1271,8 +1271,10 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         return msgspec_to_builtins(
             {
-                **self.tokenizer_manager.resolved_config_dict(
-                    dataclasses.asdict(self.tokenizer_manager.server_args)
+                **redact_server_args_secrets(
+                    self.tokenizer_manager.resolved_config_dict(
+                        dataclasses.asdict(self.tokenizer_manager.server_args)
+                    )
                 ),
                 **self._scheduler_init_result.scheduler_infos[0],
                 "internal_states": internal_states,

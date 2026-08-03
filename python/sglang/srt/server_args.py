@@ -101,6 +101,26 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
+# ServerArgs is exposed by several public introspection APIs. Keep the denylist
+# next to the dataclass so every transport uses the same security boundary.
+SERVER_ARGS_SECRET_FIELDS = frozenset(
+    {
+        "api_key",
+        "admin_api_key",
+        "ssl_keyfile_password",
+    }
+)
+
+
+def redact_server_args_secrets(server_args_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy safe for public introspection and diagnostic metadata."""
+    return {
+        key: value
+        for key, value in server_args_dict.items()
+        if key not in SERVER_ARGS_SECRET_FIELDS
+    }
+
+
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 
