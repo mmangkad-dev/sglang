@@ -740,17 +740,10 @@ class KimiK3VisionTower(nn.Module):
         if self.merge_type != "sd2_tpool":
             raise NotImplementedError(f"Not support merge_type: {self.merge_type}")
 
-        hidden_size = getattr(config, "vt_hidden_size", None) or config.hidden_size
-        num_heads = (
-            getattr(config, "vt_num_attention_heads", None)
-            or config.num_attention_heads
-        )
-        num_layers = (
-            getattr(config, "vt_num_hidden_layers", None) or config.num_hidden_layers
-        )
-        intermediate_size = (
-            getattr(config, "vt_intermediate_size", None) or config.intermediate_size
-        )
+        hidden_size = config.vt_hidden_size
+        num_heads = config.vt_num_attention_heads
+        num_layers = config.vt_num_hidden_layers
+        intermediate_size = config.vt_intermediate_size
 
         self.patch_embed = MoonVision3dPatchEmbed(
             out_dim=hidden_size,
@@ -760,10 +753,10 @@ class KimiK3VisionTower(nn.Module):
             pos_emb_time=config.init_pos_emb_time,
             pos_emb_type=config.pos_emb_type,
             pos_emb_interpolation_mode=config.pos_emb_interpolation_mode,
-            patch_embed_proj_bias=getattr(config, "patch_embed_proj_bias", True),
+            patch_embed_proj_bias=config.patch_embed_proj_bias,
         )
 
-        activation_func = getattr(config, "activation_func", "gelu_pytorch_tanh")
+        activation_func = config.activation_func
         if activation_func == "gelu_pytorch_tanh":
             activation = lambda x: F.gelu(x, approximate="tanh")
         elif activation_func == "gelu":
@@ -777,12 +770,12 @@ class KimiK3VisionTower(nn.Module):
             block_cfg={
                 "num_heads": num_heads,
                 "hidden_dim": hidden_size,
-                "qkv_hidden_size": getattr(config, "qkv_hidden_size", None),
+                "qkv_hidden_size": config.qkv_hidden_size,
                 "mlp_dim": intermediate_size,
-                "norm_type": getattr(config, "norm_type", "layernorm"),
+                "norm_type": config.norm_type,
                 "activation": activation,
-                "attn_bias": getattr(config, "attn_bias", True),
-                "linear_bias": getattr(config, "linear_bias", True),
+                "attn_bias": config.attn_bias,
+                "linear_bias": config.linear_bias,
             },
         )
         self.cuda_graph_runner = None
@@ -908,14 +901,10 @@ class KimiK3MultiModalProjector(nn.Module):
     def __init__(self, vision_config):
         super().__init__()
         config = vision_config
-        mm_hidden_size = (
-            getattr(config, "mm_hidden_size", None) or config.vt_hidden_size
-        )
+        mm_hidden_size = config.mm_hidden_size
         merge_h, merge_w = config.merge_kernel_size
         self.hidden_size = mm_hidden_size * merge_h * merge_w
-        text_hidden_size = getattr(config, "text_hidden_size", None) or getattr(
-            config, "hidden_size"
-        )
+        text_hidden_size = config.text_hidden_size
         eps = config.projector_ln_eps
 
         self.proj = nn.Sequential(
