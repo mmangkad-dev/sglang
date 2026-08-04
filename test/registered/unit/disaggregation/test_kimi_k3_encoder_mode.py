@@ -71,7 +71,7 @@ def test_epd_language_only_rejects_missing_dispatched_embedding():
     with pytest.raises(HTTPException) as exc_info:
         _reject_missing_dispatched_encoder_embedding(server_args, request, None)
 
-    assert getattr(exc_info.value, "status_code", None) == 503
+    assert exc_info.value.status_code == 503
 
 
 def test_epd_allows_local_processing_when_request_was_not_dispatched():
