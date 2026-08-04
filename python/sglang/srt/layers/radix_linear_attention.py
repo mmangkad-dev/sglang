@@ -76,6 +76,13 @@ class RadixLinearAttention(nn.Module):
         self.dt_bias = dt_bias
         self.lower_bound = None
 
+        # Optional Kimi-K3 fused KDA decode handoff. These fields live on the
+        # shared layer because KDAAttnBackend also serves plain KimiLinear
+        # layers, which must select the unfused path without missing state.
+        self._k3_fused_decode_args = None
+        self._k3_onorm_gate = None
+        self._k3_onorm_consumed = False
+
     def forward(
         self,
         forward_batch: ForwardBatch,
