@@ -71,6 +71,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
+        self._track_pools_cache = False
 
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """Virtual->physical mamba slot-id translate (identity for the non-unified
@@ -734,7 +735,7 @@ class MambaAttnBackendBase(AttentionBackend):
         """Full [num_layers, pool_size, ...] conv/ssm pools plus the pool index
         of the last mamba layer, for the fused all-layers track launch. None if
         the pool shape is not the expected layout."""
-        cached = getattr(self, "_track_pools_cache", False)
+        cached = self._track_pools_cache
         if cached is False:
             pools = None
             try:
@@ -1214,7 +1215,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         # only hit by the direct callers. Chain layout only (topk <= 1), so
         # accept_lens == last_correct_step_indices + 1.
         mamba_pool = req_pool.mamba_pool
-        if getattr(mamba_pool, "replayssm_is_kda", False):
+        if mamba_pool.replayssm_is_kda:
             from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
                 commit_kda_replayssm_after_verify,
             )
