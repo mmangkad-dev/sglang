@@ -109,11 +109,6 @@ def _build_hybrid_backend(testcase, case: MLAAttentionCase):
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
 class TestHybridLinearChunkMetadataDelegation(CustomTestCase):
-    def test_wrapper_exposes_chunk_metadata_hook(self):
-        _, full_backend, hybrid = _build_hybrid_backend(self, _make_case())
-        self.assertTrue(callable(hybrid.init_mha_chunk_metadata))
-        self.assertTrue(callable(full_backend.init_mha_chunk_metadata))
-
     def test_delegation_plans_qo_indptr(self):
         case = _make_case()
         runner, full_backend, hybrid = _build_hybrid_backend(self, case)

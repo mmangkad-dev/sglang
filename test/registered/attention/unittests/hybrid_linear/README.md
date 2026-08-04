@@ -43,7 +43,7 @@ full-attention backend (`hybrid_linear_attn_backend.py`).
 
 | File | What it pins |
 |---|---|
-| `test_flashinfer_mla_chunk_metadata.py` | Wraps a real chunk-KV-enabled `FlashInferMLAAttnBackend` (`full_attn_layers=[0]`) and asserts (1) the wrapper exposes `init_mha_chunk_metadata` and (2) the delegated call plans `qo_indptr[-1]` to the true extend-token count. |
+| `test_flashinfer_mla_chunk_metadata.py` | Wraps a real chunk-KV-enabled `FlashInferMLAAttnBackend` (`full_attn_layers=[0]`) and asserts that delegation plans `qo_indptr[-1]` to the true extend-token count; inheriting only the base no-op fails this check. |
 
 Run on a CUDA host:
 

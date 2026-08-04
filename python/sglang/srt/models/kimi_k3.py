@@ -3056,7 +3056,6 @@ class KimiK3ForConditionalGeneration(nn.Module):
             MmItemMemoryPool.try_to_recycle(), which waits for the server TP
             size rather than the attention subgroup size.
             """
-            parallel = get_parallel()
             server_args = get_server_args()
             ipc_consumer_count = max(server_args.tp_size, 1)
             device_index = device.index
