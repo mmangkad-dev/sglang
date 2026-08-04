@@ -2014,6 +2014,7 @@ class KimiK3DecoderLayer(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.self_attention_res_proj",
             )
+            self.self_attention_res_proj._attn_res_cw_cache = {}
             self.mlp_res_proj = ReplicatedLinear(
                 config.hidden_size,
                 1,
@@ -2021,6 +2022,7 @@ class KimiK3DecoderLayer(nn.Module):
                 quant_config=None,
                 prefix=f"{prefix}.mlp_res_proj",
             )
+            self.mlp_res_proj._attn_res_cw_cache = {}
 
         if self._sp_moe:
             # o_proj emits TP-partial sums; _finish_attn_reduce completes the
@@ -2410,6 +2412,7 @@ class KimiK3LinearModel(nn.Module):
                     quant_config=None,
                     prefix=f"{prefix}.output_attn_res_proj",
                 )
+                self.output_attn_res_proj._attn_res_cw_cache = {}
         else:
             self.norm = PPMissingLayer()
 

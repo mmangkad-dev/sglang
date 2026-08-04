@@ -48,7 +48,7 @@ def get_cw(
 
     Cached per dtype: the fast kernel consumes bf16 while the triton path
     consumes fp32, and a shared slot would hand one path the other's dtype."""
-    cache = proj.__dict__.setdefault("_attn_res_cw_cache", {})
+    cache = proj._attn_res_cw_cache
     cw = cache.get(dtype)
     if cw is None:
         cw = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
