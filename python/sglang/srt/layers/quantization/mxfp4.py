@@ -575,11 +575,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # Checkpoint scales are uint8 e8m0 (biased exponents). DeepGEMM
             # SM100 needs them in packed-UE8M0 TMA-aligned MN-major layout.
             # Round-trip through fp32 is exact (values are powers of two).
-            for scale_name, weight in (
-                ("w13_weight_scale", layer.w13_weight),
-                ("w2_weight_scale", layer.w2_weight),
+            for scale, weight in (
+                (layer.w13_weight_scale, layer.w13_weight),
+                (layer.w2_weight_scale, layer.w2_weight),
             ):
-                scale = getattr(layer, scale_name)
                 num_experts, n, _ = scale.data.shape
                 k = weight.shape[2] * 2
                 scale_f32 = scale.data.view(torch.float8_e8m0fnu).to(torch.float32)
