@@ -7,9 +7,11 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.utils.common import (
+    get_cuda_version,
     get_device_capability,
     is_cuda,
     is_sm100_supported,
+    is_sm120_supported,
 )
 from sglang.srt.utils.custom_op import register_custom_op_from_extern
 
@@ -97,6 +99,7 @@ class Fp4GemmRunnerBackend(Enum):
     FLASHINFER_CUDNN = "flashinfer_cudnn"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
+    FLASHINFER_B12X = "flashinfer_b12x"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     MARLIN = "marlin"
 
@@ -108,6 +111,9 @@ class Fp4GemmRunnerBackend(Enum):
 
     def is_flashinfer_cutlass(self) -> bool:
         return self == Fp4GemmRunnerBackend.FLASHINFER_CUTLASS
+
+    def is_flashinfer_b12x(self) -> bool:
+        return self == Fp4GemmRunnerBackend.FLASHINFER_B12X
 
     def is_flashinfer_trtllm(self) -> bool:
         return self == Fp4GemmRunnerBackend.FLASHINFER_TRTLLM
@@ -130,6 +136,7 @@ class Fp4GemmRunnerBackend(Enum):
             'flashinfer_cutlass' -> 'cutlass'
             'flashinfer_cudnn' -> 'cudnn'
             'flashinfer_cutedsl' -> 'cute-dsl'
+            'flashinfer_b12x' -> 'b12x'
         """
         if self == Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL:
             return "cute-dsl"
@@ -150,6 +157,8 @@ def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
     if backend == "auto":
         if is_sm100_supported():
             backend = "flashinfer_cutedsl"
+        elif is_sm120_supported() and get_cuda_version() >= (13, 0):
+            backend = "flashinfer_b12x"
         elif is_cuda() and (10, 0) > get_device_capability() >= (8, 0):
             backend = "marlin"
         else:
