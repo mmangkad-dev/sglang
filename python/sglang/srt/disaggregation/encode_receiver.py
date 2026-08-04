@@ -892,7 +892,7 @@ class WaitingImageRequest:
 
         try:
             recv_obj: EmbeddingData = safe_pickle_loads(parts[0])
-            if getattr(recv_obj, "error_msg", None) is not None:
+            if recv_obj.error_msg is not None:
                 logger.warning(
                     f"Received error signal from encoder for {self.rid}: {recv_obj.error_msg} {recv_obj.error_code = }"
                 )
