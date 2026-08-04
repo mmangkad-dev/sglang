@@ -931,7 +931,7 @@ class ModelConfig:
             self.v_head_dim = tc.v_head_dim
             self.qk_nope_head_dim = tc.qk_nope_head_dim
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if getattr(tc, "rope_scaling", None):
+            if tc.rope_scaling:
                 self.scaling = compute_mla_mscale_scaling(tc.rope_scaling, self.scaling)
         elif (
             "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures

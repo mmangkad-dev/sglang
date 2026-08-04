@@ -489,9 +489,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
 
 
 def _is_mxfp4_pack_quantized(hf_config: Any) -> bool:
-    qc = getattr(
-        getattr(hf_config, "text_config", hf_config), "quantization_config", None
-    )
+    qc = hf_config.text_config.get_quantization_config()
     if not isinstance(qc, dict):
         return False
     groups = qc.get("config_groups") or {}

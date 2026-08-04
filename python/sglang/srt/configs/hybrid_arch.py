@@ -11,6 +11,7 @@ from sglang.srt.configs import (
     InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
+    KimiK3Config,
     KimiLinearConfig,
     Lfm2Config,
     Lfm2MoeConfig,
@@ -102,9 +103,8 @@ def kimi_linear_config(model_config: ModelConfig):
     config = model_config.hf_config
     if isinstance(config, KimiLinearConfig):
         return config
-    text_config = getattr(config, "text_config", None)
-    if isinstance(text_config, KimiLinearConfig):
-        return text_config
+    if isinstance(config, KimiK3Config):
+        return config.text_config
     return None
 
 

@@ -127,6 +127,9 @@ class KimiLinearConfig(PretrainedConfig):
             **kwargs,
         )
 
+    def get_quantization_config(self) -> dict | None:
+        return self.__dict__.get("quantization_config")
+
     @property
     def is_mla(self):
         return (

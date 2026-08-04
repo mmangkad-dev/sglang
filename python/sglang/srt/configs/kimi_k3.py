@@ -110,8 +110,9 @@ class KimiK3Config(PretrainedConfig):
         self.media_placeholder_token_id = media_placeholder_token_id
         self.image_placeholder = image_placeholder
 
-        if getattr(self.text_config, "quantization_config", None) is not None:
-            self.quantization_config = self.text_config.quantization_config
+        quantization_config = self.text_config.get_quantization_config()
+        if quantization_config is not None:
+            self.quantization_config = quantization_config
 
         super().__init__(pad_token_id=pad_token_id, **kwargs)
 
