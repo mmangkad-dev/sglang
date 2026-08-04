@@ -3,7 +3,7 @@ from __future__ import annotations
 import warnings
 from abc import ABC
 from enum import Enum, IntEnum, auto
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, Callable, ClassVar, List, Optional, Tuple, Type, Union
 
 import torch
 
@@ -335,7 +335,7 @@ class SpecInput(ABC):
     # (ragged forwards carry 1 there). -1 = not set by this flow.
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
-    draft_token_num: Optional[int] = None
+    draft_token_num: ClassVar[Optional[int]]
 
     # DSA MTP IndexShare seed relay. Class-level defaults (same rationale as
     # ragged_verify_layout) so scheduler/relay/attention code reads them
@@ -346,6 +346,8 @@ class SpecInput(ABC):
 
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
+        if "draft_token_num" not in self.__dict__:
+            self.draft_token_num = None
 
     # Cross-algorithm phase guards. Used by attention backends and
     # ForwardBatch padding logic to dispatch on phase without hardcoding the
