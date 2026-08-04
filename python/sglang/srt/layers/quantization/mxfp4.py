@@ -557,8 +557,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "Current MXFP4 MoE layer is not supported by Marlin."
                 )
 
-            if self.moe_runner_config.gemm1_alpha is not None and getattr(
-                self.moe_runner_config, "gate_up_interleaved", True
+            if (
+                self.moe_runner_config.gemm1_alpha is not None
+                and self.moe_runner_config.gate_up_interleaved
             ):
                 deinterleave_moe_mxfp4_w13_for_marlin(layer)
             prepare_moe_mxfp4_layer_for_marlin(layer)
@@ -623,8 +624,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # Per-expert buffers are local (create_weights uses num_local_experts);
             # the global self.num_experts here breaks EP>1. Mirrors the SM90 path.
             E = layer.num_local_experts
-            _alpha = getattr(layer.moe_runner_config, "gemm1_alpha", None) or 1.702
-            _limit = getattr(layer.moe_runner_config, "gemm1_clamp_limit", None) or 7.0
+            _alpha = layer.moe_runner_config.gemm1_alpha or 1.702
+            _limit = layer.moe_runner_config.gemm1_clamp_limit or 7.0
             layer.gemm1_alpha = Parameter(
                 torch.tensor([_alpha] * E, dtype=torch.float32).cuda(),
                 requires_grad=False,
@@ -703,7 +704,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 new_shape = list(shape)
                 return x.reshape(*new_shape)
 
-            if getattr(layer.moe_runner_config, "gate_up_interleaved", True):
+            if layer.moe_runner_config.gate_up_interleaved:
                 w13_weight_scale = swap_every_two_rows(w13_weight_scale, -2)
                 w13_weight = swap_every_two_rows(w13_weight, -2)
                 w13_bias = swap_every_two_rows(w13_bias, -1)
@@ -833,17 +834,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             return
         if _use_aiter:
-            if getattr(layer, "w13_weight_bias", None) is not None:
+            if layer.w13_weight_bias is not None:
                 layer.w13_weight_bias.data = layer.w13_weight_bias.data.to(
                     torch.float32
                 )
-            if getattr(layer, "w2_weight_bias", None) is not None:
+            if layer.w2_weight_bias is not None:
                 layer.w2_weight_bias.data = layer.w2_weight_bias.data.to(torch.float32)
 
             e, n, k = layer.w13_weight.shape
-            gate_up_interleaved = getattr(
-                layer.moe_runner_config, "gate_up_interleaved", True
-            )
+            gate_up_interleaved = layer.moe_runner_config.gate_up_interleaved
 
             if gate_up_interleaved:
                 layer.w13_weight.view(torch.uint8).copy_(
@@ -859,7 +858,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     .contiguous()
                     .view(e, n, -1)
                 )
-                if getattr(layer, "w13_weight_bias", None) is not None:
+                if layer.w13_weight_bias is not None:
                     layer.w13_weight_bias.data = (
                         layer.w13_weight_bias.data.view(-1, n // 2, 2)
                         .permute(0, 2, 1)
@@ -869,7 +868,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             k3_situ_a8w4 = (
                 os.environ.get("AITER_SITUV2_A8W4", "0") == "1"
-                and getattr(layer.moe_runner_config, "activation", None) == "situ"
+                and layer.moe_runner_config.activation == "situ"
             )
             use_aiter_gu_interleave = k3_situ_a8w4 or (
                 envs.SGLANG_USE_AITER_MOE_GU_ITLV.get() and gate_up_interleaved
@@ -1040,7 +1039,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # half along its row dim (N) from N_un to N_pad with zeros, and along
         # its last dim (K) from K_un (or K_un / sf_block_size) to K_pad.
 
-        _interleaved = getattr(layer.moe_runner_config, "gate_up_interleaved", True)
+        _interleaved = layer.moe_runner_config.gate_up_interleaved
 
         def _stack_up_gate_w13(unpadded_w13, last_pad, last_un):
             # unpadded_w13: [E, 2*N_un, last_un]
@@ -1098,8 +1097,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w2_bias_padded[:, :K_un] = layer.w2_weight_bias.data
 
         # ---- Per-expert SwiGLU scalars (read from runner config, fallback to GPT-OSS defaults)
-        _sm90_alpha = getattr(layer.moe_runner_config, "gemm1_alpha", None) or 1.702
-        _sm90_limit = getattr(layer.moe_runner_config, "gemm1_clamp_limit", None) or 7.0
+        _sm90_alpha = layer.moe_runner_config.gemm1_alpha or 1.702
+        _sm90_limit = layer.moe_runner_config.gemm1_clamp_limit or 7.0
         layer.swiglu_alpha = Parameter(
             torch.full((E,), _sm90_alpha, dtype=torch.float32, device=device),
             requires_grad=False,
@@ -1603,7 +1602,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
                 # Bypassed topk: route from logits inside the op.
                 correction_bias = topk_output.topk_config.correction_bias
-                bias_bf16 = getattr(layer, "_situ_routing_bias_bf16", None)
+                bias_bf16 = layer.__dict__.get("_situ_routing_bias_bf16")
                 if bias_bf16 is None and correction_bias is not None:
                     bias_bf16 = correction_bias.to(torch.bfloat16)
                     layer._situ_routing_bias_bf16 = bias_bf16
