@@ -71,6 +71,9 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -392,11 +395,14 @@ class KimiK3MoE(nn.Module):
         # For MXFP4 compressed-tensors, replace quant_config with Mxfp4Config
         # so FusedMoE's weight_loader uses the MXFP4 fast path
         moe_quant_config = quant_config
-        if quant_config is not None and getattr(quant_config, "quant_format", None):
-            if "mxfp4" in quant_config.quant_format:
-                from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
+        if (
+            isinstance(quant_config, CompressedTensorsConfig)
+            and quant_config.quant_format
+            and "mxfp4" in quant_config.quant_format
+        ):
+            from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 
-                moe_quant_config = Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
+            moe_quant_config = Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
 
         # Routed experts (operate in moe_hidden_size space)
         # gate_up_interleaved=False: K3 loads per-expert w1/w3 into non-interleaved layout
@@ -1336,11 +1342,8 @@ class KimiK3DeltaAttention(nn.Module):
                 self.num_heads // self.tp_size,
                 2 * self.head_dim,
             ]
-            _dtype = config.dtype
-            if isinstance(_dtype, str):
-                _dtype = getattr(torch, _dtype, torch.bfloat16)
             self.fused_fg_b_proj = ColumnParallelBatchedLinear(
-                2, self.head_dim, projection_size, dtype=_dtype
+                2, self.head_dim, projection_size, dtype=config.dtype
             )
         else:
             attn_tp_rank = self.attn_tp_rank
@@ -2140,9 +2143,11 @@ class KimiK3DecoderLayer(nn.Module):
             get_attn_tp_context,
         )
 
-        qkv_latent_func = getattr(self.self_attn, "prepare_qkv_latent", None)
-        if qkv_latent_func is not None:
-            attn_inputs = AttentionInputs(hidden_states, forward_batch, qkv_latent_func)
+        is_mla = isinstance(self.self_attn, KimiK3MLAAttention)
+        if is_mla:
+            attn_inputs = AttentionInputs(
+                hidden_states, forward_batch, self.self_attn.prepare_qkv_latent
+            )
             get_attn_tp_context().set_attn_inputs(attn_inputs)
 
         result = self.self_attn(
@@ -2152,7 +2157,7 @@ class KimiK3DecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
         )
 
-        if qkv_latent_func is not None:
+        if is_mla:
             get_attn_tp_context().clear_attn_inputs()
 
         return result
