@@ -1592,13 +1592,16 @@ class RowParallelLinear(LinearBase):
                     self, input_parallel, bias=bias_
                 )
             else:
-                apply_into = getattr(self.quant_method, "apply_into", None)
-                if apply_into is None:
+                from sglang.srt.layers.quantization.unquant import (
+                    UnquantizedLinearMethod,
+                )
+
+                if not isinstance(self.quant_method, UnquantizedLinearMethod):
                     raise RuntimeError(
                         f"{type(self.quant_method).__name__} cannot write into "
                         "caller-owned linear output"
                     )
-                output_parallel = apply_into(
+                output_parallel = self.quant_method.apply_into(
                     self, input_parallel, output_tensor, bias=bias_
                 )
 

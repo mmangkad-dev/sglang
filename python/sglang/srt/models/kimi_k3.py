@@ -341,9 +341,10 @@ _EP_FRONT_LOGGED = False
 
 
 def _o_proj_takes_output(o_proj: RowParallelLinear) -> bool:
-    """Whether o_proj can write into caller-owned storage. ``apply_into`` is an
-    optional quant-method capability; only the unquantized method has it."""
-    return getattr(o_proj.quant_method, "apply_into", None) is not None
+    """Whether o_proj uses the method supporting caller-owned storage."""
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    return isinstance(o_proj.quant_method, UnquantizedLinearMethod)
 
 
 def _k3_symm_o_proj_out(o_proj: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
