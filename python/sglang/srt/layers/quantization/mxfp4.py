@@ -497,6 +497,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w13_weight_bias", w13_weight_bias)
             set_weight_attrs(w13_weight_bias, extra_weight_attrs)
+        else:
+            layer.register_parameter("w13_weight_bias", None)
 
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
@@ -531,6 +533,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
+        else:
+            layer.register_parameter("w2_weight_bias", None)
 
     def process_weights_after_loading(self, layer):
         if self.use_marlin:
