@@ -1,8 +1,8 @@
 """Regression test: HybridLinearAttnBackend delegates init_mha_chunk_metadata.
 
 Hybrid MLA models (Ring/Ling, Kimi-Linear) run DeepSeek-style MLA on their
-full-attention layers. Prefill plans the flashinfer ragged wrapper via
-``hasattr(get_attn_backend(), "init_mha_chunk_metadata")`` (forward_mha.py).
+full-attention layers. Prefill plans the flashinfer ragged wrapper via the
+``AttentionBackend.init_mha_chunk_metadata`` contract (forward_mha.py).
 For a hybrid model ``get_attn_backend()`` is the HybridLinearAttnBackend wrapper;
 when it lacked the hook the guard was False, qo_indptr/kv_indptr were never
 planned, and flashinfer raised "q.shape[0] does not match qo_indptr[-1]".
@@ -111,8 +111,8 @@ def _build_hybrid_backend(testcase, case: MLAAttentionCase):
 class TestHybridLinearChunkMetadataDelegation(CustomTestCase):
     def test_wrapper_exposes_chunk_metadata_hook(self):
         _, full_backend, hybrid = _build_hybrid_backend(self, _make_case())
-        self.assertTrue(hasattr(hybrid, "init_mha_chunk_metadata"))
-        self.assertTrue(hasattr(full_backend, "init_mha_chunk_metadata"))
+        self.assertTrue(callable(hybrid.init_mha_chunk_metadata))
+        self.assertTrue(callable(full_backend.init_mha_chunk_metadata))
 
     def test_delegation_plans_qo_indptr(self):
         case = _make_case()

@@ -131,9 +131,9 @@ class HybridAttnBackend(AttentionBackend):
         # split (e.g. --decode-attention-backend trtllm_mla), and any
         # prefix-cache-hit extend batch then runs against a stale plan:
         #   ValueError: q.shape[0] (...) does not match qo_indptr[-1] (...)
-        init = getattr(self.prefill_backend, "init_mha_chunk_metadata", None)
-        if init is not None:
-            init(forward_batch, disable_flashinfer_ragged)
+        self.prefill_backend.init_mha_chunk_metadata(
+            forward_batch, disable_flashinfer_ragged
+        )
 
     @property
     def verify_mask(self) -> Optional[VerifyMask]:

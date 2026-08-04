@@ -403,8 +403,7 @@ class DeepseekMHAForwardMixin:
         # Only initialize the info once
         if has_extend_prefix and forward_batch.num_prefix_chunks is None:
             forward_batch.prepare_chunked_prefix_cache_info(q.device)
-            if hasattr(get_attn_backend(), "init_mha_chunk_metadata"):
-                get_attn_backend().init_mha_chunk_metadata(forward_batch)
+            get_attn_backend().init_mha_chunk_metadata(forward_batch)
 
         forward_batch.mha_return_lse = has_extend_prefix
         # Do mha for extended part without prefix
@@ -449,8 +448,7 @@ class DeepseekMHAForwardMixin:
         # Only initialize the info once
         if has_extend_prefix and forward_batch.num_prefix_chunks is None:
             forward_batch.num_prefix_chunks = 0
-            if hasattr(get_attn_backend(), "init_mha_chunk_metadata"):
-                get_attn_backend().init_mha_chunk_metadata(forward_batch)
+            get_attn_backend().init_mha_chunk_metadata(forward_batch)
         forward_batch.mha_return_lse = False
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)

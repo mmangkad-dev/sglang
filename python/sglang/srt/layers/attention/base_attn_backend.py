@@ -129,6 +129,17 @@ class AttentionBackend(ABC):
         should override this hook for both capture and replay.
         """
 
+    def init_mha_chunk_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        disable_flashinfer_ragged: bool = False,
+    ) -> None:
+        """Prepare optional MHA chunk metadata for a forward pass.
+
+        Most backends require no additional preparation. MLA backends and
+        wrappers around them override this hook.
+        """
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
         raise NotImplementedError()

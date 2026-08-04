@@ -24,8 +24,7 @@ That gap hid a real production crash: the MLA prefill path plans its flashinfer
 ragged wrapper via
 
 ```python
-if hasattr(get_attn_backend(), "init_mha_chunk_metadata"):
-    get_attn_backend().init_mha_chunk_metadata(forward_batch)
+get_attn_backend().init_mha_chunk_metadata(forward_batch)
 ```
 
 For a hybrid model `get_attn_backend()` returns the **wrapper**. The wrapper did
@@ -36,7 +35,8 @@ not expose `init_mha_chunk_metadata`, so the guard was silently False, the
 ValueError: q.shape[0] (8218) does not match qo_indptr[-1] (800).
 ```
 
-Fix: `HybridLinearAttnBackend.init_mha_chunk_metadata` delegates to the
+Fix: `AttentionBackend` declares the hook as a no-op contract, and
+`HybridLinearAttnBackend.init_mha_chunk_metadata` delegates to the
 full-attention backend (`hybrid_linear_attn_backend.py`).
 
 ## Tests

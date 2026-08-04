@@ -692,8 +692,7 @@ class SarvamMoEMLAAttention(nn.Module):
                 forward_batch.prepare_chunked_prefix_cache_info(q.device)
             else:
                 forward_batch.num_prefix_chunks = 0
-            if hasattr(get_attn_backend(), "init_mha_chunk_metadata"):
-                get_attn_backend().init_mha_chunk_metadata(forward_batch)
+            get_attn_backend().init_mha_chunk_metadata(forward_batch)
 
         forward_batch.set_attn_attend_prefix_cache(False)
         forward_batch.mha_return_lse = do_prefix_merge
