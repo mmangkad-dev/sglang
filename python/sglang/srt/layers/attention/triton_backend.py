@@ -468,10 +468,7 @@ class TritonAttnBackend(AttentionBackend):
         # Prefer the spec_info's per-request query length (DSpark draft propose
         # uses gamma < verify window); fall back to the configured verify window.
         num_draft_tokens = self.num_draft_tokens
-        if (
-            spec_info is not None
-            and getattr(spec_info, "draft_token_num", None) is not None
-        ):
+        if spec_info is not None and spec_info.draft_token_num is not None:
             num_draft_tokens = int(spec_info.draft_token_num)
         qo_indptr = self.qo_indptr[: bs + 1]
         qo_indptr[: bs + 1] = torch.arange(
@@ -810,10 +807,7 @@ class TritonAttnBackend(AttentionBackend):
             # self.num_draft_tokens is the verify window (gamma + 1), while
             # DSpark draft propose runs a gamma-token TARGET_VERIFY forward.
             num_draft_tokens = self.num_draft_tokens
-            if (
-                spec_info is not None
-                and getattr(spec_info, "draft_token_num", None) is not None
-            ):
+            if spec_info is not None and spec_info.draft_token_num is not None:
                 num_draft_tokens = int(spec_info.draft_token_num)
             qo_indptr = torch.arange(
                 0,
@@ -1110,10 +1104,7 @@ class TritonAttnBackend(AttentionBackend):
                 else None
             )
             max_extend_len = self.num_draft_tokens
-            if (
-                spec_info is not None
-                and getattr(spec_info, "draft_token_num", None) is not None
-            ):
+            if spec_info is not None and spec_info.draft_token_num is not None:
                 max_extend_len = int(spec_info.draft_token_num)
             return ForwardMetadata(
                 attn_logits=None,
