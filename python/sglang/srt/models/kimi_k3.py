@@ -401,7 +401,7 @@ class KimiK3MoE(nn.Module):
         # Routed experts (operate in moe_hidden_size space)
         # gate_up_interleaved=False: K3 loads per-expert w1/w3 into non-interleaved layout
         self.experts = get_moe_impl_class(moe_quant_config)(
-            num_experts=getattr(config, "n_routed_experts", config.num_experts),
+            num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_token,
             hidden_size=self.moe_hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -415,8 +415,8 @@ class KimiK3MoE(nn.Module):
             # trtllm fused-routing MoE backends (e.g. nvfp4 w4a4) route inside
             # the kernel and require the routing method; K3 uses DSv3-style
             # grouped topk with e_score_correction_bias.
-            routing_method_type=getattr(
-                config, "routing_method_type", RoutingMethodType.DeepSeekV3
+            routing_method_type=config.__dict__.get(
+                "routing_method_type", RoutingMethodType.DeepSeekV3
             ),
             prefix=add_prefix("experts", prefix),
         )
@@ -1714,7 +1714,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         gate_alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         self.all_reduce_fusion = all_reduce_fusion
-        self.use_output_gate = getattr(config, "mla_use_output_gate", False)
+        self.use_output_gate = config.mla_use_output_gate
         super().__init__(
             layer_id=layer_idx,
             hidden_size=config.hidden_size,
@@ -2022,8 +2022,7 @@ class KimiK3DecoderLayer(nn.Module):
         if self._sp_moe:
             # o_proj emits TP-partial sums; _finish_attn_reduce completes the
             # reduction (RS on the clean attn-res path, AR on fallbacks).
-            o_proj = getattr(self.self_attn, "o_proj", None)
-            assert o_proj is not None, "SP-MoE requires attention exposing o_proj"
+            o_proj = self.self_attn.o_proj
             o_proj.reduce_results = False
             if k3_sp_collective.enabled():
                 # The table selects NVLS pull RS for larger token buckets.
@@ -2610,7 +2609,7 @@ class KimiK3LinearForCausalLM(nn.Module):
             )
         else:
             self.lm_head = PPMissingLayer()
-        logit_scale = getattr(config, "logit_scale", 1.0)
+        logit_scale = config.__dict__.get("logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
         self.capture_aux_hidden_states = False
 
@@ -2798,7 +2797,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if not self.config.is_kda_layer(layer_id):
                         continue
                     layer = self.model.layers[layer_id].self_attn
-                    if not getattr(layer, "do_fuse_qkvbfg", False):
+                    if not layer.do_fuse_qkvbfg:
                         continue
                 if weight_name in {".q_proj", ".k_proj", ".v_proj"}:
                     layer_id = int(name.split(".")[2])
@@ -3051,9 +3050,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             """
             parallel = get_parallel()
             server_args = get_server_args()
-            ipc_consumer_count = max(
-                getattr(server_args, "tp_size", parallel.attn_tp_size), 1
-            )
+            ipc_consumer_count = max(server_args.tp_size, 1)
             device_index = device.index
             if device.type == "cuda" and device_index is None:
                 device_index = torch.cuda.current_device()
@@ -3164,9 +3161,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        mapper = getattr(self, "hf_to_sglang_mapper", None)
-        if mapper is not None:
-            weights = mapper.apply(weights)
+        weights = self.hf_to_sglang_mapper.apply(weights)
 
         vision_params = (
             None
