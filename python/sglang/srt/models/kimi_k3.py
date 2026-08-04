@@ -2400,6 +2400,8 @@ class KimiK3LinearModel(nn.Module):
             prefix=f"{prefix}.layers",
         )
 
+        self.output_attn_res_norm: Optional[RMSNorm] = None
+        self.output_attn_res_proj: Optional[ReplicatedLinear] = None
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             if config.attn_res_block_size is not None:
@@ -2897,7 +2899,8 @@ class KimiK3LinearForCausalLM(nn.Module):
             if layer.use_attn_residuals:
                 _warm_cw(layer.self_attention_res_proj, layer.self_attention_res_norm)
                 _warm_cw(layer.mlp_res_proj, layer.mlp_res_norm)
-        if hasattr(self.model, "output_attn_res_proj"):
+        if self.model.output_attn_res_proj is not None:
+            assert self.model.output_attn_res_norm is not None
             _warm_cw(self.model.output_attn_res_proj, self.model.output_attn_res_norm)
 
         # Post-load: merge the horizontally-fused decode weights. Module
