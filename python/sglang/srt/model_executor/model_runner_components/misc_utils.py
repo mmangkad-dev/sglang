@@ -81,7 +81,7 @@ def resolve_pp_proxy_residual_num_blocks(
     if pp_size <= 1 or pp_rank == 0 or not is_kimi_k3(model_config.hf_config):
         return None
 
-    block_size = getattr(model_config.hf_text_config, "attn_res_block_size", None)
+    block_size = model_config.hf_text_config.attn_res_block_size
     if block_size is None:
         return None
     return (start_layer + block_size - 1) // block_size
