@@ -434,6 +434,7 @@ class EmbeddingData:
         # Coerce to plain int: this object crosses process boundaries via
         # safe_pickle_loads, whose allowlist blocks http.HTTPStatus.
         self.error_code = int(error_code) if error_code is not None else None
+        self.original_image_sizes = kwargs.pop("original_image_sizes", None)
         # Store additional metadata (e.g., video_timestamps for qwen3_vl)
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -481,7 +482,6 @@ _GENERAL_VIDEO_META_ATTRS = (
     "video_timestamps",
     "second_per_grid_ts",
 )
-_GENERAL_IMAGE_META_ATTRS = ("original_image_sizes",)
 # MiMo-VL audio-in-video fields; appended only when model_type is MiMo.
 _MIMO_VIDEO_AUDIO_META_ATTRS = (
     "video_audio_feature_lens",
@@ -552,8 +552,7 @@ class MultiModalEmbeddingData(EmbeddingData):
         self.img_grid_thw = [None] * num_parts
         self.video_grid_thw = [None] * num_parts
         self.audio_feature_lens = [None] * num_parts
-        for attr in _GENERAL_IMAGE_META_ATTRS:
-            setattr(self, attr, [None] * num_parts)
+        self.original_image_sizes = [None] * num_parts
         self.modality_list = [
             modality if part_idx == i else None for i in range(num_parts)
         ]
@@ -574,14 +573,13 @@ class MultiModalEmbeddingData(EmbeddingData):
             self._set_image_meta_for_part(part_idx, kwargs)
 
     def _set_image_meta_for_part(self, part_idx, source):
-        for attr_name in _GENERAL_IMAGE_META_ATTRS:
-            val = (
-                source.get(attr_name)
-                if isinstance(source, dict)
-                else getattr(source, attr_name, None)
-            )
-            if val is not None:
-                getattr(self, attr_name)[part_idx] = val
+        val = (
+            source.get("original_image_sizes")
+            if isinstance(source, dict)
+            else source.original_image_sizes
+        )
+        if val is not None:
+            self.original_image_sizes[part_idx] = val
 
     def _set_part_grid(self, part_idx, modality, grid):
         """Set the grid for one part according to modality (IMAGE/VIDEO/AUDIO)."""
@@ -616,10 +614,8 @@ class MultiModalEmbeddingData(EmbeddingData):
             val = getattr(embedding_data, attr, None)
             if val is not None:
                 extra[attr] = val
-        for attr in _GENERAL_IMAGE_META_ATTRS:
-            val = getattr(embedding_data, attr, None)
-            if val is not None:
-                extra[attr] = val
+        if embedding_data.original_image_sizes is not None:
+            extra["original_image_sizes"] = embedding_data.original_image_sizes
         mm_data = cls(
             part_idx=embedding_data.part_idx,
             num_parts=embedding_data.num_parts,
@@ -670,10 +666,11 @@ class MultiModalEmbeddingData(EmbeddingData):
                 kwargs[attr] = torch.cat(valid, dim=0)
             else:
                 kwargs[attr] = list(itertools.chain(*valid))
-        for attr in _GENERAL_IMAGE_META_ATTRS:
-            valid = [value for value in getattr(self, attr) if value is not None]
-            if valid:
-                kwargs[attr] = list(itertools.chain(*valid))
+        valid_image_sizes = [
+            value for value in self.original_image_sizes if value is not None
+        ]
+        if valid_image_sizes:
+            kwargs["original_image_sizes"] = list(itertools.chain(*valid_image_sizes))
         return kwargs
 
     def add(self, embedding_data: EmbeddingData):
