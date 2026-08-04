@@ -378,6 +378,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         self.num_experts = num_experts
+        layer._situ_routing_bias_bf16 = None
         weight_dtype = torch.uint8
         scale_dtype = torch.uint8
         self.with_bias = with_bias
@@ -1601,7 +1602,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
                 # Bypassed topk: route from logits inside the op.
                 correction_bias = topk_output.topk_config.correction_bias
-                bias_bf16 = layer.__dict__.get("_situ_routing_bias_bf16")
+                bias_bf16 = layer._situ_routing_bias_bf16
                 if bias_bf16 is None and correction_bias is not None:
                     bias_bf16 = correction_bias.to(torch.bfloat16)
                     layer._situ_routing_bias_bf16 = bias_bf16
