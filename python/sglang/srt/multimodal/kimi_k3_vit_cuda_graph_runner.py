@@ -124,7 +124,7 @@ class KimiK3ViTCudaGraphRunner:
             outputs=tuple(outputs),
             metadata=metadata,
         )
-        position_embeddings = getattr(metadata, "position_embeddings", None)
+        position_embeddings = metadata.position_embeddings
         position_cache_bytes = (
             position_embeddings.numel() * position_embeddings.element_size()
             if position_embeddings is not None

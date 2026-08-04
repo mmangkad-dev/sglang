@@ -302,7 +302,7 @@ def test_kimi_k3_vit_graph_runner_reuses_global_graph_pool(monkeypatch):
     runner = KimiK3ViTCudaGraphRunner(Tower(), capacity=2, min_hits=1)
     pixels = torch.randn(4, 2)
     grids = torch.tensor([[1, 2, 2]])
-    metadata = object()
+    metadata = SimpleNamespace(position_embeddings=None)
     runner._capture(((1, 2, 2),), pixels, grids, ((1, 2, 2),), metadata)
     runner._capture(((1, 1, 4),), pixels, grids, ((1, 1, 4),), metadata)
 

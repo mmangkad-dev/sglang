@@ -336,7 +336,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        if getattr(request_obj, "video_data", None) or kwargs.get("audio_data"):
+        if request_obj.video_data or kwargs.get("audio_data"):
             raise ValueError("Kimi-K3 supports image input only")
 
         expected_image_count = len(image_data or [])
@@ -389,7 +389,7 @@ class KimiK3ImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
         # that assignment is known: one tokenizer/scheduler crossing per
         # image instead of one per rank. K2.5 gates this on
         # --mm-enable-dp-encoder; K3 needs no flag.
-        if getattr(self, "use_cuda_ipc", False):
+        if self.use_cuda_ipc:
             for item in mm_items:
                 item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
                     True
