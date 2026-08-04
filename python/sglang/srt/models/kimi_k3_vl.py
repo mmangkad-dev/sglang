@@ -348,6 +348,7 @@ class Rope2DPosEmbRepeated(nn.Module):
         self.max_height = max_height
         self.max_width = max_width
         self.theta_base = theta_base
+        self.register_buffer("freqs_cis", None, persistent=False)
 
     def _precompute_freqs_cis(self, device: torch.device) -> torch.Tensor:
         N = self.max_height * self.max_width
@@ -372,10 +373,8 @@ class Rope2DPosEmbRepeated(nn.Module):
         *,
         grid_thw_list: Optional[Sequence[Sequence[int]]] = None,
     ) -> torch.Tensor:
-        if not hasattr(self, "freqs_cis"):
-            self.register_buffer(
-                "freqs_cis", self._precompute_freqs_cis(device), persistent=False
-            )
+        if self.freqs_cis is None:
+            self.freqs_cis = self._precompute_freqs_cis(device)
 
         shapes = _resolve_grid_thw_list(grid_thws, grid_thw_list)
         assert all(
