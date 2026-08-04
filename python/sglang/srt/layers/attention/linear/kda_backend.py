@@ -347,6 +347,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # extend_seq_lens_cpu from schedule, mamba track indices rebuild from req
     # objects, and the replayssm seq_lens_cpu force-flush is GDN-only.
     needs_cpu_seq_lens: bool = False
+    _fused_reject_logged: bool = False
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
@@ -437,8 +438,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # see kimi_k3.py) and the shapes are covered; the model applies the
         # norm itself whenever the stash is left unconsumed.
         if replayssm_d is None:
-            fused_static = getattr(layer, "_k3_fused_decode_args", None)
-            onorm_gate = getattr(layer, "_k3_onorm_gate", None)
+            fused_static = layer._k3_fused_decode_args
+            onorm_gate = layer._k3_onorm_gate
             if (
                 fused_static is not None
                 and onorm_gate is not None
@@ -490,7 +491,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 # One-shot diagnostics: the model offered the handoff but the
                 # runtime shapes were rejected (decode stays on the unfused
                 # chain, which is correct but slower).
-                if not getattr(KDAAttnBackend, "_fused_reject_logged", False):
+                if not KDAAttnBackend._fused_reject_logged:
                     KDAAttnBackend._fused_reject_logged = True
                     rank0_log(
                         "KDA fused decode rejected by covered(): "
@@ -720,7 +721,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # ReplaySSM: intermediate_ssm is intentionally None (the ring + commit-time
         # fold replace the per-step snapshots). Pass None to the verify kernel so it
         # skips the write (CACHE_INTERMEDIATE_STATES=False); the output is unaffected.
-        replayssm_rawv = getattr(mamba_cache_params, "replayssm_rawv", None)
+        replayssm_rawv = mamba_cache_params.replayssm_rawv
         replayssm_on = replayssm_rawv is not None
         if intermediate_state_cache is None and not replayssm_on:
             raise RuntimeError(
@@ -996,8 +997,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
         # The kernel owns all 128 output channels and can fold gated RMSNorm
         # into the recurrence.
-        onorm_gate = getattr(layer, "_k3_onorm_gate", None)
-        fused_static = getattr(layer, "_k3_fused_decode_args", None)
+        onorm_gate = layer._k3_onorm_gate
+        fused_static = layer._k3_fused_decode_args
         apply_onorm = onorm_gate is not None and fused_static is not None
         if apply_onorm:
             onorm_weight = fused_static[5]

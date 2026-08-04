@@ -1507,6 +1507,9 @@ class KimiK3DeltaAttention(nn.Module):
             A_log=self.A_log,
             dt_bias=self.dt_bias,
         )
+        self.attn._k3_fused_decode_args = None
+        self.attn._k3_onorm_gate = None
+        self.attn._k3_onorm_consumed = False
         # KDA safe gate: checkpoint trained with gate_lower_bound=-5.0
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
         # Set by _prepare_fused_decode() once weights are loaded.
