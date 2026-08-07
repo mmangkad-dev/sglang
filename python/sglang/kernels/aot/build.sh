@@ -10,6 +10,14 @@ PYTHON_VERSION="$1"          # e.g. 3.10
 CUDA_VERSION="$2"            # e.g. 12.9
 ARCH="${3:-$(uname -i)}"     # optional override
 
+case "${CUDA_VERSION}" in
+  12.9|13.0) ;;
+  *)
+    echo "Unsupported CUDA version: ${CUDA_VERSION} (supported: 12.9, 13.0)" >&2
+    exit 1
+    ;;
+esac
+
 if [ "${ARCH}" = "aarch64" ]; then
   BASE_IMG="pytorch/manylinuxaarch64-builder"
 else

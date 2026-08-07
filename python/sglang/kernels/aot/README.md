@@ -137,7 +137,3 @@ The tool generates:
   - Individual kernel sizes (sorted by size)
 
 Use this to identify large kernels and potential template instantiation bloat.
-
-## FAQ
-- Q: Segmentation fault with CUDA 12.6
-- A: Update ptxas to 12.8, reference: [segment fault error](https://github.com/Dao-AILab/flash-attention/issues/1453)

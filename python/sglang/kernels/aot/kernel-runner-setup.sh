@@ -1,7 +1,19 @@
 #!/bin/bash
 set -e
 
-CUDA_VERSIONS="${1:-12-8,12-9}"
+CUDA_VERSIONS="${1:-12-9,13-0}"
+
+IFS=',' read -ra CUDA_VERSION_ARRAY <<< "$CUDA_VERSIONS"
+for CUDA_VERSION in "${CUDA_VERSION_ARRAY[@]}"; do
+    CUDA_VERSION=$(echo "$CUDA_VERSION" | xargs)
+    case "$CUDA_VERSION" in
+        12-9|13-0) ;;
+        *)
+            echo "Unsupported CUDA version: $CUDA_VERSION (supported: 12-9, 13-0)" >&2
+            exit 1
+            ;;
+    esac
+done
 
 echo "==================================="
 echo "Installing Docker..."
@@ -52,12 +64,12 @@ echo "Builder: ${BUILDER_NAME}"
 # Parse CUDA versions and pull corresponding Docker images
 IFS=',' read -ra CUDA_VERSION_ARRAY <<< "$CUDA_VERSIONS"
 
-# Convert CUDA versions from format "12-8" to "12.8" and pull images
+# Convert CUDA versions from format "12-9" to "12.9" and pull images
 for CUDA_VERSION in "${CUDA_VERSION_ARRAY[@]}"; do
     # Trim whitespace
     CUDA_VERSION=$(echo "$CUDA_VERSION" | xargs)
 
-    # Convert format: 12-8 -> 12.8
+    # Convert format: 12-9 -> 12.9
     CUDA_VERSION_DOTTED=$(echo "$CUDA_VERSION" | tr '-' '.')
 
     DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION_DOTTED}"

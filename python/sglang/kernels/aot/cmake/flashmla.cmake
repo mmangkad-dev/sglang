@@ -24,24 +24,15 @@ set(FLASHMLA_CUDA_FLAGS
     "-Xcudafe=--diag_suppress=177"   # variable was declared but never referenced
 )
 
-set(FLASHMLA_ENABLE_SM100 OFF)
+set(FLASHMLA_ENABLE_SM100 ON)
 
-# The FlashMLA kernels only work on hopper and require CUDA 12.4 or later.
-# Only build FlashMLA kernels if we are building for something compatible with
-# sm90a
-if(${CUDA_VERSION} VERSION_GREATER 12.4)
-    list(APPEND FLASHMLA_CUDA_FLAGS
-        "-gencode=arch=compute_90a,code=sm_90a"
-    )
-endif()
-if(${CUDA_VERSION} VERSION_GREATER 12.8)
-    # sm_100f is compatible with all sm_10x
-    list(APPEND FLASHMLA_CUDA_FLAGS
-        "-gencode=arch=compute_100f,code=sm_100f"
-    )
-    set(FLASHMLA_ENABLE_SM100 ON)
-endif()
-if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
+# sm_100f is compatible with all sm_10x.
+list(APPEND FLASHMLA_CUDA_FLAGS
+    "-gencode=arch=compute_90a,code=sm_90a"
+    "-gencode=arch=compute_100f,code=sm_100f"
+)
+
+if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
     # Patch FlashMLA sources for SM103a support.
     # These patches are only needed (and only valid) with CUDA 13+.
 

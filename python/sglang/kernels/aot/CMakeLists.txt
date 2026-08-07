@@ -28,17 +28,9 @@ enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
 set_property(GLOBAL PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
-message(STATUS "Detected CUDA_VERSION=${CUDA_VERSION}")
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
-    message("CUDA_VERSION ${CUDA_VERSION} >= 13.0")
-elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8")
-    message("CUDA_VERSION ${CUDA_VERSION} >= 12.8")
-elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
-    message("CUDA_VERSION ${CUDA_VERSION} >= 12.4")
-elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.1")
-    message("CUDA_VERSION ${CUDA_VERSION} >= 12.1")
-elseif ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "11.8")
-    message("CUDA_VERSION ${CUDA_VERSION} >= 11.8")
+message(STATUS "Detected CUDAToolkit_VERSION=${CUDAToolkit_VERSION}")
+if (CUDAToolkit_VERSION VERSION_LESS "12.9")
+    message(FATAL_ERROR "sgl-kernel requires CUDA 12.9 or newer; detected ${CUDAToolkit_VERSION}")
 endif()
 
 # Torch
@@ -109,7 +101,7 @@ set(DEFAULT_SGL_KERNEL_ENABLE_FA3 OFF)
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     message(STATUS "For aarch64, disable FA3 by default")
 endif()
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+if (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     set(DEFAULT_SGL_KERNEL_ENABLE_FA3 ON)
 endif()
 
@@ -172,11 +164,9 @@ list(APPEND SGL_KERNEL_CUDA_FLAGS
 
 option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
 option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
-option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
 option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              ${DEFAULT_SGL_KERNEL_ENABLE_FA3})
 option(SGL_KERNEL_ENABLE_FA3_SPARSE_MASK  "Enable FA3 sparse mask kernels" OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
-option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
 
 if (SGL_KERNEL_ENABLE_BF16)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -205,51 +195,36 @@ if (ENABLE_BELOW_SM90)
 
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
-    # sm_100f is available in CUDA 12.9+ and covers all sm_100, sm_103, sm_107, sm_10x
-    if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.9")
-        list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_100f,code=sm_100f"
-        )
-    else()
-        list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_100a,code=sm_100a"
-        )
-    endif()
+list(APPEND SGL_KERNEL_CUDA_FLAGS
+    "-gencode=arch=compute_100f,code=sm_100f"
+    "-gencode=arch=compute_120a,code=sm_120a"
+)
+# refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
+if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
     list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_120a,code=sm_120a"
+        "--compress-mode=size"
     )
-    # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
-    if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
+    if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
         list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "--compress-mode=size"
+            "-gencode=arch=compute_110a,code=sm_110a"
+            "-gencode=arch=compute_121a,code=sm_121a"
         )
-        if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
-            list(APPEND SGL_KERNEL_CUDA_FLAGS
-                "-gencode=arch=compute_110a,code=sm_110a"
-                "-gencode=arch=compute_121a,code=sm_121a"
-            )
-        endif()
-    else()
-        if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
-            list(APPEND SGL_KERNEL_CUDA_FLAGS
-                "-gencode=arch=compute_101a,code=sm_101a"
-            )
-        endif()
     endif()
+elseif (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-gencode=arch=compute_101a,code=sm_101a"
+    )
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND SGL_KERNEL_ENABLE_FA3)
+if (SGL_KERNEL_ENABLE_FA3)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
-    list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-DENABLE_NVFP4=1"
-    )
-endif()
+list(APPEND SGL_KERNEL_CUDA_FLAGS
+    "-DENABLE_NVFP4=1"
+)
 
 # All source files
 # NOTE: Please sort the filenames alphabetically
@@ -511,15 +486,12 @@ set(INFLLM_FLASH_CUDA_FLAGS
     "--threads=${SGL_KERNEL_COMPILE_THREADS}"
 )
 
-# Arch gencodes: match the original setup.py auto-detection
-# (80 always; 90 for CUDA>=11.8; 120 for CUDA>=12.8).
+# Arch gencodes: match the original setup.py auto-detection.
 if (ENABLE_BELOW_SM90)
     list(APPEND INFLLM_FLASH_CUDA_FLAGS "-gencode=arch=compute_80,code=sm_80")
 endif()
 list(APPEND INFLLM_FLASH_CUDA_FLAGS "-gencode=arch=compute_90,code=sm_90")
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
-    list(APPEND INFLLM_FLASH_CUDA_FLAGS "-gencode=arch=compute_120a,code=sm_120a")
-endif()
+list(APPEND INFLLM_FLASH_CUDA_FLAGS "-gencode=arch=compute_120a,code=sm_120a")
 
 set(INFLLM_FLASH_SOURCES
     "csrc/infllm_v2/flash_extension.cc"
