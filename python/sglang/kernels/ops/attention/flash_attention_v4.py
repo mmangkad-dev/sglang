@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import os
 from typing import Callable, Optional, Tuple, Union
 
 import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.srt.environ import envs
 
 try:
-    if os.environ.get("SGLANG_INKLING_FA4_USE_PIP") == "1":
-        # A/B debug escape hatch: route through the pip flash-attn-4 package
-        # (dev's stack). rel_bias is vendored-only, so SHEARED must be 0.
+    if envs.SGLANG_INKLING_FA4_USE_PIP.get():
+        # The pip flash-attn-4 package is the default shared FA4 implementation.
+        # Inkling opts out because rel_bias and sheared bias are in-tree-only.
         from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func
     else:
         from sglang.kernels.ops.attention.flash_attn.cute import (
@@ -119,6 +119,10 @@ def flash_attn_varlen_func(
         rel_bias_kwargs["rel_bias"] = rel_bias
     if rel_bias_prep_cache is not None:
         rel_bias_kwargs["rel_bias_prep_cache"] = rel_bias_prep_cache
+    if envs.SGLANG_INKLING_FA4_USE_PIP.get() and num_splits == 0:
+        # Preserve the previous pip FA4 behavior. Its automatic SplitKV path
+        # can select a configuration that is unsupported on SM90.
+        num_splits = 1
     result = _flash_attn_varlen_func(
         q=q,
         k=k,

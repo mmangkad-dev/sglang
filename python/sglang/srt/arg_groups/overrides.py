@@ -1203,6 +1203,9 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
             f"Use {inkling_attn_backend} as the attention backend for Inkling "
             "(requires fa4 or triton)."
         )
+    # Inkling's FA4 path requires the in-tree relative/sheared-bias extensions.
+    # Other FA4 users default to the pip flash-attn-4 implementation.
+    envs.SGLANG_INKLING_FA4_USE_PIP.set(False)
     envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.set(True)
     return overrides
 

@@ -874,6 +874,10 @@ class Envs:
 
     # Flash Attention
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
+    # Use the pip flash-attn-4 implementation for the shared FA4 backend.
+    # Inkling disables this during model resolution because it requires the
+    # in-tree extensions (for example, relative/sheared bias).
+    SGLANG_INKLING_FA4_USE_PIP = EnvBool(True)
 
     # Kernels
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
