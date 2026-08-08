@@ -268,11 +268,15 @@ class BaseRunner(ABC):
         if mr.server_args.flashinfer_allreduce_fusion_backend is None:
             return
 
-        from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
         from sglang.srt.layers.flashinfer_comm_fusion import pre_initialize_workspaces
 
+        max_token_num = mr.max_decode_logits_rows()
+        prefill_capture_sizes = mr.server_args.cuda_graph_config.prefill.bs or ()
+        if prefill_capture_sizes:
+            max_token_num = max(max_token_num, max(prefill_capture_sizes))
+
         pre_initialize_workspaces(
-            max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
+            max_token_num=max_token_num,
             hidden_dim=mr.model_config.hidden_size,
             dtype=mr.dtype,
         )
