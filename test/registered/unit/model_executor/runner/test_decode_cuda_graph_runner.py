@@ -290,5 +290,27 @@ class TestOriginalTraceExport(CustomTestCase):
                 )
 
 
+class TestFlashInferWorkspaceFreeze(CustomTestCase):
+    def test_capture_freezes_workspace_immediately_after_warmup(self):
+        """Removing capture-time freezing would leave graph pointers replaceable."""
+        events = []
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.warmup = mock.Mock(side_effect=lambda: events.append("warmup"))
+
+        class _FreezeObserved(Exception):
+            pass
+
+        def freeze():
+            events.append("freeze")
+            raise _FreezeObserved
+
+        runner._freeze_flashinfer_allreduce_workspaces = mock.Mock(side_effect=freeze)
+
+        with self.assertRaises(_FreezeObserved):
+            runner.capture()
+
+        self.assertEqual(events, ["warmup", "freeze"])
+
+
 if __name__ == "__main__":
     unittest.main()

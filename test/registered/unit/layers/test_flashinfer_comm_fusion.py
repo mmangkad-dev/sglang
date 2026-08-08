@@ -107,7 +107,7 @@ class TestFlashInferCommFusion(CustomTestCase):
         )
 
     def test_failed_fusion_falls_back_to_allreduce_before_norm(self):
-        """Workspace rejection must not silently omit the tensor-parallel collective."""
+        """Workspace rejection must not silently omit the required collective."""
         from sglang.srt.layers import layernorm
 
         class _FakeNorm:
