@@ -5,7 +5,13 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers import flashinfer_comm_fusion as fusion
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.runtime_context import (
+    get_context,
+    get_flags,
+    get_forward,
+    get_parallel,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -306,30 +312,19 @@ class TestFlashInferCommFusion(CustomTestCase):
                 "apply_flashinfer_allreduce_fusion",
                 return_value=False,
             ),
-            patch.object(
-                communicator_module, "is_enable_moe_cp_allgather", return_value=False
+            get_context().override_server_args(
+                enable_aiter_allreduce_fusion=True,
+                attn_cp_size=1,
+                moe_dp_size=1,
             ),
-            patch.object(
-                communicator_module, "is_dp_attention_enabled", return_value=False
+            get_flags().dp.override(enabled=False),
+            get_flags().moe.override(a2a_backend=MoeA2ABackend.NONE),
+            get_forward().scoped(attn_input_scattered=False),
+            get_parallel().override(
+                tp_size=8,
+                moe_ep_size=2,
+                moe_tp_size=4,
             ),
-            patch.object(
-                communicator_module,
-                "get_attn_tp_context",
-                return_value=types.SimpleNamespace(input_scattered=False),
-            ),
-            patch.object(
-                communicator_module,
-                "get_moe_a2a_backend",
-                return_value=types.SimpleNamespace(is_none=lambda: True),
-            ),
-            patch.object(
-                communicator_module,
-                "get_exec",
-                return_value=types.SimpleNamespace(
-                    comm=types.SimpleNamespace(enable_aiter_allreduce_fusion=True)
-                ),
-            ),
-            get_parallel().override(tp_size=8, moe_ep_size=2, moe_tp_size=2),
         ):
             self.assertTrue(
                 communicator.should_fuse_mlp_allreduce_with_next_layer(forward_batch)
