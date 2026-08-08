@@ -1427,6 +1427,25 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
         self.assertEqual(config.compiler, "eager")
 
 
+class TestPrefillCudaGraphDefaultCaptureSize(CustomTestCase):
+    def test_mla_breakable_graph_captures_through_chunked_prefill_size(self):
+        """MLA inherited a 2048-token cap from piecewise graphs, causing the
+        newer breakable graph to miss configured larger prefill chunks."""
+        args = ServerArgs(model_path="dummy")
+        args.chunked_prefill_size = 16384
+        args.mem_fraction_static = 0.8
+        args.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL),
+            prefill=PhaseConfig(backend=Backend.BREAKABLE),
+        )
+
+        with patch.object(ServerArgs, "use_mla_backend", return_value=True):
+            args._handle_gpu_memory_settings(gpu_mem=None)
+
+        self.assertEqual(args.cuda_graph_config.prefill.max_bs, 16384)
+        self.assertEqual(args.cuda_graph_config.prefill.bs[-1], 16384)
+
+
 class TestCudaGraphDisaggregationRoles(CustomTestCase):
     def _handled_args(self, **overrides):
         args = ServerArgs(model_path="dummy", **overrides)

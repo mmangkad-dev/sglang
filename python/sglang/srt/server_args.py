@@ -4729,13 +4729,7 @@ class ServerArgs:
             decode_cuda_graph_config.max_bs = self.torch_compile_max_bs
 
         if prefill_cuda_graph_config.max_bs is None:
-            # Refer to pr #15927, by default we set the prefill max_bs to the chunked prefill size.
-            # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
-            # To avoid the performance regression, we set max_bs to 2048 by default.
-            if not self.use_mla_backend():
-                prefill_cuda_graph_config.max_bs = self.chunked_prefill_size
-            else:
-                prefill_cuda_graph_config.max_bs = 2048
+            prefill_cuda_graph_config.max_bs = self.chunked_prefill_size
 
             # If max_total_tokens is set, cap prefill max_bs to not exceed max_total_tokens.
             if self.max_total_tokens is not None:
