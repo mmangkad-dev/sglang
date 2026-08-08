@@ -184,6 +184,7 @@ def _forward_with_allreduce_fusion(
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
+            moe_tensor_model_parallel_all_reduce,
             tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
@@ -222,10 +223,15 @@ def _forward_with_allreduce_fusion(
                 if fused_result[0] is not None:
                     return fused_result
 
-            # For AITER route, preserve correctness when fused path is unavailable.
-            if _use_aiter and get_exec().comm.enable_aiter_allreduce_fusion:
-                x = tensor_model_parallel_all_reduce(x)
-                return norm_module.forward(x, residual, None)
+            # A fused backend may reject the shape or fail workspace setup.
+            # Preserve the collective before falling back to ordinary RMSNorm.
+            all_reduce = (
+                tensor_model_parallel_all_reduce
+                if use_attn_tp_group
+                else moe_tensor_model_parallel_all_reduce
+            )
+            x = all_reduce(x)
+            return norm_module.forward(x, residual, None)
 
     return norm_module.forward(x, residual, post_residual_addition)
 

@@ -396,6 +396,11 @@ class FlashInferWorkspaceManager:
         self._logged_init = False
         self._workspace_size_check_kwarg = None
         self._workspace_size_check_strategy_type = None
+        self._workspace_reinitialization_allowed = True
+
+    def _freeze(self):
+        """Keep device addresses stable for CUDA graphs captured with this workspace."""
+        self._workspace_reinitialization_allowed = False
 
     def _configure_workspace_size_check(self):
         """Cache the backend-specific size-check API for this workspace."""
@@ -430,10 +435,6 @@ class FlashInferWorkspaceManager:
         """Initialize workspace using FlashInfer's unified API."""
         global _flashinfer_allreduce_unavailable
 
-        # Track the high-water mark so allocations only grow
-        self._max_token_num_seen = max(max_token_num, self._max_token_num_seen or 0)
-        self._max_hidden_dim_seen = max(hidden_dim, self._max_hidden_dim_seen or 0)
-
         # Reuse existing workspace if it already covers this problem size
         if (
             self.initialized
@@ -446,6 +447,16 @@ class FlashInferWorkspaceManager:
             )
         ):
             return
+
+        # Captured graphs retain the workspace's device addresses. Once frozen,
+        # an unsupported larger eager shape must fall back instead of replacing
+        # the allocation underneath those graphs.
+        if not self._workspace_reinitialization_allowed:
+            return
+
+        # Track the high-water mark so allocations only grow before capture.
+        self._max_token_num_seen = max(max_token_num, self._max_token_num_seen or 0)
+        self._max_hidden_dim_seen = max(hidden_dim, self._max_hidden_dim_seen or 0)
 
         # Same world_size but buffer too small: free old workspace before creating new
         if self.initialized and self.world_size == world_size:
@@ -740,7 +751,15 @@ def ensure_workspace_initialized(
 
         _sync_allreduce_unavailable_across_tp()
 
-    return workspace_manager.initialized
+    return (
+        workspace_manager.initialized
+        and workspace_manager.is_buffer_size_sufficient(
+            token_num=token_num,
+            hidden_dim=hidden_dim,
+            dtype=effective_dtype,
+            use_oneshot=use_oneshot,
+        )
+    )
 
 
 def fake_flashinfer_allreduce_residual_rmsnorm(
@@ -892,6 +911,11 @@ def pre_initialize_workspaces(
         use_oneshot=use_oneshot,
         use_attn_tp_group=True,
     )
+
+    # CUDA graphs captured after this point embed these workspaces' device
+    # addresses. Never replace either allocation during later eager forwards.
+    _get_workspace_manager(use_attn_tp_group=False)._freeze()
+    _get_workspace_manager(use_attn_tp_group=True)._freeze()
 
 
 def cleanup_flashinfer_workspace():

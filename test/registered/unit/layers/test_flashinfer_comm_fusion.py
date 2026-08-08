@@ -7,6 +7,7 @@ import torch
 from sglang.srt.layers import flashinfer_comm_fusion as fusion
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-c", runner_config="4-gpu-h100")
 register_cuda_ci(est_time=30, stage="base-c", runner_config="4-gpu-b200")
@@ -71,7 +72,92 @@ def _torch_allreduce_residual_rmsnorm_baseline(
     return norm_out, residual_out
 
 
-class TestFlashInferCommFusion(unittest.TestCase):
+class TestFlashInferCommFusion(CustomTestCase):
+    def test_frozen_workspace_is_not_replaced_for_larger_shape(self):
+        """A post-capture eager shape must not invalidate captured device pointers."""
+        manager = fusion.FlashInferWorkspaceManager()
+        workspace = _FakeWorkspace("trtllm", world_size=4)
+        workspace.is_buffer_size_sufficient = lambda **kwargs: (
+            kwargs["num_tokens"] <= 2048
+        )
+        manager.workspace = workspace
+        manager.initialized = True
+        manager.world_size = 4
+        manager.max_token_num = 2048
+        manager.hidden_dim = 4096
+        manager._freeze()
+
+        with patch.object(manager, "cleanup") as cleanup:
+            manager.initialize(
+                world_size=4,
+                rank=0,
+                max_token_num=4096,
+                hidden_dim=4096,
+                dtype=torch.bfloat16,
+            )
+
+        cleanup.assert_not_called()
+        self.assertIs(manager.workspace, workspace)
+        self.assertFalse(
+            manager.is_buffer_size_sufficient(
+                token_num=4096,
+                hidden_dim=4096,
+                dtype=torch.bfloat16,
+            )
+        )
+
+    def test_failed_fusion_falls_back_to_allreduce_before_norm(self):
+        """Workspace rejection must not silently omit the tensor-parallel collective."""
+        from sglang.srt.layers import layernorm
+
+        class _FakeNorm:
+            variance_epsilon = 1e-6
+
+            def forward(self, x, residual, post_residual_addition):
+                self.inputs = (x, residual, post_residual_addition)
+                return x + residual
+
+        norm = _FakeNorm()
+        x = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        residual = torch.ones_like(x)
+        weight = torch.ones(4)
+
+        for use_attn_tp_group, collective_name in (
+            (True, "tensor_model_parallel_all_reduce"),
+            (False, "moe_tensor_model_parallel_all_reduce"),
+        ):
+            with (
+                self.subTest(use_attn_tp_group=use_attn_tp_group),
+                patch.object(layernorm, "_use_aiter", False),
+                patch.object(
+                    fusion,
+                    "flashinfer_allreduce_residual_rmsnorm",
+                    return_value=(None, None),
+                ),
+                patch(
+                    f"sglang.srt.distributed.{collective_name}",
+                    side_effect=lambda tensor: tensor * 2,
+                ) as all_reduce,
+                get_parallel().override(
+                    attn_tp_size=2,
+                    moe_ep_size=1,
+                    moe_tp_size=2,
+                ),
+            ):
+                output = layernorm._forward_with_allreduce_fusion(
+                    norm_module=norm,
+                    x=x,
+                    residual=residual,
+                    post_residual_addition=None,
+                    weight=weight,
+                    use_attn_tp_group=use_attn_tp_group,
+                )
+
+            all_reduce.assert_called_once_with(x)
+            torch.testing.assert_close(norm.inputs[0], x * 2)
+            self.assertIsNone(norm.inputs[2])
+            torch.testing.assert_close(output, x * 2 + residual)
+
     def test_auto_backend_resolves_by_arch(self):
         single_node = types.SimpleNamespace(
             flashinfer_allreduce_fusion_backend="auto", nnodes=1
