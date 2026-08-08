@@ -778,6 +778,13 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     return norm_out, residual_out
 
 
+def _supports_collective_topology(use_attn_tp_group: bool) -> bool:
+    """Whether one fused all-reduce covers every required reduction."""
+    return use_attn_tp_group or not (
+        get_parallel().moe_ep_size > 1 and get_parallel().moe_tp_size > 1
+    )
+
+
 @register_custom_op(
     mutates_args=["input_tensor", "residual", "weight"],
     fake_impl=fake_flashinfer_allreduce_residual_rmsnorm,
@@ -821,6 +828,11 @@ def flashinfer_allreduce_residual_rmsnorm(
     if use_attn_tp_group:
         world_size = get_parallel().attn_tp_size
     else:
+        # FlashInfer can fuse one collective. Hybrid expert + MoE tensor
+        # parallelism requires EP followed by MoE-TP, so defer both to the
+        # ordinary fallback instead of silently omitting the second reduction.
+        if not _supports_collective_topology(use_attn_tp_group=False):
+            return None, None
         if get_parallel().moe_ep_size > 1:
             world_size = get_parallel().moe_ep_size
         else:

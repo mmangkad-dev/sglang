@@ -53,7 +53,10 @@ from sglang.srt.layers.dp_attention import (
     is_enable_moe_cp_allgather,
     moe_cp_all_gather_into_tensor,
 )
-from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
+from sglang.srt.layers.flashinfer_comm_fusion import (
+    _supports_collective_topology,
+    is_flashinfer_allreduce_unavailable,
+)
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
@@ -522,36 +525,10 @@ class LayerCommunicator:
                 gathered_last_layer_output is residual
                 # An accumulator that copies on append already holds a snapshot.
                 and not getattr(captured_last_layer_outputs, "copies_on_append", False)
-                and not self._post_attn_residual_is_read_only(residual)
             ):
                 gathered_last_layer_output = residual.clone()
             captured_last_layer_outputs.append(gathered_last_layer_output)
         return hidden_states, residual
-
-    def _post_attn_residual_is_read_only(self, residual: torch.Tensor) -> bool:
-        """True if ``prepare_mlp``'s post-attention RMSNorm leaves ``residual``
-        untouched, so Eagle3 aux capture can keep its reference and skip the clone.
-
-        Only the flashinfer all-reduce-fusion path writes a fresh ``residual_out``
-        (see ``flashinfer_allreduce_residual_rmsnorm``); the aiter fused kernel and
-        every plain norm fold into ``residual`` in place. That path is reachable
-        only from the ``_gather_*`` communicate-fns, and only when they fall past
-        their input-scattered branch.
-        """
-        norm_fn = getattr(
-            self._communicate_with_all_reduce_and_layer_norm_fn,
-            "func",
-            self._communicate_with_all_reduce_and_layer_norm_fn,
-        )
-        uses_gather_norm = norm_fn in (
-            CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
-            CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual_moe,
-        )
-        return (
-            uses_gather_norm
-            and not get_attn_tp_context().input_scattered
-            and apply_flashinfer_allreduce_fusion(residual.shape[0])
-        )
 
     def prepare_attn(
         self,
@@ -829,6 +806,11 @@ class LayerCommunicator:
         # When mlp_mode is SCATTERED, the MLP runs on scattered data with no TP
         # all-reduce, so there is nothing to fuse with the next layer.
         if self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
+            return False
+
+        # FlashInfer fuses exactly one collective, while hybrid MoE parallelism
+        # requires EP followed by MoE-TP.
+        if not _supports_collective_topology(use_attn_tp_group=False):
             return False
 
         return (

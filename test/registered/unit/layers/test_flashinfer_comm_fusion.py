@@ -122,11 +122,26 @@ class TestFlashInferCommFusion(CustomTestCase):
         residual = torch.ones_like(x)
         weight = torch.ones(4)
 
-        for use_attn_tp_group, moe_ep_size, collective_name in (
-            (True, 1, "attention_tensor_model_parallel_all_reduce"),
-            (False, 2, "moe_expert_parallel_all_reduce"),
-            (False, 1, "moe_tensor_model_parallel_all_reduce"),
+        for use_attn_tp_group, moe_ep_size, moe_tp_size, collective_names in (
+            (True, 1, 2, ("attention_tensor_model_parallel_all_reduce",)),
+            (False, 2, 1, ("moe_expert_parallel_all_reduce",)),
+            (False, 1, 2, ("moe_tensor_model_parallel_all_reduce",)),
+            (
+                False,
+                2,
+                2,
+                (
+                    "moe_expert_parallel_all_reduce",
+                    "moe_tensor_model_parallel_all_reduce",
+                ),
+            ),
         ):
+            collective_calls = []
+
+            def all_reduce(tensor, *, name):
+                collective_calls.append(name)
+                return tensor * 2
+
             with (
                 self.subTest(
                     use_attn_tp_group=use_attn_tp_group,
@@ -139,13 +154,21 @@ class TestFlashInferCommFusion(CustomTestCase):
                     return_value=(None, None),
                 ),
                 patch(
-                    f"sglang.srt.distributed.{collective_name}",
-                    side_effect=lambda tensor: tensor * 2,
-                ) as all_reduce,
+                    "sglang.srt.distributed.attention_tensor_model_parallel_all_reduce",
+                    side_effect=lambda tensor: all_reduce(tensor, name="attention"),
+                ),
+                patch(
+                    "sglang.srt.distributed.moe_expert_parallel_all_reduce",
+                    side_effect=lambda tensor: all_reduce(tensor, name="ep"),
+                ),
+                patch(
+                    "sglang.srt.distributed.moe_tensor_model_parallel_all_reduce",
+                    side_effect=lambda tensor: all_reduce(tensor, name="moe_tp"),
+                ),
                 get_parallel().override(
                     attn_tp_size=2,
                     moe_ep_size=moe_ep_size,
-                    moe_tp_size=2,
+                    moe_tp_size=moe_tp_size,
                 ),
             ):
                 output = layernorm._forward_with_allreduce_fusion(
@@ -157,10 +180,109 @@ class TestFlashInferCommFusion(CustomTestCase):
                     use_attn_tp_group=use_attn_tp_group,
                 )
 
-            all_reduce.assert_called_once_with(x)
-            torch.testing.assert_close(norm.inputs[0], x * 2)
+            expected_calls = {
+                "attention_tensor_model_parallel_all_reduce": "attention",
+                "moe_expert_parallel_all_reduce": "ep",
+                "moe_tensor_model_parallel_all_reduce": "moe_tp",
+            }
+            self.assertEqual(
+                collective_calls, [expected_calls[name] for name in collective_names]
+            )
+            expected_x = x * (2 ** len(collective_names))
+            torch.testing.assert_close(norm.inputs[0], expected_x)
             self.assertIsNone(norm.inputs[2])
-            torch.testing.assert_close(output, x * 2 + residual)
+            torch.testing.assert_close(output, expected_x + residual)
+
+    def test_aiter_rejection_falls_back_to_full_tp(self):
+        """AITER rejection must retain the full TP collective it attempted to fuse."""
+        from sglang.srt.layers import layernorm
+
+        norm = types.SimpleNamespace(
+            variance_epsilon=1e-6,
+            forward=lambda x, residual, _post: (x, residual),
+        )
+        x = torch.ones(2, 4)
+        residual = torch.ones_like(x)
+
+        with (
+            patch.object(layernorm, "_use_aiter", True),
+            patch(
+                "sglang.srt.distributed.tensor_model_parallel_fused_allreduce_rmsnorm",
+                return_value=None,
+            ),
+            patch(
+                "sglang.srt.distributed.tensor_model_parallel_all_reduce",
+                side_effect=lambda tensor: tensor * 8,
+            ) as tp_all_reduce,
+            patch(
+                "sglang.srt.distributed.moe_expert_parallel_all_reduce"
+            ) as ep_all_reduce,
+            get_parallel().override(
+                tp_size=8,
+                attn_tp_size=1,
+                moe_ep_size=1,
+                moe_tp_size=1,
+            ),
+        ):
+            output, _ = layernorm._forward_with_allreduce_fusion(
+                norm_module=norm,
+                x=x,
+                residual=residual,
+                post_residual_addition=None,
+                weight=torch.ones(4),
+                use_attn_tp_group=False,
+            )
+
+        tp_all_reduce.assert_called_once_with(x)
+        ep_all_reduce.assert_not_called()
+        torch.testing.assert_close(output, x * 8)
+
+    def test_aux_capture_owns_snapshot_before_fallback_norm_mutation(self):
+        """Aux capture must survive a later in-place mutation of the residual."""
+        from sglang.srt.layers.communicator import LayerCommunicator
+
+        class _Accumulator:
+            copies_on_append = False
+
+            def __init__(self):
+                self.values = []
+
+            def append(self, value):
+                self.values.append(value)
+
+        communicator = LayerCommunicator.__new__(LayerCommunicator)
+        communicator.prepare_attn = lambda hidden, residual, *_args, **_kwargs: (
+            hidden,
+            residual,
+        )
+        communicator._communicate_simple_fn = (
+            lambda *, hidden_states, **_kwargs: hidden_states
+        )
+        communicator._context = None
+
+        residual = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        expected = residual.clone()
+        accumulator = _Accumulator()
+        _, returned_residual = communicator.prepare_attn_and_capture_last_layer_outputs(
+            hidden_states=torch.zeros_like(residual),
+            residual=residual,
+            forward_batch=None,
+            captured_last_layer_outputs=accumulator,
+        )
+
+        returned_residual.add_(100)
+        torch.testing.assert_close(accumulator.values[0], expected)
+        self.assertIsNot(accumulator.values[0], returned_residual)
+
+    def test_hybrid_moe_parallelism_rejects_single_collective_fusion(self):
+        """Hybrid EP+MoE-TP cannot use a fusion that performs only one reduction."""
+        with get_parallel().override(moe_ep_size=2, moe_tp_size=2):
+            self.assertFalse(
+                fusion._supports_collective_topology(use_attn_tp_group=False)
+            )
+            self.assertTrue(
+                fusion._supports_collective_topology(use_attn_tp_group=True)
+            )
 
     def test_auto_backend_resolves_by_arch(self):
         single_node = types.SimpleNamespace(
