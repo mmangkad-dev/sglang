@@ -808,14 +808,14 @@ class LayerCommunicator:
         if self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
             return False
 
-        # FlashInfer fuses exactly one collective, while hybrid MoE parallelism
-        # requires EP followed by MoE-TP.
-        if not _supports_collective_topology(use_attn_tp_group=False):
-            return False
-
         return (
             (
-                apply_flashinfer_allreduce_fusion(batch_size)
+                (
+                    apply_flashinfer_allreduce_fusion(batch_size)
+                    # FlashInfer fuses exactly one collective, while hybrid MoE
+                    # parallelism requires EP followed by MoE-TP.
+                    and _supports_collective_topology(use_attn_tp_group=False)
+                )
                 or (
                     _use_aiter
                     and batch_size > 0

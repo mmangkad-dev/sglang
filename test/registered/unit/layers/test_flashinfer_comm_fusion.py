@@ -284,6 +284,57 @@ class TestFlashInferCommFusion(CustomTestCase):
                 fusion._supports_collective_topology(use_attn_tp_group=True)
             )
 
+    def test_hybrid_moe_parallelism_keeps_aiter_fusion_eligible(self):
+        """FlashInfer's hybrid-topology restriction must not disable full-TP AITER."""
+        from sglang.srt.layers import communicator as communicator_module
+
+        communicator = communicator_module.LayerCommunicator.__new__(
+            communicator_module.LayerCommunicator
+        )
+        communicator._speculative_algo = None
+        communicator.layer_scatter_modes = types.SimpleNamespace(mlp_mode=object())
+        communicator.is_last_layer = False
+        communicator._context = types.SimpleNamespace(tp_size=8)
+        forward_batch = types.SimpleNamespace(
+            input_ids=torch.ones(4, dtype=torch.int64)
+        )
+
+        with (
+            patch.object(communicator_module, "_use_aiter", True),
+            patch.object(
+                communicator_module,
+                "apply_flashinfer_allreduce_fusion",
+                return_value=False,
+            ),
+            patch.object(
+                communicator_module, "is_enable_moe_cp_allgather", return_value=False
+            ),
+            patch.object(
+                communicator_module, "is_dp_attention_enabled", return_value=False
+            ),
+            patch.object(
+                communicator_module,
+                "get_attn_tp_context",
+                return_value=types.SimpleNamespace(input_scattered=False),
+            ),
+            patch.object(
+                communicator_module,
+                "get_moe_a2a_backend",
+                return_value=types.SimpleNamespace(is_none=lambda: True),
+            ),
+            patch.object(
+                communicator_module,
+                "get_exec",
+                return_value=types.SimpleNamespace(
+                    comm=types.SimpleNamespace(enable_aiter_allreduce_fusion=True)
+                ),
+            ),
+            get_parallel().override(tp_size=8, moe_ep_size=2, moe_tp_size=2),
+        ):
+            self.assertTrue(
+                communicator.should_fuse_mlp_allreduce_with_next_layer(forward_batch)
+            )
+
     def test_auto_backend_resolves_by_arch(self):
         single_node = types.SimpleNamespace(
             flashinfer_allreduce_fusion_backend="auto", nnodes=1
