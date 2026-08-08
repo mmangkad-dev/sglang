@@ -122,12 +122,16 @@ class TestFlashInferCommFusion(CustomTestCase):
         residual = torch.ones_like(x)
         weight = torch.ones(4)
 
-        for use_attn_tp_group, collective_name in (
-            (True, "tensor_model_parallel_all_reduce"),
-            (False, "moe_tensor_model_parallel_all_reduce"),
+        for use_attn_tp_group, moe_ep_size, collective_name in (
+            (True, 1, "attention_tensor_model_parallel_all_reduce"),
+            (False, 2, "moe_expert_parallel_all_reduce"),
+            (False, 1, "moe_tensor_model_parallel_all_reduce"),
         ):
             with (
-                self.subTest(use_attn_tp_group=use_attn_tp_group),
+                self.subTest(
+                    use_attn_tp_group=use_attn_tp_group,
+                    moe_ep_size=moe_ep_size,
+                ),
                 patch.object(layernorm, "_use_aiter", False),
                 patch.object(
                     fusion,
@@ -140,7 +144,7 @@ class TestFlashInferCommFusion(CustomTestCase):
                 ) as all_reduce,
                 get_parallel().override(
                     attn_tp_size=2,
-                    moe_ep_size=1,
+                    moe_ep_size=moe_ep_size,
                     moe_tp_size=2,
                 ),
             ):

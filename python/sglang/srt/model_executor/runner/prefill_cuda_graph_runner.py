@@ -1317,6 +1317,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
+        self._freeze_flashinfer_allreduce_workspaces()
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             with graph_capture() as graph_capture_context:
                 self.stream = graph_capture_context.stream

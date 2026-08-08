@@ -296,6 +296,16 @@ class BaseRunner(ABC):
 
         init_fi_a2a_workspace(get_parallel().dcp_group)
 
+    def _freeze_flashinfer_allreduce_workspaces(self) -> None:
+        if self.model_runner.server_args.flashinfer_allreduce_fusion_backend is None:
+            return
+
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            freeze_flashinfer_workspaces,
+        )
+
+        freeze_flashinfer_workspaces()
+
     def _flashinfer_autotune(self, *, buffers, batch_size):
         """Run flashinfer autotune.
 

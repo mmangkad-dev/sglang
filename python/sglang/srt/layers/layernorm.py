@@ -184,8 +184,9 @@ def _forward_with_allreduce_fusion(
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
+            attention_tensor_model_parallel_all_reduce,
+            moe_expert_parallel_all_reduce,
             moe_tensor_model_parallel_all_reduce,
-            tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
         from sglang.srt.layers.flashinfer_comm_fusion import (
@@ -225,11 +226,12 @@ def _forward_with_allreduce_fusion(
 
             # A fused backend may reject the shape or fail workspace setup.
             # Preserve the collective before falling back to ordinary RMSNorm.
-            all_reduce = (
-                tensor_model_parallel_all_reduce
-                if use_attn_tp_group
-                else moe_tensor_model_parallel_all_reduce
-            )
+            if use_attn_tp_group:
+                all_reduce = attention_tensor_model_parallel_all_reduce
+            elif get_parallel().moe_ep_size > 1:
+                all_reduce = moe_expert_parallel_all_reduce
+            else:
+                all_reduce = moe_tensor_model_parallel_all_reduce
             x = all_reduce(x)
             return norm_module.forward(x, residual, None)
 

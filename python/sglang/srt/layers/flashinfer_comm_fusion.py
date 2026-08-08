@@ -912,8 +912,9 @@ def pre_initialize_workspaces(
         use_attn_tp_group=True,
     )
 
-    # CUDA graphs captured after this point embed these workspaces' device
-    # addresses. Never replace either allocation during later eager forwards.
+
+def freeze_flashinfer_workspaces():
+    """Prevent graph-captured workspace addresses from being replaced."""
     _get_workspace_manager(use_attn_tp_group=False)._freeze()
     _get_workspace_manager(use_attn_tp_group=True)._freeze()
 
