@@ -1055,9 +1055,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
                 )
 
     if use_routed_topk:
-        packed_topk_ids = _get_packed_topk_ids_for_flashinfer_routed(topk_output)
+        topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights.to(torch.bfloat16)
         result = trtllm_fp4_block_scale_routed_moe(
-            topk_ids=packed_topk_ids,
+            topk_ids=(topk_ids, topk_weights),
             routing_bias=None,
             hidden_states=hs_fp4,
             hidden_states_scale=hs_scale,
@@ -1075,7 +1076,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             output2_scale_scalar=quant_info.g2_alphas,
             per_token_scale=per_token_scale,
             num_experts=quant_info.global_num_experts,
-            top_k=packed_topk_ids.shape[1],
+            top_k=topk_ids.shape[1],
             n_group=0,
             topk_group=0,
             intermediate_size=quant_info.intermediate_size_per_partition,
