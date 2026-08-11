@@ -219,6 +219,8 @@ def _per_token_group_quant_8bit_raw(
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
+    output_q: Optional[torch.Tensor] = None,
+    output_s: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Function to perform per-token-group quantization on an input tensor `x`.
 
@@ -253,15 +255,20 @@ def _per_token_group_quant_8bit_raw(
         bit8_max = info.max
         bit8_min = info.min
 
-    x_q = torch.empty_like(x, device=x.device, dtype=dtype)
-    x_s = create_per_token_group_quant_fp8_output_scale(
-        x_shape=x.shape,
-        device=x.device,
-        group_size=group_size,
-        column_major_scales=column_major_scales,
-        scale_tma_aligned=scale_tma_aligned,
-        scale_ue8m0=False,
-    )
+    x_q = output_q
+    if x_q is None:
+        x_q = torch.empty_like(x, device=x.device, dtype=dtype)
+    if output_s is None or scale_ue8m0:
+        x_s = create_per_token_group_quant_fp8_output_scale(
+            x_shape=x.shape,
+            device=x.device,
+            group_size=group_size,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=False,
+        )
+    else:
+        x_s = output_s
 
     M = x.numel() // group_size
     N = group_size
@@ -313,6 +320,9 @@ def _per_token_group_quant_8bit_raw(
             recipe=(1, group_size, group_size),
             is_sfa=True,
         )
+        if output_s is not None:
+            output_s.copy_(x_s)
+            x_s = output_s
 
     return x_q, x_s
 
@@ -325,6 +335,8 @@ def _per_token_group_quant_8bit_fuse_silu_and_mul(
     scale_tma_aligned: bool,
     scale_ue8m0: bool,
     masked_m: Optional[torch.Tensor],
+    output_q: Optional[torch.Tensor] = None,
+    output_s: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # Another way to implement (can be used in e.g. comparison tests)
     # from sgl_kernel import silu_and_mul
@@ -354,11 +366,18 @@ def _per_token_group_quant_8bit_fuse_silu_and_mul(
         masked_m = torch.tensor([num_tokens], device=x.device, dtype=torch.int32)
 
     # Use `zeros` for easier testing
-    output = torch.zeros(
-        (*x.shape[:-1], x.shape[-1] // 2),
-        device=x.device,
-        dtype=dst_dtype,
-    )
+    output = output_q
+    if output is None:
+        output = torch.zeros(
+            (*x.shape[:-1], x.shape[-1] // 2),
+            device=x.device,
+            dtype=dst_dtype,
+        )
+    elif needs_unsqueeze:
+        output = output.unsqueeze(0)
+        output.zero_()
+    else:
+        output.zero_()
     # Use `zeros` for easier testing
     output_scale_for_kernel = torch.zeros(
         (*x.shape[:-1], x.shape[-1] // 2 // group_size),
@@ -387,6 +406,10 @@ def _per_token_group_quant_8bit_fuse_silu_and_mul(
         output = output.squeeze(0)
         output_scale = output_scale.squeeze(0)
 
+    if output_s is not None:
+        output_s.copy_(output_scale)
+        output_scale = output_s
+
     return output, output_scale
 
 
@@ -400,6 +423,8 @@ def per_token_group_quant_8bit(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    output_q: Optional[torch.Tensor] = None,
+    output_s: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if fuse_silu_and_mul:
         return _per_token_group_quant_8bit_fuse_silu_and_mul(
@@ -410,6 +435,8 @@ def per_token_group_quant_8bit(
             scale_tma_aligned=scale_tma_aligned,
             scale_ue8m0=scale_ue8m0,
             masked_m=masked_m,
+            output_q=output_q,
+            output_s=output_s,
         )
     else:
         return _per_token_group_quant_8bit_raw(
@@ -420,6 +447,8 @@ def per_token_group_quant_8bit(
             scale_tma_aligned=scale_tma_aligned,
             scale_ue8m0=scale_ue8m0,
             dtype=dst_dtype,
+            output_q=output_q,
+            output_s=output_s,
         )
 
 
@@ -481,8 +510,8 @@ def create_per_token_group_quant_fp8_output_scale(
         )
 
 
-# AOT v2 (the MUSA path) runtime-switches on these; the JIT
-# per_token_group_quant kernel also templates on 256.
+# The MUSA Triton path supports these sizes; the CUDA JIT
+# per_token_group_quant kernel additionally templates on 256.
 _MUSA_KERNEL_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128)
 _V3_KERNEL_SUPPORTED_GROUP_SIZES = (16, 32, 64, 128, 256)
 
@@ -502,8 +531,8 @@ def _run_per_token_group_quant_8bit_kernel(
 ) -> None:
     """Quantize into caller-owned ``x_q`` / ``x_s``.
 
-    CUDA routes to the JIT per_token_group_quant kernel; MUSA stays on the AOT
-    v2 op (the JIT kernel is CUDA-only), and the fp32-pow-2 storage flavor of
+    CUDA routes to the JIT per_token_group_quant kernel; MUSA uses the Triton
+    implementation with these caller-owned outputs, and the fp32-pow-2 storage flavor of
     row-major UE8M0 (float32 ``x_s``, deep_gemm ``ceil_to_ue8m0`` convention)
     stays on the JIT v2 baseline — per_token_group_quant only packs UE8M0 as
     int32. The kernel bakes the quant constants in at compile time, so
@@ -532,7 +561,7 @@ def _run_per_token_group_quant_8bit_kernel(
         return
 
     if _is_musa:
-        quantized, scales = per_token_group_quant_8bit(
+        per_token_group_quant_8bit(
             x=x,
             group_size=group_size,
             dst_dtype=x_q.dtype,
@@ -542,9 +571,9 @@ def _run_per_token_group_quant_8bit_kernel(
             scale_ue8m0=scale_ue8m0,
             fuse_silu_and_mul=fuse_silu_and_mul,
             masked_m=masked_m,
+            output_q=x_q,
+            output_s=x_s,
         )
-        x_q.copy_(quantized)
-        x_s.copy_(scales)
         return
 
     assert (
@@ -591,6 +620,22 @@ def sglang_per_token_group_quant_fp8(
         # kernel (same [T, 1] scale shape) instead of a group kernel that
         # would need arbitrary group sizes.
         return sglang_per_token_quant_fp8(x)
+
+    if _is_musa and x.shape[0] > 0:
+        # The Triton implementation owns its result buffers on MUSA. Return
+        # them directly instead of allocating destination buffers first and
+        # copying the generated tensors into them.
+        return per_token_group_quant_8bit(
+            x=x,
+            group_size=group_size,
+            dst_dtype=fp8_dtype,
+            eps=eps,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=scale_ue8m0,
+            fuse_silu_and_mul=fuse_silu_and_mul,
+            masked_m=masked_m,
+        )
 
     out_shape = (*x.shape[:-1], x.shape[-1] // (2 if fuse_silu_and_mul else 1))
 

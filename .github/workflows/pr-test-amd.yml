@@ -282,7 +282,6 @@ jobs:
           run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_activation.py
           run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_topk.py
           run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_kvcacheio.py
-          run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_moe_topk_sigmoid.py
           run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_torch_defaults_reset.py
           exit $failures
 

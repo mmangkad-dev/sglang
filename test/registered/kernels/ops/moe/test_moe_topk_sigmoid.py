@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.moe.moe_topk_sigmoid import topk_sigmoid
+from sglang.srt.layers.moe.topk import _topk_sigmoid_torch_out
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -44,6 +45,21 @@ NUM_TOKENS = NUM_TOKENS_CI if _is_ci else NUM_TOKENS_FULL
 NUM_EXPERTS = NUM_EXPERTS_CI if _is_ci else NUM_EXPERTS_FULL
 TOPK_LIST = TOPK_CI if _is_ci else TOPK_FULL
 DTYPES = DTYPES_CI if _is_ci else DTYPES_FULL
+
+
+def test_torch_fallback_preserves_fp32_sigmoid_routing():
+    """BF16 sigmoid rounding must not collapse distinct routing logits into a tie."""
+    gating_output = torch.tensor(
+        [[-1.0, -0.99609375]], dtype=torch.bfloat16, device="cuda"
+    )
+    topk_weights = torch.empty((1, 1), dtype=torch.float32, device="cuda")
+    topk_ids = torch.empty((1, 1), dtype=torch.int32, device="cuda")
+
+    _topk_sigmoid_torch_out(topk_weights, topk_ids, gating_output)
+
+    assert topk_ids.item() == 1
+    expected_weight = gating_output.float().sigmoid()[0, 1]
+    torch.testing.assert_close(topk_weights[0, 0], expected_weight)
 
 
 # ---------------------------------------------------------------------------
