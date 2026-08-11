@@ -57,7 +57,6 @@ else:
         gptq_gemm,
         gptq_shuffle,
         int8_scaled_mm,
-        sgl_per_token_quant_fp8,
         shuffle_rows,
     )
     from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
@@ -137,6 +136,7 @@ else:
             musa_fused_moe_gemv,
             musa_fused_mul_add,
             musa_rotary_embedding_contiguous,
+            sgl_per_token_quant_fp8,
             top_k_top_p_sampling_from_probs,
         )
 
@@ -179,7 +179,6 @@ else:
         "rmsnorm",
         "rotary_embedding",
         "segment_packbits",
-        "sgl_per_token_quant_fp8",
         "shuffle_rows",
         "silu_and_mul",
         "top_k_renorm_prob",
@@ -197,6 +196,9 @@ else:
     if torch.version.hip is not None:
         _DEBUG_EXPORT_NAMES.append("gelu_quick")
         _DEBUG_EXPORT_NAMES.append("deepseek_v4_topk_transform_512")
+
+    if hasattr(torch.version, "musa") and torch.version.musa is not None:
+        _DEBUG_EXPORT_NAMES.append("sgl_per_token_quant_fp8")
 
     for _name in _DEBUG_EXPORT_NAMES:
         if _name in globals():

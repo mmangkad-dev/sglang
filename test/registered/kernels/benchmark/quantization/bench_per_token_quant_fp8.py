@@ -1,5 +1,4 @@
 import torch
-from sgl_kernel import sgl_per_token_quant_fp8 as aot_per_token_quant_fp8
 
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_random
@@ -15,16 +14,25 @@ def _jit_quant(input, output, scale):
     per_token_quant_fp8(input, output, scale)
 
 
+def _torch_quant(input, output, scale):
+    row_max = input.float().abs().amax(dim=1)
+    row_scale = row_max / torch.finfo(torch.float8_e4m3fn).max
+    scale_inv = torch.where(row_scale == 0, 0, row_scale.reciprocal())
+    quantized = (input.float() * scale_inv.unsqueeze(1)).clamp(-448.0, 448.0)
+    output.copy_(quantized.to(output.dtype))
+    scale.copy_(row_scale.unsqueeze(1))
+
+
 FN_MAP = {
     "jit": _jit_quant,
-    "aot": aot_per_token_quant_fp8,
+    "torch": _torch_quant,
 }
 
 
 @marker.parametrize("num_tokens", [1, 39, 128, 512, 1392, 7807], [39, 1392])
 @marker.parametrize("hidden_dim", [512, 1076, 1368, 1536, 2048, 4096], [1536])
 @marker.parametrize("dtype", [torch.float16, torch.bfloat16])
-@marker.benchmark("impl", ["jit", "aot"])
+@marker.benchmark("impl", ["jit", "torch"])
 def benchmark(num_tokens: int, hidden_dim: int, dtype: torch.dtype, impl: str):
     input = create_random(num_tokens, hidden_dim, dtype=dtype)
     output = torch.empty_like(input, dtype=torch.float8_e4m3fn)

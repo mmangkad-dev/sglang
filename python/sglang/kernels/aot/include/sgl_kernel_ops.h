@@ -233,7 +233,9 @@ torch::Tensor fp8_scaled_mm(
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype,
     const c10::optional<torch::Tensor>& bias);
+#ifdef USE_MUSA
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
+#endif
 
 torch::Tensor gptq_gemm(
     torch::Tensor a,

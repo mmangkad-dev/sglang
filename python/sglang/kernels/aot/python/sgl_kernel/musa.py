@@ -4,6 +4,14 @@ import torch
 from sgl_kernel.utils import _to_tensor_scalar_tuple
 
 
+def sgl_per_token_quant_fp8(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+) -> None:
+    torch.ops.sgl_kernel.sgl_per_token_quant_fp8.default(input, output_q, output_s)
+
+
 def musa_batched_rotary_embedding_contiguous(
     positions: torch.Tensor,
     query: torch.Tensor,

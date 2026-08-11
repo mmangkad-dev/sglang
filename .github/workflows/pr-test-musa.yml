@@ -217,7 +217,7 @@ jobs:
       - name: Run sgl-kernel test
         timeout-minutes: 20
         run: |
-          pytest python/sglang/kernels/aot/tests/test_per_token_quant_fp8.py
+          pytest python/sglang/kernels/aot/tests/test_per_token_quant_fp8_musa.py
           pytest python/sglang/kernels/aot/tests/test_per_token_group_quant_musa.py
           pytest python/sglang/kernels/aot/tests/speculative/test_eagle_utils.py
           pytest python/sglang/kernels/aot/tests/speculative/test_ngram_utils.py

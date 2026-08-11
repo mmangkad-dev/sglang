@@ -2,7 +2,6 @@ import sys
 
 import pytest
 import torch
-from sgl_kernel import sgl_per_token_quant_fp8 as aot_per_token_quant_fp8
 
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.kernels.ops.quantization.per_token_quant_fp8 import per_token_quant_fp8
@@ -13,14 +12,19 @@ register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="4-gpu-b
 register_cuda_ci(est_time=30, stage="nightly", runner_config="1-gpu-large")
 
 
-def _run_impl(input: torch.Tensor, *, use_jit: bool):
+def _run_jit(input: torch.Tensor):
     output = torch.empty_like(input, dtype=torch.float8_e4m3fn)
     scale = torch.empty((input.shape[0], 1), dtype=torch.float32, device="cuda")
-    if use_jit:
-        per_token_quant_fp8(input, output, scale)
-    else:
-        aot_per_token_quant_fp8(input, output, scale)
+    per_token_quant_fp8(input, output, scale)
     return output, scale
+
+
+def _torch_reference(input: torch.Tensor):
+    row_max = input.float().abs().amax(dim=1)
+    scale = row_max / torch.finfo(torch.float8_e4m3fn).max
+    scale_inv = torch.where(scale == 0, 0, scale.reciprocal())
+    output = (input.float() * scale_inv.unsqueeze(1)).clamp(-448.0, 448.0)
+    return output.to(torch.float8_e4m3fn), scale.unsqueeze(1)
 
 
 def _assert_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor):
@@ -34,36 +38,38 @@ def _warp_dispatch_num_tokens() -> int:
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("dispatch", ["cta", "warp"])
 @pytest.mark.parametrize("hidden_dim", [1076, 1368])
-def test_per_token_quant_fp8_is_bit_exact(dtype, dispatch, hidden_dim):
-    """The JIT migration must preserve every output and scale bit from AOT."""
+def test_per_token_quant_fp8_matches_torch(dtype, dispatch, hidden_dim):
+    """The JIT kernel must match FP32 row-wise reference quantization."""
     num_tokens = 39 if dispatch == "cta" else _warp_dispatch_num_tokens()
     input = torch.rand((num_tokens, hidden_dim), dtype=dtype, device="cuda")
 
-    actual_output, actual_scale = _run_impl(input, use_jit=True)
-    expected_output, expected_scale = _run_impl(input, use_jit=False)
+    actual_output, actual_scale = _run_jit(input)
+    expected_output, expected_scale = _torch_reference(input)
 
-    _assert_bitwise_equal(actual_scale, expected_scale)
-    _assert_bitwise_equal(actual_output, expected_output)
+    torch.testing.assert_close(actual_scale, expected_scale, rtol=1e-6, atol=0)
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), rtol=0.125, atol=0.0625
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("dispatch", ["cta", "warp"])
-def test_per_token_quant_fp8_zero_rows_are_bit_exact(dtype, dispatch):
-    """Zero-scale behavior differs by legacy dispatch and must remain unchanged."""
+def test_per_token_quant_fp8_zero_rows(dtype, dispatch):
+    """Pin the legacy zero-scale behavior of each launch strategy."""
     num_tokens = 1 if dispatch == "cta" else _warp_dispatch_num_tokens()
     input = torch.zeros((num_tokens, 512), dtype=dtype, device="cuda")
 
-    actual_output, actual_scale = _run_impl(input, use_jit=True)
-    expected_output, expected_scale = _run_impl(input, use_jit=False)
+    actual_output, actual_scale = _run_jit(input)
 
-    _assert_bitwise_equal(actual_scale, expected_scale)
-    _assert_bitwise_equal(actual_output, expected_output)
+    assert torch.count_nonzero(actual_scale) == 0
+    expected_value = 448.0 if dispatch == "cta" else 0.0
+    assert torch.all(actual_output.float() == expected_value)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("dispatch", ["cta", "warp"])
-def test_per_token_quant_fp8_midpoints_are_bit_exact(dtype, dispatch):
-    """FP8 rounding ties must select the same representable value as AOT."""
+def test_per_token_quant_fp8_midpoints_match_torch(dtype, dispatch):
+    """FP8 rounding ties must select the reference representable value."""
     num_tokens = 1 if dispatch == "cta" else _warp_dispatch_num_tokens()
     midpoint_values = torch.tensor(
         [448.0, 1.0625, 1.1875, 1.375, -1.0625, -1.1875, -1.375],
@@ -74,10 +80,10 @@ def test_per_token_quant_fp8_midpoints_are_bit_exact(dtype, dispatch):
         :, :512
     ].contiguous()
 
-    actual_output, actual_scale = _run_impl(input, use_jit=True)
-    expected_output, expected_scale = _run_impl(input, use_jit=False)
+    actual_output, actual_scale = _run_jit(input)
+    expected_output, expected_scale = _torch_reference(input)
 
-    _assert_bitwise_equal(actual_scale, expected_scale)
+    torch.testing.assert_close(actual_scale, expected_scale, rtol=1e-6, atol=0)
     _assert_bitwise_equal(actual_output, expected_output)
 
 
@@ -88,7 +94,7 @@ def test_scaled_fp8_quant_accepts_padded_outputs():
     output, scale = scaled_fp8_quant(
         input, num_token_padding=17, use_per_token_if_dynamic=True
     )
-    expected_output, expected_scale = _run_impl(input, use_jit=False)
+    expected_output, expected_scale = _run_jit(input)
 
     assert output.shape == (17, 512)
     assert scale.shape == (17, 1)

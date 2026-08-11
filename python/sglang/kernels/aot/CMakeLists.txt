@@ -272,7 +272,6 @@ set(SOURCES
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/fp8_gemm_kernel.cu"
     "csrc/gemm/int8_gemm_kernel.cu"
-    "csrc/gemm/per_token_quant_fp8.cu"
     "csrc/gemm/gptq/gptq_kernel.cu"
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu"
 
