@@ -186,7 +186,40 @@ if _is_cuda or _is_hip or _is_xpu:
         # XPU has no tvm_ffi, so the CUDA JIT topk_sigmoid isn't reachable;
         # use the AOT symbols from sgl_kernel directly. topk_sigmoid was aligned
         # with the post-#28715 CUDA signature in sgl-kernel-xpu#285.
-        from sgl_kernel import topk_sigmoid, topk_softmax
+        from sgl_kernel import topk_softmax
+
+        def topk_sigmoid(
+            topk_weights,
+            topk_ids,
+            gating_output,
+            renormalize=False,
+            correction_bias=None,
+            routed_scaling_factor=1.0,
+            num_fused_shared_experts=0,
+        ):
+            if num_fused_shared_experts:
+                raise ValueError(
+                    "XPU sigmoid top-k does not support fused shared experts"
+                )
+            scores = gating_output.sigmoid()
+            scores_for_choice = (
+                scores
+                if correction_bias is None
+                else scores + correction_bias.unsqueeze(0)
+            )
+            _, selected_ids = torch.topk(
+                scores_for_choice, k=topk_ids.shape[-1], dim=-1, sorted=True
+            )
+            selected_weights = scores.gather(1, selected_ids)
+            if renormalize:
+                selected_weights = selected_weights / selected_weights.sum(
+                    dim=-1, keepdim=True
+                )
+            topk_ids.copy_(selected_ids.to(topk_ids.dtype))
+            topk_weights.copy_(
+                selected_weights.to(topk_weights.dtype) * routed_scaling_factor
+            )
+
     else:
         from sglang.kernels.ops.moe import topk_softmax
 

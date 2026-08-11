@@ -69,9 +69,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("gelu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("gelu_and_mul", torch::kMUSA, &gelu_and_mul);
 
-  m.def("concat_mla_k(Tensor! k, Tensor k_nope, Tensor k_rope) -> ()");
-  m.impl("concat_mla_k", torch::kMUSA, &concat_mla_k);
-
   m.def(
       "rotary_embedding(Tensor positions, Tensor! query,"
       "                 Tensor!? key, int head_size,"
@@ -83,16 +80,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
    */
   m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
   m.impl("awq_dequantize", torch::kMUSA, &awq_dequantize);
-
-  m.def(
-      "sgl_per_token_group_quant_8bit(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
-      " float eps, float fp8_min, float fp8_max, bool scale_ue8m0) -> ()");
-  m.impl("sgl_per_token_group_quant_8bit", torch::kMUSA, &sgl_per_token_group_quant_8bit);
-
-  m.def(
-      "sgl_per_token_group_quant_8bit_v2(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
-      " float eps, float fp8_min, float fp8_max, bool scale_ue8m0, bool fuse_silu_and_mul, Tensor? masked_m) -> ()");
-  m.impl("sgl_per_token_group_quant_8bit_v2", torch::kMUSA, &sgl_per_token_group_quant_8bit_v2);
 
   m.def("sgl_per_token_quant_fp8(Tensor input, Tensor output_q, Tensor output_s) -> ()");
   m.impl("sgl_per_token_quant_fp8", torch::kMUSA, &sgl_per_token_quant_fp8);

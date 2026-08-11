@@ -55,10 +55,6 @@ if _is_cuda or _is_musa:
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
 
-if _is_musa:
-    # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
-    from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
-
 if _is_hip:
     _has_vllm = False
     if _use_aiter:
@@ -78,24 +74,6 @@ if _is_hip:
         except ImportError:
             # Fallback: vllm not available, will use native PyTorch implementation
             _has_vllm = False
-
-if _is_musa:
-
-    @register_fake_if_exists("sgl_kernel::sgl_per_token_group_quant_8bit_v2")
-    def _(
-        input,
-        output_q,
-        output_s,
-        group_size,
-        eps,
-        fp8_min,
-        fp8_max,
-        scale_ue8m0,
-        fuse_silu_and_mul,
-        masked_m,
-    ):
-        return
-
 
 logger = logging.getLogger(__name__)
 
@@ -554,19 +532,19 @@ def _run_per_token_group_quant_8bit_kernel(
         return
 
     if _is_musa:
-        sgl_per_token_group_quant_8bit(
-            x,
-            x_q,
-            x_s,
-            group_size,
-            eps,
-            fp8_min,
-            fp8_max,
-            scale_ue8m0,
-            fuse_silu_and_mul,
-            masked_m,
-            enable_v2=True,
+        quantized, scales = per_token_group_quant_8bit(
+            x=x,
+            group_size=group_size,
+            dst_dtype=x_q.dtype,
+            eps=eps,
+            column_major_scales=x_s.stride(-2) < x_s.stride(-1),
+            scale_tma_aligned=False,
+            scale_ue8m0=scale_ue8m0,
+            fuse_silu_and_mul=fuse_silu_and_mul,
+            masked_m=masked_m,
         )
+        x_q.copy_(quantized)
+        x_s.copy_(scales)
         return
 
     assert (

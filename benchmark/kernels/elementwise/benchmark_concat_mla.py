@@ -1,9 +1,9 @@
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel import concat_mla_k as concat_mla_k_cuda
 
 from sglang.benchmark.bench_utils import run_bench
+from sglang.kernels.ops.attention.concat_mla import concat_mla_k as concat_mla_k_cuda
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -143,9 +143,7 @@ output_exp = execute_and_get_output(fn_cuda, data)
 if not torch.all(output_ref == output_exp):
     abs_delta = torch.abs(output_ref - output_exp)
     raise AssertionError(
-        f"{output_ref=} {output_exp=} "
-        f"{abs_delta=} "
-        f"{torch.argwhere(abs_delta != 0.0)=} "
+        f"{output_ref=} {output_exp=} {abs_delta=} {torch.argwhere(abs_delta != 0.0)=} "
     )
 
 

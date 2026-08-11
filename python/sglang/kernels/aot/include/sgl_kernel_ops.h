@@ -154,8 +154,6 @@ void rotary_embedding(
     bool is_neox);
 
 void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
-void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
-void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out);
 
 void fast_topk_interface(
     const at::Tensor& score,
@@ -235,26 +233,6 @@ torch::Tensor fp8_scaled_mm(
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype,
     const c10::optional<torch::Tensor>& bias);
-void sgl_per_token_group_quant_8bit(
-    at::Tensor input,
-    at::Tensor output_q,
-    at::Tensor output_s,
-    int64_t group_size,
-    double eps,
-    double fp8_min,
-    double fp8_max,
-    bool scale_ue8m0);
-void sgl_per_token_group_quant_8bit_v2(
-    at::Tensor input,
-    at::Tensor output_q,
-    at::Tensor output_s,
-    int64_t group_size,
-    double eps,
-    double min_8bit,
-    double max_8bit,
-    bool scale_ue8m0,
-    bool fuse_silu_and_mul,
-    const std::optional<torch::Tensor>& masked_m);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
 
 torch::Tensor gptq_gemm(
@@ -288,13 +266,6 @@ void topk_softmax(
     torch::Tensor& gating_output,
     bool renormalize,
     double moe_softcapping,
-    const c10::optional<torch::Tensor>& correction_bias);
-
-void topk_sigmoid(
-    torch::Tensor& topk_weights,
-    torch::Tensor& topk_indices,
-    torch::Tensor& gating_output,
-    bool renormalize,
     const c10::optional<torch::Tensor>& correction_bias);
 
 void moe_sum_reduce(at::Tensor& input, at::Tensor& output, double routed_scaling_factor);
@@ -369,24 +340,6 @@ void dsv4_fused_q_indexer_rope_hadamard_quant(
     double weight_scale,
     const at::Tensor& freqs_cis,
     const at::Tensor& positions);
-
-void fused_qk_norm_rope(
-    torch::Tensor& qkv,
-    int64_t num_heads_q,
-    int64_t num_heads_k,
-    int64_t num_heads_v,
-    int64_t head_dim,
-    double eps,
-    torch::Tensor& q_weight,
-    torch::Tensor& k_weight,
-    double base,
-    bool is_neox,
-    torch::Tensor& position_ids,
-    double factor,
-    double low,
-    double high,
-    double attention_factor,
-    int64_t rotary_dim);
 
 /*
  * From csrc/moe/cutlass_moe/w4a8

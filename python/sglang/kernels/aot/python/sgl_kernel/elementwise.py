@@ -418,23 +418,3 @@ def rotary_embedding(
 
 def copy_to_gpu_no_ce(input: torch.Tensor, output: torch.Tensor):
     torch.ops.sgl_kernel.copy_to_gpu_no_ce(input, output)
-
-
-def concat_mla_k(
-    k: torch.Tensor,
-    k_nope: torch.Tensor,
-    k_rope: torch.Tensor,
-):
-    torch.ops.sgl_kernel.concat_mla_k(k, k_nope, k_rope)
-
-
-def concat_mla_absorb_q(
-    a: torch.Tensor,
-    b: torch.Tensor,
-):
-    *batch_dims, _ = a.shape
-    out = torch.empty(
-        (*batch_dims, a.shape[-1] + b.shape[-1]), device=a.device, dtype=a.dtype
-    )
-    torch.ops.sgl_kernel.concat_mla_absorb_q(a, b, out)
-    return out

@@ -1,8 +1,7 @@
 """
 Correctness tests for the moe_topk_sigmoid JIT kernel.
 
-Validates against a pure-PyTorch reference and, when sgl_kernel is available,
-cross-checks against the AOT implementation.
+Validates against a pure-PyTorch reference.
 """
 
 import itertools
@@ -17,13 +16,6 @@ from sglang.kernels.ops.moe.moe_topk_sigmoid import topk_sigmoid
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-
-try:
-    from sgl_kernel import topk_sigmoid as topk_sigmoid_aot
-
-    AOT_AVAILABLE = True
-except ImportError:
-    AOT_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # CI / full-range helpers
@@ -455,41 +447,6 @@ def test_fallback_non_power_of_two(num_experts):
     torch.testing.assert_close(
         topk_w.sum(dim=-1), torch.ones(num_tokens, device="cuda"), rtol=1e-4, atol=1e-4
     )
-
-
-# ---------------------------------------------------------------------------
-# Cross-validation against AOT sgl_kernel
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(not AOT_AVAILABLE, reason="sgl_kernel not available")
-@pytest.mark.parametrize(
-    "num_tokens, num_experts, topk",
-    list(itertools.product([1, 128, 1024], [8, 64, 128], [1, 4])),
-)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("renormalize", [False, True])
-def test_topk_sigmoid_vs_aot(num_tokens, num_experts, topk, dtype, renormalize):
-    if topk > num_experts:
-        pytest.skip("topk > num_experts")
-
-    torch.manual_seed(42)
-    gating = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
-
-    topk_w_jit = torch.empty((num_tokens, topk), dtype=torch.float32, device="cuda")
-    topk_i_jit = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
-    topk_sigmoid(topk_w_jit, topk_i_jit, gating, renormalize=renormalize)
-
-    topk_w_aot = torch.empty((num_tokens, topk), dtype=torch.float32, device="cuda")
-    topk_i_aot = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
-    topk_sigmoid_aot(topk_w_aot, topk_i_aot, gating, renormalize=renormalize)
-
-    assert torch.allclose(
-        topk_w_jit, topk_w_aot, atol=1e-3, rtol=1e-3
-    ), f"JIT vs AOT weight mismatch (dtype={dtype}, n_exp={num_experts}, topk={topk})"
-    assert torch.equal(
-        topk_i_jit, topk_i_aot
-    ), f"JIT vs AOT index mismatch (dtype={dtype}, n_exp={num_experts}, topk={topk})"
 
 
 if __name__ == "__main__":

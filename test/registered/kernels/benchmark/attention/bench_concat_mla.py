@@ -3,8 +3,6 @@ import itertools
 import torch
 import triton
 import triton.testing
-from sgl_kernel import concat_mla_absorb_q as aot_absorb_q
-from sgl_kernel import concat_mla_k as aot_k
 
 from sglang.kernels.jit.benchmark.utils import run_benchmark
 from sglang.kernels.ops.attention.concat_mla import concat_mla_absorb_q as jit_absorb_q
@@ -30,10 +28,6 @@ DTYPE = torch.bfloat16
 DEVICE = "cuda"
 
 
-def aot_concat_mla_k(k, k_nope, k_rope):
-    aot_k(k, k_nope, k_rope)
-
-
 def jit_concat_mla_k(k, k_nope, k_rope):
     jit_k(k, k_nope, k_rope)
 
@@ -42,10 +36,6 @@ def torch_concat_mla_k(k, k_nope, k_rope):
     nope_head_dim = k_nope.shape[-1]
     k[:, :, :nope_head_dim] = k_nope
     k[:, :, nope_head_dim:] = k_rope.expand(-1, k.shape[1], -1)
-
-
-def aot_concat_mla_absorb_q(a, b):
-    return aot_absorb_q(a, b)
 
 
 def jit_concat_mla_absorb_q(a, b):
@@ -63,9 +53,9 @@ if IS_CI:
 else:
     NUM_TOKENS_VALS = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
 
-K_LINE_VALS = ["aot", "jit", "torch"]
-K_LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "PyTorch"]
-K_STYLES = [("orange", "-"), ("blue", "--"), ("green", "-.")]
+K_LINE_VALS = ["jit", "torch"]
+K_LINE_NAMES = ["SGL JIT Kernel", "PyTorch"]
+K_STYLES = [("blue", "--"), ("green", "-.")]
 
 
 def _create_concat_mla_k_data(num_tokens):
@@ -109,7 +99,6 @@ def bench_concat_mla_k(num_tokens: int, provider: str):
     k, k_nope, k_rope = _create_concat_mla_k_data(num_tokens)
 
     FN_MAP = {
-        "aot": aot_concat_mla_k,
         "jit": jit_concat_mla_k,
         "torch": torch_concat_mla_k,
     }
@@ -122,9 +111,9 @@ if IS_CI:
 else:
     ABSORB_Q_VALS = list(itertools.product([1, 4, 8, 16, 32], [1, 8, 32, 128]))
 
-Q_LINE_VALS = ["aot", "jit", "torch"]
-Q_LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "PyTorch"]
-Q_STYLES = [("orange", "-"), ("blue", "--"), ("green", "-.")]
+Q_LINE_VALS = ["jit", "torch"]
+Q_LINE_NAMES = ["SGL JIT Kernel", "PyTorch"]
+Q_STYLES = [("blue", "--"), ("green", "-.")]
 
 
 @triton.testing.perf_report(
@@ -150,10 +139,7 @@ def bench_concat_mla_absorb_q(dim_0: int, dim_1: int, provider: str):
         )
         fn = lambda: torch_concat_mla_absorb_q(a, b, out)
     else:
-        FN_MAP = {
-            "aot": aot_concat_mla_absorb_q,
-            "jit": jit_concat_mla_absorb_q,
-        }
+        FN_MAP = {"jit": jit_concat_mla_absorb_q}
         fn = lambda: FN_MAP[provider](a, b)
 
     return run_benchmark(fn)

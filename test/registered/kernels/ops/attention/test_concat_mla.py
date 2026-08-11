@@ -35,25 +35,6 @@ def torch_concat_mla_absorb_q(
     out[:, :, a_last_dim:] = b
 
 
-def sgl_kernel_concat_mla_k(
-    k: torch.Tensor, k_nope: torch.Tensor, k_rope: torch.Tensor
-) -> None:
-    """AOT compiled sgl_kernel implementation."""
-    from sgl_kernel import concat_mla_k
-
-    concat_mla_k(k, k_nope, k_rope)
-
-
-def sgl_kernel_concat_mla_absorb_q(
-    a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
-) -> None:
-    """AOT compiled sgl_kernel implementation."""
-    from sgl_kernel import concat_mla_absorb_q
-
-    result = concat_mla_absorb_q(a, b)  # AOT returns output
-    out.copy_(result)  # Copy to provided tensor for comparison
-
-
 def jit_concat_mla_k(
     k: torch.Tensor, k_nope: torch.Tensor, k_rope: torch.Tensor
 ) -> None:
@@ -111,27 +92,6 @@ def test_concat_mla_k_jit_vs_torch(num_tokens: int) -> None:
     triton.testing.assert_close(k_jit, k_torch, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("num_tokens", NUM_TOKENS_LIST)
-def test_concat_mla_k_jit_vs_aot(num_tokens: int) -> None:
-    """Test JIT kernel against AOT kernel for bitwise equivalence."""
-    k_jit = torch.empty(
-        num_tokens, NUM_LOCAL_HEADS, K_HEAD_DIM, device=DEVICE, dtype=DTYPE
-    )
-    k_aot = torch.empty(
-        num_tokens, NUM_LOCAL_HEADS, K_HEAD_DIM, device=DEVICE, dtype=DTYPE
-    )
-
-    k_nope = torch.randn(
-        num_tokens, NUM_LOCAL_HEADS, QK_NOPE_HEAD_DIM, device=DEVICE, dtype=DTYPE
-    )
-    k_rope = torch.randn(num_tokens, 1, QK_ROPE_HEAD_DIM, device=DEVICE, dtype=DTYPE)
-
-    sgl_kernel_concat_mla_k(k_aot, k_nope, k_rope)
-    jit_concat_mla_k(k_jit, k_nope, k_rope)
-
-    triton.testing.assert_close(k_jit, k_aot, atol=0, rtol=0)
-
-
 DIM_0_LIST = [1, 2, 4, 8, 16, 32]
 DIM_1_LIST = [1, 2, 4, 8, 16, 128]
 
@@ -151,23 +111,6 @@ def test_concat_mla_absorb_q_jit_vs_torch(dim_0: int, dim_1: int) -> None:
     jit_concat_mla_absorb_q(a, b, out_jit)
 
     triton.testing.assert_close(out_jit, out_torch, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize(
-    "dim_0,dim_1",
-    list(itertools.product(DIM_0_LIST, DIM_1_LIST)),
-)
-def test_concat_mla_absorb_q_jit_vs_aot(dim_0: int, dim_1: int) -> None:
-    """Test JIT kernel against AOT kernel for bitwise equivalence."""
-    a = torch.randn(dim_0, dim_1, A_LAST_DIM, device=DEVICE, dtype=DTYPE)
-    b = torch.randn(dim_0, dim_1, B_LAST_DIM, device=DEVICE, dtype=DTYPE)
-    out_jit = torch.empty(dim_0, dim_1, OUT_LAST_DIM, device=DEVICE, dtype=DTYPE)
-    out_aot = torch.empty(dim_0, dim_1, OUT_LAST_DIM, device=DEVICE, dtype=DTYPE)
-
-    sgl_kernel_concat_mla_absorb_q(a, b, out_aot)
-    jit_concat_mla_absorb_q(a, b, out_jit)
-
-    triton.testing.assert_close(out_jit, out_aot, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

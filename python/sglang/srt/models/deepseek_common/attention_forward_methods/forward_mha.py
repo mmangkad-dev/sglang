@@ -39,7 +39,10 @@ if _is_cuda:
 
     from sglang.kernels.ops.attention.concat_mla import concat_mla_k
 elif _is_musa:
-    from sgl_kernel import concat_mla_k
+
+    def concat_mla_k(k, k_nope, k_rope):
+        k[..., : k_nope.shape[-1]].copy_(k_nope)
+        k[..., k_nope.shape[-1] :].copy_(k_rope.expand_as(k[..., k_nope.shape[-1] :]))
 
 
 def resolve_attn_backend(forward_batch: ForwardBatch):
