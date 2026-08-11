@@ -21,14 +21,15 @@ _CUDA = frozenset({CapabilityRequirement.CUDA})
 register_kernel(
     KernelSpec(
         op="quantization.sgl_per_token_quant_fp8",
-        backend=KernelBackend.AOT,
-        target="sgl_kernel:sgl_per_token_quant_fp8",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.quantization.per_token_quant_fp8:per_token_quant_fp8",
+        capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("float8_e4m3fn",),
             in_place=True,
             description="per-token FP8 quantization into output_q/output_s",
         ),
-        description="Per-token FP8 quantization (sgl_kernel wheel).",
+        description="Per-token FP8 quantization (sglang.kernels.jit).",
     )
 )
 register_kernel(
@@ -57,7 +58,7 @@ def sgl_per_token_quant_fp8(
     output_s: torch.Tensor,
 ) -> None:
     """Per-token FP8 quantization, writing into ``output_q`` / ``output_s``."""
-    return get_kernel("quantization.sgl_per_token_quant_fp8", KernelBackend.AOT)(
+    return get_kernel("quantization.sgl_per_token_quant_fp8", KernelBackend.JIT)(
         input, output_q, output_s
     )
 

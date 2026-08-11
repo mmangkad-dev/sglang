@@ -117,6 +117,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "bias) -> Tensor");
   m.impl("fp8_scaled_mm", torch::kCUDA, &fp8_scaled_mm);
 
+  // Compatibility API: SGLang runtime dispatches to the JIT implementation,
+  // but external sgl_kernel consumers still rely on this exported CUDA op.
   m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s) -> ()");
   m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
 

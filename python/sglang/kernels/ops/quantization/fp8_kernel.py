@@ -38,7 +38,6 @@ from sglang.srt.utils import (
     log_info_on_rank0,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -46,7 +45,7 @@ _is_cpu = is_cpu()
 _is_musa = is_musa()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_cuda or _is_musa:
+if _is_cuda:
     from sglang.kernels.ops.quantization import (
         per_token_group_quant,
         sgl_per_token_quant_fp8,
@@ -55,6 +54,12 @@ if _is_cuda or _is_musa:
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
 
+if _is_musa:
+    from sgl_kernel import sgl_per_token_quant_fp8
+
+    from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
+        per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
+    )
 if _is_hip:
     _has_vllm = False
     if _use_aiter:
@@ -2214,10 +2219,3 @@ def triton_scaled_mm(
     )
 
     return result.to(out_dtype)
-
-
-if _is_cuda:
-
-    @register_fake_if_exists("sgl_kernel::sgl_per_token_quant_fp8")
-    def _(input, output_q, output_s):
-        return
