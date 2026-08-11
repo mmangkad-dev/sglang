@@ -1,6 +1,5 @@
 import pytest
 import torch
-from sgl_kernel import sgl_per_token_quant_fp8
 
 from sglang.srt.utils import is_musa
 
@@ -12,6 +11,8 @@ pytestmark = pytest.mark.skipif(not is_musa(), reason="MUSA-only AOT coverage")
 @pytest.mark.parametrize("hidden_dim", [512, 1076])
 def test_per_token_quant_fp8_musa_matches_torch(dtype, num_tokens, hidden_dim):
     """The retained MUSA AOT kernel must match FP32 row-wise quantization."""
+    from sgl_kernel import sgl_per_token_quant_fp8
+
     input = torch.rand(
         (num_tokens, hidden_dim), dtype=dtype, device=torch.device("musa")
     )
