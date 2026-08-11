@@ -212,8 +212,8 @@ def _topk_sigmoid_torch_out(
 if _is_cuda or _is_hip or _is_xpu:
     if _is_xpu:
         # XPU has no tvm_ffi, so the CUDA JIT topk_sigmoid isn't reachable;
-        # use the AOT symbols from sgl_kernel directly. topk_sigmoid was aligned
-        # with the post-#28715 CUDA signature in sgl-kernel-xpu#285.
+        # retain the AOT topk_softmax op but use the FP32 Torch fallback for
+        # sigmoid routing.
         from sgl_kernel import topk_softmax
 
         topk_sigmoid = _topk_sigmoid_torch_out
