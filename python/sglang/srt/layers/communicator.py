@@ -558,9 +558,9 @@ class LayerCommunicator:
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     # No capacity check, unlike the attention-TP site: the
                     # previous layer already skipped its all-reduce on a
-                    # pure-topology predicate, so this call has to happen either
-                    # way and forward_with_allreduce_fusion() does the collective
-                    # when the workspace declines.
+                    # pure-topology predicate, so this call must happen either
+                    # way. The helper does the collective when the shape is
+                    # declined.
                     quant_result = None
                     if (
                         self.enable_fused_ar_quant
@@ -818,11 +818,10 @@ class LayerCommunicator:
             (
                 (
                     apply_flashinfer_allreduce_fusion(batch_size)
-                    # should_skip_post_experts_all_reduce() drops both the _MOE_EP
-                    # and _MOE_TP reductions once fusion is published, so one
-                    # fused reduce would cover half the peers and silently
-                    # under-reduce. AITER is exempt: it reduces over the whole TP
-                    # group, the same sum when those groups partition TP.
+                    # Publishing fusion makes should_skip_post_experts_all_reduce()
+                    # drop both the _MOE_EP and _MOE_TP reductions, so one fused
+                    # reduce would cover half the peers. AITER reduces over the
+                    # whole TP group -- the same sum -- so it is exempt.
                     and supports_collective_topology(use_attn_tp_group=False)
                 )
                 or (

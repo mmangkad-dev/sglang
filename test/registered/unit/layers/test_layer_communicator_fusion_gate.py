@@ -86,7 +86,7 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
 
     def test_hybrid_ep_tp_still_fuses_under_aiter(self):
         """AITER reduces over the whole TP group, the same sum as EP then MoE-TP,
-        so the FlashInfer-only restriction must not disable it."""
+        so the FlashInfer-only restriction must not reach it."""
         self.assertTrue(self._should_fuse(moe_ep_size=2, moe_tp_size=2, aiter=True))
 
 

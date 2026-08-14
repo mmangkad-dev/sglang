@@ -61,9 +61,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Floor for the FlashInfer all-reduce fusion workspace, matching what the old
-# fixed cap asked for. See _pre_initialize_flashinfer_allreduce_workspace for why
-# it stays small rather than tracking the largest captured shape.
+# Floor for the FlashInfer all-reduce fusion workspace. See
+# _pre_initialize_flashinfer_allreduce_workspace for why it stays small.
 _MIN_FUSION_WORKSPACE_TOKENS = 2048
 
 
@@ -279,19 +278,13 @@ class BaseRunner(ABC):
 
         from sglang.srt.layers.flashinfer_comm_fusion import pre_initialize_workspaces
 
-        # Deliberately *not* sized to the largest captured prefill. MNNVL clears
+        # Deliberately *not* sized to the largest captured prefill: MNNVL clears
         # its lamport buffers in proportion to the allocation rather than the
-        # message, so a bigger workspace slows every all-reduce through it: on
-        # 4xGB300 (TP=4, bf16, hidden=2880) a 178,956,288-byte buffer cost
-        # 36.08us fused against 42.49us at 357,913,248 for the same 2048-token
-        # workload -- more than fusing the RMSNorm saves.
-        #
-        # Ask for little and let the gate spend what allocator rounding gives
-        # away: fusion is gated on whether the buffer covers the shape, not on
-        # this number, and MNNVL's floor already covers ~15.5k rows at
-        # hidden=2880. Larger shapes fall back to an ordinary all-reduce. The
-        # floor also keeps trtllm, whose allocation scales linearly with this,
-        # near its previous footprint.
+        # message, so a bigger workspace slows every all-reduce through it by more
+        # than fusing the RMSNorm saves. Ask for little instead -- fusion is gated
+        # on whether the buffer covers the shape, not on this number, and rounding
+        # usually covers far more than requested. This also bounds trtllm, whose
+        # allocation scales linearly with it.
         max_token_num = max(mr.max_decode_logits_rows(), _MIN_FUSION_WORKSPACE_TOKENS)
 
         pre_initialize_workspaces(

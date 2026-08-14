@@ -89,7 +89,7 @@ def _torch_allreduce_residual_rmsnorm_baseline(
 
 class TestFlashInferCommFusion(CustomTestCase):
     def test_alignment_retry_finds_a_usable_granularity_step(self):
-        """A 32B-misaligned lamport buffer faults the TWOSHOT kernel at runtime."""
+        """A misaligned lamport buffer faults the TWOSHOT kernel at runtime."""
 
         class _Workspace:
             def __init__(self, backend, buffer_size_bytes):
@@ -104,7 +104,7 @@ class TestFlashInferCommFusion(CustomTestCase):
         for name, backend, sizes, expected_requests in (
             ("already aligned", "mnnvl", [GOOD], [16384]),
             ("quarter step clears it", "mnnvl", [BAD, GOOD], [16384, 20480]),
-            # +25% landed on the same buffer, so the next attempt must double.
+            # The grown request landed on the same buffer, so it must double.
             ("doubles when stuck", "mnnvl", [BAD, BAD, GOOD], [16384, 20480, 40960]),
             # trtllm sizes its buffer differently; the check must not apply.
             ("trtllm exempt", "trtllm", [BAD], [16384]),
@@ -178,7 +178,7 @@ class TestFlashInferCommFusion(CustomTestCase):
                 (None, None),
                 False,
             ),
-            # Freezing removed initialize()'s ability to self-heal a group change.
+            # A frozen workspace cannot be rebuilt on a different group.
             ("other group", torch.zeros(64, 7168, dtype=bf16), ("a", "b"), False),
         ):
             manager.group = group_key
@@ -196,11 +196,11 @@ class TestFlashInferCommFusion(CustomTestCase):
                 )
 
     def test_coverage_probe_reports_a_contiguous_bound(self):
-        """MNNVL coverage holes below the one-shot threshold must not be skipped.
+        """A coverage hole around the strategy switch must not be stepped over.
 
-        ONESHOT needs tp copies of the payload where TWOSHOT needs 2, so for
-        tp > 2 the requirement drops at the switch and a small buffer hides a band
-        of unsupported rows that bisection alone would step over.
+        The small-payload strategy needs a copy per rank where the other needs
+        two, so the requirement can drop at the switch and a small buffer hides a
+        band of unsupported rows beneath a supported region.
         """
         hidden_dim, tp, elem = 2880, 4, 2
         one_shot_threshold = 1024 * 1024
@@ -223,10 +223,10 @@ class TestFlashInferCommFusion(CustomTestCase):
                 hidden_dim=hidden_dim, dtype=torch.bfloat16
             )
 
-        # 768 KiB: rows 1-34 fit, 35-45 do not, 46-68 fit again. Bound is 34.
+        # Small buffer: rows 1-34 fit, 35-45 do not, 46-68 fit again -> 34.
         self.assertEqual(probe(768 * 1024), 34)
-        # The real floor is ~170x the threshold, so the switch is inside the
-        # covered region and the bound is exact.
+        # A realistic buffer puts the switch inside the covered region, so the
+        # bound is the true maximum.
         self.assertEqual(probe(178956288), 15532)
 
     def test_frozen_workspace_is_not_replaced_for_larger_shape(self):
@@ -254,7 +254,7 @@ class TestFlashInferCommFusion(CustomTestCase):
         self.assertIs(manager.workspace, workspace)
 
     def test_gate_has_no_batch_size_cap(self):
-        """A reintroduced cap would silently undo this change."""
+        """The gate must not impose a batch-size ceiling of its own."""
         from sglang.srt.layers import communicator as communicator_module
 
         with (
@@ -273,7 +273,8 @@ class TestFlashInferCommFusion(CustomTestCase):
             ),
         ):
             gate = communicator_module.apply_flashinfer_allreduce_fusion
-            # 2048 was the old cap: both sides of it must now behave alike.
+            # Either side of a plausible ceiling must behave alike; only an empty
+            # batch is rejected.
             self.assertTrue(gate(2048))
             self.assertTrue(gate(2049))
             self.assertFalse(gate(0))
@@ -341,8 +342,8 @@ class TestFlashInferCommFusion(CustomTestCase):
             self.assertEqual(calls, expected)
             expected_x = x * (2 ** len(expected))
             torch.testing.assert_close(norm.inputs[0], expected_x)
-            # post_residual_addition was already folded into residual upstream;
-            # passing it again would double-apply it.
+            # residual already absorbed post_residual_addition; passing it on
+            # would apply it twice.
             self.assertIsNone(norm.inputs[2])
             torch.testing.assert_close(output, expected_x + residual)
 
