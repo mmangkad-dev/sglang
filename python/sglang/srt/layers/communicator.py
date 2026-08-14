@@ -787,18 +787,6 @@ class LayerCommunicator:
         if is_enable_moe_cp_allgather():
             return False
 
-        # Fusing makes the next layer's residual+LN absorb the post-experts
-        # all-reduce, and that fused kernel reduces over a single group. Under
-        # hybrid EP+TP the post-experts reduction spans two disjoint groups
-        # (moe_expert_parallel_all_reduce over _MOE_EP, then
-        # moe_tensor_model_parallel_all_reduce over _MOE_TP), and
-        # should_skip_post_experts_all_reduce() skips *both* once fusion is
-        # published -- so the fused reduce would cover only half the peers and
-        # silently return under-reduced activations.
-        parallel = get_parallel()
-        if parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1:
-            return False
-
         if (
             is_dp_attention_enabled()
             and self._speculative_algo is not None
@@ -824,8 +812,18 @@ class LayerCommunicator:
             (
                 (
                     apply_flashinfer_allreduce_fusion(batch_size)
-                    # FlashInfer fuses exactly one collective, while hybrid MoE
-                    # parallelism requires EP followed by MoE-TP.
+                    # Fusing makes the next layer's residual+LN absorb the
+                    # post-experts all-reduce, and the FlashInfer kernel reduces
+                    # over a single group. Under hybrid EP+TP the post-experts
+                    # reduction spans two disjoint groups
+                    # (moe_expert_parallel_all_reduce over _MOE_EP, then
+                    # moe_tensor_model_parallel_all_reduce over _MOE_TP), and
+                    # should_skip_post_experts_all_reduce() skips *both* once
+                    # fusion is published -- so one fused reduce would cover only
+                    # half the peers and silently under-reduce. AITER is exempt:
+                    # its fused kernel reduces over the whole TP group, which is
+                    # the same sum as EP-then-MoE-TP when those groups partition
+                    # TP.
                     and _supports_collective_topology(use_attn_tp_group=False)
                 )
                 or (

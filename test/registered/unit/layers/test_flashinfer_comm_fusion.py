@@ -93,6 +93,71 @@ def _torch_allreduce_residual_rmsnorm_baseline(
 
 
 class TestFlashInferCommFusion(CustomTestCase):
+    def test_misaligned_mnnvl_workspace_grows_until_twoshot_stage_aligns(self):
+        """A 32B-misaligned lamport buffer faults the TWOSHOT kernel at runtime."""
+
+        class _Workspace:
+            def __init__(self, buffer_size_bytes):
+                self.backend = "mnnvl"
+                self.buffer_size_bytes = buffer_size_bytes
+                self.destroyed = False
+
+            def destroy(self):
+                self.destroyed = True
+
+        requested = []
+        created = []
+
+        def create(**kwargs):
+            requested.append(kwargs["max_token_num"])
+            # The first two requests land on a misaligned granularity step.
+            created.append(_Workspace(536870224 if len(requested) < 3 else 715827200))
+            return created[-1]
+
+        with patch.object(fusion, "_create_allreduce_fusion_workspace", create):
+            workspace, max_token_num = fusion._create_workspace_aligned_for_twoshot(
+                {"max_token_num": 16384, "hidden_dim": 7168}
+            )
+
+        self.assertEqual(requested, [16384, 20480, 25600])
+        self.assertEqual(max_token_num, 25600)
+        self.assertIs(workspace, created[-1])
+        # Rejected attempts must release their multicast memory.
+        self.assertTrue(all(w.destroyed for w in created[:-1]))
+        self.assertFalse(created[-1].destroyed)
+
+    def test_persistently_misaligned_mnnvl_workspace_raises(self):
+        """Exhausting the retries must fail loudly, not hand back a faulting workspace."""
+
+        class _Workspace:
+            backend = "mnnvl"
+            buffer_size_bytes = 536870224
+
+            def destroy(self):
+                pass
+
+        with patch.object(
+            fusion, "_create_allreduce_fusion_workspace", lambda **_kw: _Workspace()
+        ):
+            with self.assertRaises(RuntimeError):
+                fusion._create_workspace_aligned_for_twoshot({"max_token_num": 16384})
+
+    def test_trtllm_workspace_skips_the_mnnvl_alignment_retry(self):
+        """Only MNNVL derives its buffer size the way this alignment bug needs."""
+        workspace = _FakeWorkspace("trtllm", world_size=4)
+        # An MNNVL-misaligned size must not trigger a retry on trtllm.
+        workspace.buffer_size_bytes = 536870224
+
+        with patch.object(
+            fusion, "_create_allreduce_fusion_workspace", lambda **_kw: workspace
+        ):
+            got, max_token_num = fusion._create_workspace_aligned_for_twoshot(
+                {"max_token_num": 16384}
+            )
+
+        self.assertIs(got, workspace)
+        self.assertEqual(max_token_num, 16384)
+
     def test_frozen_workspace_is_not_replaced_for_larger_shape(self):
         """A post-capture eager shape must not invalidate captured device pointers."""
         manager = fusion.FlashInferWorkspaceManager()

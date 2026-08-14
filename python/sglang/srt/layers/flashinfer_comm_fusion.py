@@ -295,6 +295,76 @@ def _flashinfer_trtllm_workspace_allocation_sizes(
     return allocation_sizes
 
 
+# TWOSHOT splits each lamport buffer into two stages and addresses the second at
+# buffer_size_bytes / 2, so that half-offset is only 16B-aligned -- what the
+# kernel's vector accesses need -- when the buffer itself is 32B-aligned.
+_MNNVL_TWOSHOT_STAGE_ALIGNMENT = 32
+# FlashInfer rounds the multicast allocation up to a fixed granularity and then
+# takes buffer_size_bytes = floor(alloc / 3) // 16 * 16, which lands on a
+# 32B-misaligned size for roughly every third granularity step. Asking for more
+# tokens moves to the next step, so a couple of retries always finds a usable
+# one; grow by a quarter so each retry clears a step outright.
+_MNNVL_ALIGNMENT_RETRIES = 3
+
+
+def _mnnvl_twoshot_stage_is_aligned(workspace) -> bool:
+    """Whether ``workspace`` can run the MNNVL TWOSHOT kernel without faulting.
+
+    Non-MNNVL backends size their buffers differently and are unaffected.
+    """
+    if workspace.backend != "mnnvl":
+        return True
+    return workspace.buffer_size_bytes % _MNNVL_TWOSHOT_STAGE_ALIGNMENT == 0
+
+
+def _create_workspace_aligned_for_twoshot(create_kw: dict):
+    """Create a workspace whose TWOSHOT stage offset is aligned.
+
+    Returns ``(workspace, max_token_num)``, where ``max_token_num`` is the size
+    actually allocated -- retries grow it past a misaligned granularity step.
+
+    Without this, an unlucky (max_token_num, hidden_dim) pair produces a buffer
+    whose second TWOSHOT stage starts on a 16B-misaligned address and the kernel
+    kills the process with cudaErrorMisalignedAddress on the first
+    TWOSHOT-sized input. ONESHOT (tiny inputs) is unaffected, so warmup can
+    sail past it. hidden_dim=7168 at max_token_num=16384 reproduces it.
+
+    Every rank requests the same sizes and the allocator is deterministic, so
+    all ranks walk the same retry sequence and stay in lockstep through the
+    handle exchanges inside each attempt.
+    """
+    max_token_num = create_kw["max_token_num"]
+    for attempt in range(_MNNVL_ALIGNMENT_RETRIES):
+        workspace = _create_allreduce_fusion_workspace(
+            **{**create_kw, "max_token_num": max_token_num}
+        )
+        if _mnnvl_twoshot_stage_is_aligned(workspace):
+            return workspace, max_token_num
+
+        grown = -(-max_token_num * 5 // 4)
+        logger.warning(
+            "FlashInfer MNNVL workspace for max_token_num=%d has a "
+            "%dB-misaligned lamport buffer (%d bytes); retrying with "
+            "max_token_num=%d (attempt %d/%d).",
+            max_token_num,
+            _MNNVL_TWOSHOT_STAGE_ALIGNMENT,
+            workspace.buffer_size_bytes,
+            grown,
+            attempt + 1,
+            _MNNVL_ALIGNMENT_RETRIES,
+        )
+        workspace.destroy()
+        max_token_num = grown
+
+    raise RuntimeError(
+        "Could not allocate a FlashInfer MNNVL workspace whose TWOSHOT stage "
+        f"offset is {_MNNVL_TWOSHOT_STAGE_ALIGNMENT}B-aligned after "
+        f"{_MNNVL_ALIGNMENT_RETRIES} attempts. Use "
+        "--flashinfer-allreduce-fusion-backend=trtllm, which sizes its "
+        "workspace differently."
+    )
+
+
 def _probe_cumem_create_sequence(cuda_driver, allocation_sizes, prop) -> bool:
     handles = []
     try:
@@ -526,7 +596,9 @@ class FlashInferWorkspaceManager:
                 create_kw["force_oneshot_support"] = bool(use_oneshot)
             if use_fp32_lamport:
                 create_kw["use_fp32_lamport"] = True
-            self.workspace = _create_allreduce_fusion_workspace(**create_kw)
+            self.workspace, alloc_token_num = _create_workspace_aligned_for_twoshot(
+                create_kw
+            )
             self._configure_workspace_size_check()
             self.world_size = world_size
             self.rank = rank
