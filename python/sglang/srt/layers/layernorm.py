@@ -234,11 +234,8 @@ def _forward_with_allreduce_fusion(
             elif can_use_flashinfer_allreduce_fusion(
                 x, use_attn_tp_group=use_attn_tp_group
             ):
-                # Decided in Python, before the op: the custom op's schema
-                # promises two tensors, so it cannot carry a shape-dependent
-                # fallback of its own -- under Dynamo the fake impl would hand
-                # the tracer tensors, the None test below would fold to True and
-                # the fallback would be compiled out.
+                # Decided before the op: its schema promises two tensors, so a
+                # shape-dependent fallback inside it folds away under Dynamo.
                 fused_result = flashinfer_allreduce_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,
@@ -250,8 +247,8 @@ def _forward_with_allreduce_fusion(
                 if fused_result[0] is not None:
                     return fused_result
 
-            # A fused backend may reject the shape or fail workspace setup.
-            # Preserve the collective before falling back to ordinary RMSNorm.
+            # A fused backend may reject the shape. Keep the collective it
+            # replaced before falling back to an ordinary RMSNorm.
             if _use_aiter:
                 x = tensor_model_parallel_all_reduce(x)
             elif use_attn_tp_group:

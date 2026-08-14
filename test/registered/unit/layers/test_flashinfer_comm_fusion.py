@@ -110,8 +110,7 @@ class TestFlashInferCommFusion(CustomTestCase):
 
         def create(**kwargs):
             requested.append(kwargs["max_token_num"])
-            # First attempt lands on a misaligned step; the quarter-step retry
-            # reaches a different, usable one.
+            # First attempt misaligned; the quarter-step retry clears it.
             created.append(_Workspace(536870224 if len(requested) < 2 else 715827200))
             return created[-1]
 
@@ -143,8 +142,7 @@ class TestFlashInferCommFusion(CustomTestCase):
 
         def create(**kwargs):
             requested.append(kwargs["max_token_num"])
-            # Same misaligned buffer twice: +25% did not clear the step, so the
-            # next attempt must double rather than burn another quarter-step.
+            # Same misaligned buffer twice, so the next attempt must double.
             return _Workspace(536870224 if len(requested) < 3 else 715827200)
 
         with patch.object(fusion, "_create_allreduce_fusion_workspace", create):
@@ -208,8 +206,7 @@ class TestFlashInferCommFusion(CustomTestCase):
                         use_attn_tp_group=False,
                     )
                 )
-                # Group identity mismatch: freezing removed initialize()'s
-                # ability to self-heal this, so the gate has to catch it.
+                # Freezing removed initialize()'s ability to self-heal this.
                 manager.group = ("other", "other")
                 self.assertFalse(
                     fusion.can_use_flashinfer_allreduce_fusion(
@@ -219,13 +216,11 @@ class TestFlashInferCommFusion(CustomTestCase):
                 )
 
     def test_coverage_probe_reports_a_contiguous_bound(self):
-        """MNNVL coverage has a hole when the buffer is below the one-shot threshold.
+        """MNNVL coverage holes below the one-shot threshold must not be skipped.
 
-        ONESHOT needs tp copies of the payload, TWOSHOT needs 2, and MNNVL picks
-        by payload size -- so for tp > 2 the requirement drops at the switch and a
-        small buffer leaves a band of unsupported row counts below a supported
-        region. Bisection alone would step over the band and hand the gate a
-        bound above it.
+        ONESHOT needs tp copies of the payload where TWOSHOT needs 2, so for
+        tp > 2 the requirement drops at the switch and a small buffer hides a band
+        of unsupported rows that bisection alone would step over.
         """
         import math
 
@@ -236,7 +231,6 @@ class TestFlashInferCommFusion(CustomTestCase):
             payload = token_num * hidden_dim * tp * elem
             if payload <= one_shot_threshold:  # ONESHOT: tp copies
                 return payload
-            # TWOSHOT: 2 stages over a tp-rounded row count
             return 2 * math.ceil(token_num / tp) * tp * hidden_dim * elem
 
         def manager_for(buffer_size_bytes):
@@ -251,8 +245,7 @@ class TestFlashInferCommFusion(CustomTestCase):
             manager.world_size = tp
             return manager
 
-        # 768 KiB: rows 1-34 fit under ONESHOT, 35-45 do not, and 46-68 fit again
-        # under TWOSHOT. The contiguous bound is 34, not 68.
+        # 768 KiB: rows 1-34 fit, 35-45 do not, 46-68 fit again. Bound is 34.
         holed = manager_for(768 * 1024)
         self.assertTrue(
             holed.is_buffer_size_sufficient(
@@ -271,8 +264,8 @@ class TestFlashInferCommFusion(CustomTestCase):
             34,
         )
 
-        # The real MNNVL granularity floor is ~170x the one-shot threshold, so the
-        # discontinuity is fully inside the covered region and the bound is exact.
+        # The real floor is ~170x the threshold, so the discontinuity is inside
+        # the covered region and the bound is exact.
         real = manager_for(178956288)
         self.assertEqual(
             real._probe_max_supported_token_num(

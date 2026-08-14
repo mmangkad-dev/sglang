@@ -295,27 +295,19 @@ def _flashinfer_trtllm_workspace_allocation_sizes(
     return allocation_sizes
 
 
-# TWOSHOT splits each lamport buffer into two stages and addresses the second at
-# buffer_size_bytes / 2, so that half-offset is only 16B-aligned -- what the
-# kernel's vector accesses need -- when the buffer itself is 32B-aligned.
+# TWOSHOT addresses its second stage at buffer_size_bytes / 2, so that offset is
+# 16B-aligned -- what the kernel needs -- only when the buffer is 32B-aligned.
 _MNNVL_TWOSHOT_STAGE_ALIGNMENT = 32
-# FlashInfer rounds the multicast allocation up to a fixed granularity and then
-# takes buffer_size_bytes = floor(alloc / 3) // 16 * 16, which lands on a
-# 32B-misaligned size for roughly every third granularity step. Asking for more
-# tokens moves to the next step, so a couple of retries always finds a usable
-# one; grow by a quarter so each retry clears a step outright.
+# buffer_size_bytes = floor(alloc / 3) // 16 * 16 lands misaligned on roughly
+# every third granularity step; a larger request moves to the next step.
 _MNNVL_ALIGNMENT_RETRIES = 3
-# Rows scanned to confirm coverage has no hole below the MNNVL strategy switch.
-# The switch is bounded by a byte budget (MNNVL_ONE_SHOT_THRESHOLD, 1 MiB in
-# flashinfer 0.6.17), so at any realistic hidden_dim it lands far below this.
+# Rows swept for a coverage hole below the MNNVL strategy switch, which sits
+# under a byte budget (MNNVL_ONE_SHOT_THRESHOLD, 1 MiB in flashinfer 0.6.17).
 _COVERAGE_CONTIGUITY_SWEEP_ROWS = 1024
 
 
 def _mnnvl_twoshot_stage_is_aligned(workspace) -> bool:
-    """Whether ``workspace`` can run the MNNVL TWOSHOT kernel without faulting.
-
-    Non-MNNVL backends size their buffers differently and are unaffected.
-    """
+    """Other backends size their buffers differently and are unaffected."""
     if workspace.backend != "mnnvl":
         return True
     return workspace.buffer_size_bytes % _MNNVL_TWOSHOT_STAGE_ALIGNMENT == 0
@@ -324,20 +316,15 @@ def _mnnvl_twoshot_stage_is_aligned(workspace) -> bool:
 def _create_workspace_aligned_for_twoshot(create_kw: dict) -> Tuple[object, int]:
     """Create a workspace whose TWOSHOT stage offset is aligned.
 
-    Returns ``(workspace, max_token_num)``, where ``max_token_num`` is the size
-    actually allocated -- retries grow it past a misaligned granularity step.
+    Returns ``(workspace, max_token_num)`` -- the size actually allocated, since
+    retries grow the request. Without this the kernel dies with
+    cudaErrorMisalignedAddress on the first TWOSHOT-sized input; ONESHOT is
+    unaffected, so warmup sails past it. hidden_dim=7168 at max_token_num=16384
+    reproduces it.
 
-    Without this, an unlucky (max_token_num, hidden_dim) pair produces a buffer
-    whose second TWOSHOT stage starts on a 16B-misaligned address and the kernel
-    kills the process with cudaErrorMisalignedAddress on the first
-    TWOSHOT-sized input. ONESHOT (tiny inputs) is unaffected, so warmup can
-    sail past it. hidden_dim=7168 at max_token_num=16384 reproduces it.
-
-    Every rank requests the same sizes and the allocator is deterministic, so
-    all ranks walk the same retry sequence and stay in lockstep through the
-    handle exchanges inside each attempt. If that ever stops holding, the symptom
-    is a hang inside the handle exchange rather than an error, because the ranks
-    would be on different attempts of the loop.
+    All ranks request the same sizes from a deterministic allocator and so walk
+    the same retry sequence; if that ever breaks the symptom is a hang in the
+    handle exchange, not an error.
     """
     max_token_num = create_kw["max_token_num"]
     previous_buffer_size = None
@@ -347,8 +334,7 @@ def _create_workspace_aligned_for_twoshot(create_kw: dict) -> Tuple[object, int]
         )
         if _mnnvl_twoshot_stage_is_aligned(workspace):
             if attempt:
-                # Not free: a larger buffer costs proportionally more lamport
-                # clearing on every all-reduce that uses it.
+                # A larger buffer costs proportionally more lamport clearing.
                 logger.warning(
                     "FlashInfer MNNVL workspace grew from the requested "
                     "max_token_num=%d to %d to reach a %dB-aligned TWOSHOT "
@@ -361,9 +347,8 @@ def _create_workspace_aligned_for_twoshot(create_kw: dict) -> Tuple[object, int]
             return workspace, max_token_num
 
         buffer_size = workspace.buffer_size_bytes
-        # A quarter more tokens normally clears a granularity step. When it does
-        # not -- the step is coarse relative to the request -- stepping again by a
-        # quarter would burn a retry on the identical buffer, so double instead.
+        # A quarter usually clears a step; when it did not, another quarter would
+        # burn a retry on the identical buffer, so double instead.
         if buffer_size == previous_buffer_size:
             grown = max_token_num * 2
         else:
@@ -383,9 +368,8 @@ def _create_workspace_aligned_for_twoshot(create_kw: dict) -> Tuple[object, int]
         previous_buffer_size = buffer_size
         max_token_num = grown
 
-    # initialize() catches this and disables fusion for the process, which is the
-    # intended outcome: falling back to an ordinary all-reduce is correct, just
-    # slower. Nothing is required of the operator.
+    # initialize() catches this and disables fusion for the process: falling back
+    # to an ordinary all-reduce is correct, just slower.
     raise RuntimeError(
         "Could not allocate a FlashInfer MNNVL workspace whose TWOSHOT stage "
         f"offset is {_MNNVL_TWOSHOT_STAGE_ALIGNMENT}B-aligned after "
@@ -496,13 +480,12 @@ class FlashInferWorkspaceManager:
         self._workspace_size_check_kwarg = None
         self._workspace_size_check_strategy_type = None
         self._workspace_reinitialization_allowed = True
-        # Largest token count the allocated buffer can actually service, probed
-        # once at creation. Allocator rounding usually makes this far larger than
-        # the requested max_token_num.
+        # Rows the buffer can actually service, probed at creation. Allocator
+        # rounding usually makes this far larger than the requested max_token_num.
         self.max_supported_token_num: Optional[int] = None
 
     def _freeze(self) -> None:
-        """Keep device addresses stable for CUDA graphs captured with this workspace."""
+        """Keep device addresses stable for graphs captured with this workspace."""
         self._workspace_reinitialization_allowed = False
 
     def _probe_max_supported_token_num(
@@ -510,25 +493,15 @@ class FlashInferWorkspaceManager:
     ) -> int:
         """Largest N for which the buffer covers *every* row count up to N.
 
-        Runs once per allocation so the per-forward gate is a plain integer
-        compare, and deliberately reports a contiguous bound, because that is
-        what ``fusion_workspace_covers`` goes on to assume.
-
-        Coverage is not monotone in the row count in general. MNNVL picks its
-        strategy by payload size -- ONESHOT below MNNVL_ONE_SHOT_THRESHOLD,
-        TWOSHOT above -- and ONESHOT needs ``tp`` copies of the payload where
-        TWOSHOT needs 2. For tp > 2 the requirement therefore *drops* at the
-        switch, and a buffer smaller than roughly that threshold leaves a band of
-        uncovered row counts sitting below a covered region. Bisection alone
-        would step over such a band and report a bound above a hole, letting the
-        gate approve a shape FlashInfer rejects.
-
-        Bisection is only sound above that discontinuity, so the sweep below
-        checks the low region explicitly rather than assuming it. The band can
-        only exist below a fixed *byte* budget, which is why a fixed row sweep is
-        enough: at any realistic hidden_dim the entire ONESHOT regime is a few
-        hundred rows. trtllm needs none of this -- its requirement,
-        ``token_num * hidden_dim <= max_token_num * hidden_dim``, is monotone.
+        Contiguous by construction, because ``fusion_workspace_covers`` assumes
+        it is. Coverage is not monotone in general: MNNVL picks ONESHOT below
+        MNNVL_ONE_SHOT_THRESHOLD and TWOSHOT above, and ONESHOT needs ``tp``
+        copies of the payload where TWOSHOT needs 2, so for tp > 2 the
+        requirement drops at the switch. A buffer under that threshold then hides
+        a band of uncovered rows below a covered region, which bisection would
+        step over. Bisection is sound only above the discontinuity, hence the
+        sweep; the band sits under a byte budget, so a fixed row sweep covers it.
+        trtllm is monotone and needs none of this.
         """
 
         def covers(token_num: int) -> bool:
@@ -538,9 +511,8 @@ class FlashInferWorkspaceManager:
 
         if not covers(1):
             return 0
-        # Double until coverage stops, keeping `low` on the last row count that
-        # held, then bisect the open interval (low, high). The limit only bounds
-        # the loop; real prefill token budgets sit orders of magnitude below it.
+        # Double until coverage stops, then bisect (low, high). Real prefill token
+        # budgets sit orders of magnitude below the limit.
         probe_limit = 1 << 22
         low, high = 1, 2
         while high <= probe_limit and covers(high):
@@ -553,15 +525,14 @@ class FlashInferWorkspaceManager:
                 high = mid
         bound = min(low, probe_limit)
 
-        # Walk the strategy-switch region to make the bound contiguous. Costs a
-        # few hundred pure-Python checks, once, and only ever lowers the answer.
+        # Only ever lowers the answer.
         for token_num in range(1, min(bound, _COVERAGE_CONTIGUITY_SWEEP_ROWS) + 1):
             if not covers(token_num):
                 logger.warning(
                     "FlashInfer workspace coverage is not contiguous: %d rows "
                     "are unsupported while larger counts are, so fusion is "
-                    "limited to %d rows. Expected only for a buffer smaller "
-                    "than the backend one-shot threshold.",
+                    "limited to %d rows. Expected only below the backend "
+                    "one-shot threshold.",
                     token_num,
                     token_num - 1,
                 )
@@ -695,8 +666,8 @@ class FlashInferWorkspaceManager:
             self.workspace, alloc_token_num = _create_workspace_aligned_for_twoshot(
                 create_kw
             )
-            # An alignment retry allocates more than was asked for; record what
-            # was actually taken so a later re-init cannot shrink below it.
+            # A retry allocates more than was asked for; record what was taken so
+            # a later re-init cannot shrink below it.
             self._max_token_num_seen = max(
                 alloc_token_num, self._max_token_num_seen or 0
             )
@@ -852,10 +823,9 @@ def _sync_allreduce_unavailable_across_tp():
 
 
 def _fusion_group(use_attn_tp_group: bool):
-    """The (world_size, rank, coordinator) the fusion workspace rendezvouses on.
+    """The peers the fusion workspace rendezvouses on.
 
-    Shared by workspace creation and by the capacity predicate so the two cannot
-    disagree about which peers a workspace belongs to.
+    Shared by creation and by the capacity gate so the two cannot disagree.
     """
     parallel = get_parallel()
     if use_attn_tp_group:
@@ -868,11 +838,9 @@ def _fusion_group(use_attn_tp_group: bool):
 def fusion_workspace_covers(num_tokens: int, *, use_attn_tp_group: bool) -> bool:
     """Whether the fusion workspace can service ``num_tokens`` rows.
 
-    Compares against a token count probed once at workspace creation
-    (``max_supported_token_num``) rather than calling into FlashInfer per
-    forward: the answer must be a pure function of static state so it stays
-    usable while Dynamo traces, and so the fused and non-fused decisions taken at
-    different call sites for the same batch always agree.
+    Compares against ``max_supported_token_num``, probed at creation, rather than
+    calling FlashInfer per forward: the answer has to be a pure function of static
+    state to stay usable while Dynamo traces.
     """
     manager = _get_workspace_manager(use_attn_tp_group)
     return (
@@ -886,18 +854,14 @@ def can_use_flashinfer_allreduce_fusion(
 ) -> bool:
     """Whether ``flashinfer_allreduce_residual_rmsnorm`` can service this shape.
 
-    Split out from the kernel call for the same reason as
-    ``can_use_flashinfer_allreduce``: the custom op is opaque to Dynamo and its
-    schema promises two tensors, so a shape-dependent ``return None, None``
-    inside it is invisible at trace time. The fake impl hands the tracer real
-    tensors, the ``is not None`` test folds to True, the fallback is compiled
-    out, and the op then raises ``expected Tensor()`` at runtime. Deciding out
-    here keeps the op on paths that always produce tensors.
+    Split out from the kernel call like ``can_use_flashinfer_allreduce``: the op
+    is opaque to Dynamo and its schema promises two tensors, so a shape-dependent
+    ``return None, None`` inside it folds away at trace time and then raises
+    ``expected Tensor()`` at runtime. Deciding here keeps the op on paths that
+    always produce tensors.
 
-    Every check is rank-invariant: a rank that declines while its peers enter
-    the kernel mismatches and hangs. The unavailable flag and the workspace are
-    cross-rank synced at init; the rest are pure functions of group identity and
-    of tensor metadata, which is identical on every rank of the group.
+    Every check is rank-invariant -- a rank that declines while its peers enter
+    the kernel hangs.
     """
     if _flashinfer_allreduce_unavailable or _flashinfer_comm is None:
         return False
@@ -912,11 +876,9 @@ def can_use_flashinfer_allreduce_fusion(
     if not manager.initialized or manager.workspace is None:
         return False
 
-    # The workspace is only usable on the peers it was rendezvoused with. Under
-    # hybrid EP+TP the EP and MoE-TP groups have equal world size but pair
+    # Under hybrid EP+TP the EP and MoE-TP groups have equal world size but pair
     # different ranks, so a mismatch reduces over the wrong peers and silently
-    # returns garbage. Freezing means initialize() can no longer self-heal this,
-    # so it has to be checked here.
+    # returns garbage. Freezing stopped initialize() from self-healing it.
     world_size, rank, coordinator = _fusion_group(use_attn_tp_group)
     if world_size <= 1:
         return False
@@ -927,16 +889,14 @@ def can_use_flashinfer_allreduce_fusion(
     ):
         return False
 
-    # The workspace was allocated for one (hidden_dim, dtype); a second runner in
-    # the process with a different pair must not reuse it.
+    # A second runner in the process with a different pair must not reuse it.
     if manager.hidden_dim != input_tensor.shape[-1] or manager.dtype != (
         input_tensor.dtype
     ):
         return False
 
-    # Size check stays last: it reads the token dim, which is symbolic under
-    # Dynamo, so statically-off configs short-circuit before reaching it (same
-    # ordering rule as apply_flashinfer_allreduce_fusion).
+    # Size check last: it reads the symbolic token dim, so statically-off configs
+    # short-circuit first (same rule as apply_flashinfer_allreduce_fusion).
     return fusion_workspace_covers(
         input_tensor.shape[0], use_attn_tp_group=use_attn_tp_group
     )
@@ -1007,10 +967,8 @@ def ensure_workspace_initialized(
 
         _sync_allreduce_unavailable_across_tp()
 
-    # Whether the workspace *covers* this shape is decided by
-    # can_use_flashinfer_allreduce_fusion(), in plain Python outside the custom
-    # op. Reporting it from here would put a shape-dependent verdict inside the
-    # op, which Dynamo cannot see past (see that function's docstring).
+    # Coverage is decided by can_use_flashinfer_allreduce_fusion(), outside the
+    # custom op; reporting it here would hide the verdict from Dynamo.
     return workspace_manager.initialized
 
 
@@ -1033,10 +991,8 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
 def supports_collective_topology(*, use_attn_tp_group: bool) -> bool:
     """Whether one fused all-reduce covers every reduction this site needs.
 
-    The attention-TP site always reduces over a single group. The MoE site does
-    too, unless expert and MoE-tensor parallelism are both on: that reduction
-    spans _MOE_EP and then _MOE_TP, two disjoint groups, and FlashInfer fuses
-    exactly one collective.
+    FlashInfer fuses exactly one collective. Attention-TP always reduces over a
+    single group; the MoE site spans _MOE_EP then _MOE_TP when both are on.
     """
     if use_attn_tp_group:
         return True
@@ -1087,9 +1043,8 @@ def flashinfer_allreduce_residual_rmsnorm(
     if use_attn_tp_group:
         world_size = get_parallel().attn_tp_size
     else:
-        # FlashInfer can fuse one collective. Hybrid expert + MoE tensor
-        # parallelism requires EP followed by MoE-TP, so defer both to the
-        # ordinary fallback instead of silently omitting the second reduction.
+        # Hybrid EP + MoE-TP needs two reductions; defer both to the fallback
+        # rather than silently omitting the second.
         if not supports_collective_topology(use_attn_tp_group=False):
             return None, None
         if get_parallel().moe_ep_size > 1:
@@ -1286,18 +1241,14 @@ def pre_initialize_workspaces(
 def freeze_flashinfer_workspaces() -> None:
     """Prevent graph-captured workspace addresses from being replaced.
 
-    Only freezes managers that already hold an allocation. Freezing an empty one
-    would pin it empty for the process, and _get_workspace_manager() creates on
-    demand, so freezing unconditionally could invent a manager just to disable
-    it.
+    Only touches managers that hold an allocation, since
+    _get_workspace_manager() creates on demand and pinning an empty one would
+    disable fusion for the process.
 
-    Note the managers live on the process-global resource table while this runs
-    per ModelRunner, so with speculative decoding the target freezes the
-    workspace the draft will later share. That is fine as long as the draft fits
-    inside it -- EAGLE/MTP drafts consume the target's hidden states and so carry
-    the same hidden_dim, and their verify shapes are covered by the decode floor.
-    A draft with a larger hidden_dim would find the workspace frozen and run
-    unfused (correct, not faster).
+    The managers are process-global while this runs per ModelRunner, so under
+    speculative decoding the target freezes the workspace the draft shares.
+    EAGLE/MTP drafts carry the target's hidden_dim and their verify shapes fit
+    the decode floor; a draft with a larger hidden_dim runs unfused.
     """
     from sglang.srt.runtime_context import get_resources
 

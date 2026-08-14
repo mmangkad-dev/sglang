@@ -61,10 +61,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Floor for the FlashInfer all-reduce fusion workspace, matching the coverage the
-# old fixed FUSE_ALLREDUCE_MAX_BATCH_SIZE cap asked for. See
-# BaseRunner._pre_initialize_flashinfer_allreduce_workspace for why this stays
-# small rather than tracking the largest captured shape.
+# Floor for the FlashInfer all-reduce fusion workspace, matching what the old
+# fixed cap asked for. See _pre_initialize_flashinfer_allreduce_workspace for why
+# it stays small rather than tracking the largest captured shape.
 _MIN_FUSION_WORKSPACE_TOKENS = 2048
 
 
@@ -265,10 +264,8 @@ class BaseRunner(ABC):
 
             pp_parallel_deep_gemm_warmup(self)
 
-        # Pin the allocation before any real forward. Growing it later would both
-        # slow every all-reduce down (see
-        # _pre_initialize_flashinfer_allreduce_workspace) and, once graphs are
-        # captured, swap the addresses they baked in.
+        # Pin the allocation before any real forward: growing it later slows
+        # every all-reduce down, and swaps addresses captured graphs baked in.
         self._freeze_flashinfer_allreduce_workspaces()
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
@@ -282,23 +279,19 @@ class BaseRunner(ABC):
 
         from sglang.srt.layers.flashinfer_comm_fusion import pre_initialize_workspaces
 
-        # Deliberately *not* sized to the largest captured prefill. A FlashInfer
-        # workspace costs time as well as memory: MNNVL clears its lamport
-        # buffers in proportion to the allocation, not to the message, so a
-        # bigger workspace slows down every all-reduce that uses it. Measured on
-        # 4xGB300 (TP=4, bf16, hidden=2880), going from a 178,956,288-byte
-        # buffer to 357,913,248 cost 17.7% on the fused kernel and 14.6% on a
-        # plain FlashInfer all-reduce, at an identical 2048-token workload --
-        # more than fusing the RMSNorm saves.
+        # Deliberately *not* sized to the largest captured prefill. MNNVL clears
+        # its lamport buffers in proportion to the allocation rather than the
+        # message, so a bigger workspace slows every all-reduce through it: on
+        # 4xGB300 (TP=4, bf16, hidden=2880) a 178,956,288-byte buffer cost
+        # 36.08us fused against 42.49us at 357,913,248 for the same 2048-token
+        # workload -- more than fusing the RMSNorm saves.
         #
-        # Ask for little and let the gate exploit what rounding gives away:
-        # MNNVL's granularity floor hands back a buffer that already covers
-        # ~15.3k tokens at hidden=2880, and fusion is gated on whether the
-        # buffer covers the shape (is_buffer_size_sufficient), not on this
-        # number. Shapes that overflow it fall back to an ordinary all-reduce.
-        # The floor keeps the trtllm backend, whose allocation scales linearly
-        # with this value, at the coverage it had when a fixed cap of 2048 chose
-        # it.
+        # Ask for little and let the gate spend what allocator rounding gives
+        # away: fusion is gated on whether the buffer covers the shape, not on
+        # this number, and MNNVL's floor already covers ~15.5k rows at
+        # hidden=2880. Larger shapes fall back to an ordinary all-reduce. The
+        # floor also keeps trtllm, whose allocation scales linearly with this,
+        # near its previous footprint.
         max_token_num = max(mr.max_decode_logits_rows(), _MIN_FUSION_WORKSPACE_TOKENS)
 
         pre_initialize_workspaces(

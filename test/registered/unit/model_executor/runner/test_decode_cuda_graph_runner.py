@@ -294,10 +294,8 @@ class TestFlashInferWorkspaceFreeze(CustomTestCase):
     def test_capture_freezes_workspace_immediately_after_warmup(self):
         """Removing capture-time freezing would leave graph pointers replaceable.
 
-        The freeze mock raises a sentinel so capture() stops there: everything
-        after it needs a fully built runner, which this test deliberately does
-        not have. What is under test is only that freeze runs, and runs after
-        warmup.
+        The freeze mock raises a sentinel to stop capture() there; a
+        __new__-built runner cannot run the rest. Only the ordering is under test.
         """
         events = []
         runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)

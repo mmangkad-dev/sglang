@@ -556,13 +556,11 @@ class LayerCommunicator:
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
-                    # No capacity check here, unlike the attention-TP site
-                    # below: the previous layer has already skipped its
-                    # all-reduce on the strength of
-                    # should_fuse_mlp_allreduce_with_next_layer(), which is a
-                    # pure function of topology, so this call has to happen
-                    # either way. forward_with_allreduce_fusion() performs the
-                    # collective itself when the workspace declines the shape.
+                    # No capacity check, unlike the attention-TP site: the
+                    # previous layer already skipped its all-reduce on a
+                    # pure-topology predicate, so this call has to happen either
+                    # way and forward_with_allreduce_fusion() does the collective
+                    # when the workspace declines.
                     quant_result = None
                     if (
                         self.enable_fused_ar_quant
@@ -820,18 +818,11 @@ class LayerCommunicator:
             (
                 (
                     apply_flashinfer_allreduce_fusion(batch_size)
-                    # Fusing makes the next layer's residual+LN absorb the
-                    # post-experts all-reduce, and the FlashInfer kernel reduces
-                    # over a single group. Under hybrid EP+TP the post-experts
-                    # reduction spans two disjoint groups
-                    # (moe_expert_parallel_all_reduce over _MOE_EP, then
-                    # moe_tensor_model_parallel_all_reduce over _MOE_TP), and
-                    # should_skip_post_experts_all_reduce() skips *both* once
-                    # fusion is published -- so one fused reduce would cover only
-                    # half the peers and silently under-reduce. AITER is exempt:
-                    # its fused kernel reduces over the whole TP group, which is
-                    # the same sum as EP-then-MoE-TP when those groups partition
-                    # TP.
+                    # should_skip_post_experts_all_reduce() drops both the _MOE_EP
+                    # and _MOE_TP reductions once fusion is published, so one
+                    # fused reduce would cover half the peers and silently
+                    # under-reduce. AITER is exempt: it reduces over the whole TP
+                    # group, the same sum when those groups partition TP.
                     and supports_collective_topology(use_attn_tp_group=False)
                 )
                 or (
@@ -1137,9 +1128,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 apply_aiter_all_reduce_fusion(hidden_states)
                 or (
                     apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
-                    # Ask before routing: a shape the workspace cannot cover has
-                    # to reach the branch below, which still has the quantized
-                    # all-reduce and the NPU weight-cache hook.
+                    # Ask before routing: an uncoverable shape has to reach the
+                    # branch below, which keeps the quantized all-reduce and the
+                    # NPU weight-cache hook.
                     and can_use_flashinfer_allreduce_fusion(
                         hidden_states, use_attn_tp_group=True
                     )
