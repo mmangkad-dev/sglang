@@ -54,8 +54,8 @@ from sglang.srt.layers.dp_attention import (
     moe_cp_all_gather_into_tensor,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import (
-    _supports_collective_topology,
     is_flashinfer_allreduce_unavailable,
+    supports_collective_topology,
 )
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
@@ -824,7 +824,7 @@ class LayerCommunicator:
                     # its fused kernel reduces over the whole TP group, which is
                     # the same sum as EP-then-MoE-TP when those groups partition
                     # TP.
-                    and _supports_collective_topology(use_attn_tp_group=False)
+                    and supports_collective_topology(use_attn_tp_group=False)
                 )
                 or (
                     _use_aiter

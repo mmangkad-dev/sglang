@@ -599,6 +599,11 @@ class FlashInferWorkspaceManager:
             self.workspace, alloc_token_num = _create_workspace_aligned_for_twoshot(
                 create_kw
             )
+            # An alignment retry allocates more than was asked for; record what
+            # was actually taken so a later re-init cannot shrink below it.
+            self._max_token_num_seen = max(
+                alloc_token_num, self._max_token_num_seen or 0
+            )
             self._configure_workspace_size_check()
             self.world_size = world_size
             self.rank = rank
@@ -850,7 +855,7 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     return norm_out, residual_out
 
 
-def _supports_collective_topology(use_attn_tp_group: bool) -> bool:
+def supports_collective_topology(use_attn_tp_group: bool) -> bool:
     """Whether one fused all-reduce covers every required reduction."""
     return use_attn_tp_group or not (
         get_parallel().moe_ep_size > 1 and get_parallel().moe_tp_size > 1
@@ -903,7 +908,7 @@ def flashinfer_allreduce_residual_rmsnorm(
         # FlashInfer can fuse one collective. Hybrid expert + MoE tensor
         # parallelism requires EP followed by MoE-TP, so defer both to the
         # ordinary fallback instead of silently omitting the second reduction.
-        if not _supports_collective_topology(use_attn_tp_group=False):
+        if not supports_collective_topology(use_attn_tp_group=False):
             return None, None
         if get_parallel().moe_ep_size > 1:
             world_size = get_parallel().moe_ep_size

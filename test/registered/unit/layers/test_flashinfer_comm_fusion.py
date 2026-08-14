@@ -363,11 +363,9 @@ class TestFlashInferCommFusion(CustomTestCase):
         """Hybrid EP+MoE-TP cannot use a fusion that performs only one reduction."""
         with get_parallel().override(moe_ep_size=2, moe_tp_size=2):
             self.assertFalse(
-                fusion._supports_collective_topology(use_attn_tp_group=False)
+                fusion.supports_collective_topology(use_attn_tp_group=False)
             )
-            self.assertTrue(
-                fusion._supports_collective_topology(use_attn_tp_group=True)
-            )
+            self.assertTrue(fusion.supports_collective_topology(use_attn_tp_group=True))
 
     def test_hybrid_moe_parallelism_keeps_aiter_fusion_eligible(self):
         """FlashInfer's hybrid-topology restriction must not disable full-TP AITER."""
