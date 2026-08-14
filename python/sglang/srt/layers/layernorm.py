@@ -206,6 +206,7 @@ def _forward_with_allreduce_fusion(
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
         from sglang.srt.layers.flashinfer_comm_fusion import (
+            can_use_flashinfer_allreduce_fusion,
             flashinfer_allreduce_residual_rmsnorm,
         )
 
@@ -230,7 +231,14 @@ def _forward_with_allreduce_fusion(
                 )
                 if fused_result is not None:
                     return fused_result
-            else:
+            elif can_use_flashinfer_allreduce_fusion(
+                x, use_attn_tp_group=use_attn_tp_group
+            ):
+                # Decided in Python, before the op: the custom op's schema
+                # promises two tensors, so it cannot carry a shape-dependent
+                # fallback of its own -- under Dynamo the fake impl would hand
+                # the tracer tensors, the None test below would fold to True and
+                # the fallback would be compiled out.
                 fused_result = flashinfer_allreduce_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,
@@ -247,8 +255,7 @@ def _forward_with_allreduce_fusion(
             if _use_aiter:
                 x = tensor_model_parallel_all_reduce(x)
             elif use_attn_tp_group:
-                all_reduce = attention_tensor_model_parallel_all_reduce
-                x = all_reduce(x)
+                x = attention_tensor_model_parallel_all_reduce(x)
             elif get_parallel().moe_ep_size > 1:
                 x = moe_expert_parallel_all_reduce(x)
                 if get_parallel().moe_tp_size > 1:

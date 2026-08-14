@@ -110,8 +110,9 @@ class TestFlashInferCommFusion(CustomTestCase):
 
         def create(**kwargs):
             requested.append(kwargs["max_token_num"])
-            # The first two requests land on a misaligned granularity step.
-            created.append(_Workspace(536870224 if len(requested) < 3 else 715827200))
+            # First attempt lands on a misaligned step; the quarter-step retry
+            # reaches a different, usable one.
+            created.append(_Workspace(536870224 if len(requested) < 2 else 715827200))
             return created[-1]
 
         with patch.object(fusion, "_create_allreduce_fusion_workspace", create):
@@ -119,12 +120,128 @@ class TestFlashInferCommFusion(CustomTestCase):
                 {"max_token_num": 16384, "hidden_dim": 7168}
             )
 
-        self.assertEqual(requested, [16384, 20480, 25600])
-        self.assertEqual(max_token_num, 25600)
+        self.assertEqual(requested, [16384, 20480])
+        self.assertEqual(max_token_num, 20480)
         self.assertIs(workspace, created[-1])
         # Rejected attempts must release their multicast memory.
         self.assertTrue(all(w.destroyed for w in created[:-1]))
         self.assertFalse(created[-1].destroyed)
+
+    def test_alignment_retry_doubles_when_the_step_does_not_move(self):
+        """A quarter more tokens can land on the same granularity step."""
+
+        class _Workspace:
+            backend = "mnnvl"
+
+            def __init__(self, buffer_size_bytes):
+                self.buffer_size_bytes = buffer_size_bytes
+
+            def destroy(self):
+                pass
+
+        requested = []
+
+        def create(**kwargs):
+            requested.append(kwargs["max_token_num"])
+            # Same misaligned buffer twice: +25% did not clear the step, so the
+            # next attempt must double rather than burn another quarter-step.
+            return _Workspace(536870224 if len(requested) < 3 else 715827200)
+
+        with patch.object(fusion, "_create_allreduce_fusion_workspace", create):
+            _, max_token_num = fusion._create_workspace_aligned_for_twoshot(
+                {"max_token_num": 16384}
+            )
+
+        self.assertEqual(requested, [16384, 20480, 40960])
+        self.assertEqual(max_token_num, 40960)
+
+    def test_capacity_gate_declines_shapes_the_buffer_cannot_cover(self):
+        """The headline contract: coverage decides, and it is probed once."""
+        manager = fusion.FlashInferWorkspaceManager()
+        workspace = _FakeWorkspace("mnnvl", world_size=4)
+        workspace.buffer_size_bytes = 32
+        workspace.is_buffer_size_sufficient = lambda **kwargs: (
+            kwargs["num_tokens"] <= 6240
+        )
+        manager.workspace = workspace
+        manager.initialized = True
+        manager.world_size = 4
+        manager.rank = 0
+        manager.hidden_dim = 7168
+        manager.dtype = torch.bfloat16
+        manager.max_supported_token_num = manager._probe_max_supported_token_num(
+            hidden_dim=7168, dtype=torch.bfloat16
+        )
+
+        # Probed from the buffer, not from the requested max_token_num.
+        self.assertEqual(manager.max_supported_token_num, 6240)
+
+        with patch.object(fusion, "_get_workspace_manager", return_value=manager):
+            for num_tokens, expected in ((1, True), (6240, True), (6241, False)):
+                self.assertEqual(
+                    fusion.fusion_workspace_covers(num_tokens, use_attn_tp_group=False),
+                    expected,
+                )
+
+            # A mismatched hidden_dim or dtype must not reuse the workspace.
+            group = types.SimpleNamespace(device_group=None, cpu_group=None)
+            with (
+                patch.object(fusion, "_fusion_group", return_value=(4, 0, group)),
+                get_parallel().override(moe_ep_size=1, moe_tp_size=4),
+            ):
+                manager.group = (None, None)
+                self.assertTrue(
+                    fusion.can_use_flashinfer_allreduce_fusion(
+                        torch.zeros(4096, 7168, dtype=torch.bfloat16),
+                        use_attn_tp_group=False,
+                    )
+                )
+                self.assertFalse(
+                    fusion.can_use_flashinfer_allreduce_fusion(
+                        torch.zeros(4096, 4096, dtype=torch.bfloat16),
+                        use_attn_tp_group=False,
+                    )
+                )
+                self.assertFalse(
+                    fusion.can_use_flashinfer_allreduce_fusion(
+                        torch.zeros(4096, 7168, dtype=torch.float16),
+                        use_attn_tp_group=False,
+                    )
+                )
+                # Group identity mismatch: freezing removed initialize()'s
+                # ability to self-heal this, so the gate has to catch it.
+                manager.group = ("other", "other")
+                self.assertFalse(
+                    fusion.can_use_flashinfer_allreduce_fusion(
+                        torch.zeros(4096, 7168, dtype=torch.bfloat16),
+                        use_attn_tp_group=False,
+                    )
+                )
+
+    def test_fusion_gate_no_longer_caps_batch_size(self):
+        """The cap is gone; regressing to one would silently undo this change."""
+        from sglang.srt.layers import communicator as communicator_module
+
+        with (
+            patch.object(communicator_module, "_is_sm100_supported", True),
+            patch.object(communicator_module, "_is_flashinfer_available", True),
+            patch.object(
+                communicator_module, "is_dp_attention_enabled", return_value=False
+            ),
+            patch.object(
+                communicator_module,
+                "is_flashinfer_allreduce_unavailable",
+                return_value=False,
+            ),
+            get_context().override_server_args(
+                flashinfer_allreduce_fusion_backend="auto"
+            ),
+        ):
+            for batch_size in (1, 2048, 2049, 16384, 131072):
+                self.assertTrue(
+                    communicator_module.apply_flashinfer_allreduce_fusion(batch_size)
+                )
+            self.assertFalse(communicator_module.apply_flashinfer_allreduce_fusion(0))
 
     def test_persistently_misaligned_mnnvl_workspace_raises(self):
         """Exhausting the retries must fail loudly, not hand back a faulting workspace."""

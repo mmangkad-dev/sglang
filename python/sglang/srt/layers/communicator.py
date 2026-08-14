@@ -54,6 +54,7 @@ from sglang.srt.layers.dp_attention import (
     moe_cp_all_gather_into_tensor,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import (
+    can_use_flashinfer_allreduce_fusion,
     is_flashinfer_allreduce_unavailable,
     supports_collective_topology,
 )
@@ -555,6 +556,13 @@ class LayerCommunicator:
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
+                    # No capacity check here, unlike the attention-TP site
+                    # below: the previous layer has already skipped its
+                    # all-reduce on the strength of
+                    # should_fuse_mlp_allreduce_with_next_layer(), which is a
+                    # pure function of topology, so this call has to happen
+                    # either way. forward_with_allreduce_fusion() performs the
+                    # collective itself when the workspace declines the shape.
                     quant_result = None
                     if (
                         self.enable_fused_ar_quant
@@ -1127,7 +1135,15 @@ class CommunicateWithAllReduceAndLayerNormFn:
             handled = False
             if (
                 apply_aiter_all_reduce_fusion(hidden_states)
-                or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+                or (
+                    apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+                    # Ask before routing: a shape the workspace cannot cover has
+                    # to reach the branch below, which still has the quantized
+                    # all-reduce and the NPU weight-cache hook.
+                    and can_use_flashinfer_allreduce_fusion(
+                        hidden_states, use_attn_tp_group=True
+                    )
+                )
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual, use_attn_tp_group=True
