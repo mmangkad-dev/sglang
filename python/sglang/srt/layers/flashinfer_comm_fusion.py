@@ -305,6 +305,10 @@ _MNNVL_TWOSHOT_STAGE_ALIGNMENT = 32
 # tokens moves to the next step, so a couple of retries always finds a usable
 # one; grow by a quarter so each retry clears a step outright.
 _MNNVL_ALIGNMENT_RETRIES = 3
+# Rows scanned to confirm coverage has no hole below the MNNVL strategy switch.
+# The switch is bounded by a byte budget (MNNVL_ONE_SHOT_THRESHOLD, 1 MiB in
+# flashinfer 0.6.17), so at any realistic hidden_dim it lands far below this.
+_COVERAGE_CONTIGUITY_SWEEP_ROWS = 1024
 
 
 def _mnnvl_twoshot_stage_is_aligned(workspace) -> bool:
@@ -504,13 +508,27 @@ class FlashInferWorkspaceManager:
     def _probe_max_supported_token_num(
         self, hidden_dim: int, dtype: torch.dtype
     ) -> int:
-        """Binary-search the largest row count the buffer covers.
+        """Largest N for which the buffer covers *every* row count up to N.
 
-        The backends express capacity in bytes (MNNVL) or in
-        max_token_num * hidden_dim (trtllm); both requirements are monotone in
-        the row count, so a search over is_buffer_size_sufficient() finds the
-        exact boundary without duplicating either formula. Runs once per
-        allocation, so the per-forward gate is a plain integer compare.
+        Runs once per allocation so the per-forward gate is a plain integer
+        compare, and deliberately reports a contiguous bound, because that is
+        what ``fusion_workspace_covers`` goes on to assume.
+
+        Coverage is not monotone in the row count in general. MNNVL picks its
+        strategy by payload size -- ONESHOT below MNNVL_ONE_SHOT_THRESHOLD,
+        TWOSHOT above -- and ONESHOT needs ``tp`` copies of the payload where
+        TWOSHOT needs 2. For tp > 2 the requirement therefore *drops* at the
+        switch, and a buffer smaller than roughly that threshold leaves a band of
+        uncovered row counts sitting below a covered region. Bisection alone
+        would step over such a band and report a bound above a hole, letting the
+        gate approve a shape FlashInfer rejects.
+
+        Bisection is only sound above that discontinuity, so the sweep below
+        checks the low region explicitly rather than assuming it. The band can
+        only exist below a fixed *byte* budget, which is why a fixed row sweep is
+        enough: at any realistic hidden_dim the entire ONESHOT regime is a few
+        hundred rows. trtllm needs none of this -- its requirement,
+        ``token_num * hidden_dim <= max_token_num * hidden_dim``, is monotone.
         """
 
         def covers(token_num: int) -> bool:
@@ -520,12 +538,12 @@ class FlashInferWorkspaceManager:
 
         if not covers(1):
             return 0
-        # Double until it stops covering, keeping `low` on the last value that
-        # did, then bisect the open interval (low, high). Generous ceiling: real
-        # prefill token budgets sit far below it.
-        ceiling = 1 << 22
+        # Double until coverage stops, keeping `low` on the last row count that
+        # held, then bisect the open interval (low, high). The limit only bounds
+        # the loop; real prefill token budgets sit orders of magnitude below it.
+        probe_limit = 1 << 22
         low, high = 1, 2
-        while high <= ceiling and covers(high):
+        while high <= probe_limit and covers(high):
             low, high = high, high * 2
         while high - low > 1:
             mid = (low + high) // 2
@@ -533,7 +551,22 @@ class FlashInferWorkspaceManager:
                 low = mid
             else:
                 high = mid
-        return low
+        bound = min(low, probe_limit)
+
+        # Walk the strategy-switch region to make the bound contiguous. Costs a
+        # few hundred pure-Python checks, once, and only ever lowers the answer.
+        for token_num in range(1, min(bound, _COVERAGE_CONTIGUITY_SWEEP_ROWS) + 1):
+            if not covers(token_num):
+                logger.warning(
+                    "FlashInfer workspace coverage is not contiguous: %d rows "
+                    "are unsupported while larger counts are, so fusion is "
+                    "limited to %d rows. Expected only for a buffer smaller "
+                    "than the backend one-shot threshold.",
+                    token_num,
+                    token_num - 1,
+                )
+                return token_num - 1
+        return bound
 
     def _configure_workspace_size_check(self):
         """Cache the backend-specific size-check API for this workspace."""
