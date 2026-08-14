@@ -396,6 +396,11 @@ class FlashInferWorkspaceManager:
         self._logged_init = False
         self._workspace_size_check_kwarg = None
         self._workspace_size_check_strategy_type = None
+        self._workspace_reinitialization_allowed = True
+
+    def _freeze(self):
+        """Keep device addresses stable for CUDA graphs captured with this workspace."""
+        self._workspace_reinitialization_allowed = False
 
     def _configure_workspace_size_check(self):
         """Cache the backend-specific size-check API for this workspace."""
@@ -430,10 +435,6 @@ class FlashInferWorkspaceManager:
         """Initialize workspace using FlashInfer's unified API."""
         global _flashinfer_allreduce_unavailable
 
-        # Track the high-water mark so allocations only grow
-        self._max_token_num_seen = max(max_token_num, self._max_token_num_seen or 0)
-        self._max_hidden_dim_seen = max(hidden_dim, self._max_hidden_dim_seen or 0)
-
         # Reuse existing workspace if it already covers this problem size
         if (
             self.initialized
@@ -446,6 +447,16 @@ class FlashInferWorkspaceManager:
             )
         ):
             return
+
+        # Captured graphs retain the workspace's device addresses. Once frozen,
+        # an unsupported larger eager shape must fall back instead of replacing
+        # the allocation underneath those graphs.
+        if not self._workspace_reinitialization_allowed:
+            return
+
+        # Track the high-water mark so allocations only grow before capture.
+        self._max_token_num_seen = max(max_token_num, self._max_token_num_seen or 0)
+        self._max_hidden_dim_seen = max(hidden_dim, self._max_hidden_dim_seen or 0)
 
         # Same world_size but buffer too small: free old workspace before creating new
         if self.initialized and self.world_size == world_size:
@@ -740,7 +751,15 @@ def ensure_workspace_initialized(
 
         _sync_allreduce_unavailable_across_tp()
 
-    return workspace_manager.initialized
+    return (
+        workspace_manager.initialized
+        and workspace_manager.is_buffer_size_sufficient(
+            token_num=token_num,
+            hidden_dim=hidden_dim,
+            dtype=effective_dtype,
+            use_oneshot=use_oneshot,
+        )
+    )
 
 
 def fake_flashinfer_allreduce_residual_rmsnorm(
@@ -757,6 +776,13 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     residual_out = torch.empty_like(residual)
     norm_out = torch.empty_like(input_tensor)
     return norm_out, residual_out
+
+
+def _supports_collective_topology(use_attn_tp_group: bool) -> bool:
+    """Whether one fused all-reduce covers every required reduction."""
+    return use_attn_tp_group or not (
+        get_parallel().moe_ep_size > 1 and get_parallel().moe_tp_size > 1
+    )
 
 
 @register_custom_op(
@@ -802,6 +828,11 @@ def flashinfer_allreduce_residual_rmsnorm(
     if use_attn_tp_group:
         world_size = get_parallel().attn_tp_size
     else:
+        # FlashInfer can fuse one collective. Hybrid expert + MoE tensor
+        # parallelism requires EP followed by MoE-TP, so defer both to the
+        # ordinary fallback instead of silently omitting the second reduction.
+        if not _supports_collective_topology(use_attn_tp_group=False):
+            return None, None
         if get_parallel().moe_ep_size > 1:
             world_size = get_parallel().moe_ep_size
         else:
@@ -991,6 +1022,12 @@ def pre_initialize_workspaces(
         use_oneshot=use_oneshot,
         use_attn_tp_group=True,
     )
+
+
+def freeze_flashinfer_workspaces():
+    """Prevent graph-captured workspace addresses from being replaced."""
+    _get_workspace_manager(use_attn_tp_group=False)._freeze()
+    _get_workspace_manager(use_attn_tp_group=True)._freeze()
 
 
 def cleanup_flashinfer_workspace():

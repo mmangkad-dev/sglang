@@ -53,7 +53,10 @@ from sglang.srt.layers.dp_attention import (
     is_enable_moe_cp_allgather,
     moe_cp_all_gather_into_tensor,
 )
-from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
+from sglang.srt.layers.flashinfer_comm_fusion import (
+    _supports_collective_topology,
+    is_flashinfer_allreduce_unavailable,
+)
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
@@ -157,11 +160,6 @@ def _fused_rmsnorm_fp8_per_token_quant(
         return (out_fp8, scale.unsqueeze(1))
 
 
-# TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
-# We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
-FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
-
-
 def apply_flashinfer_allreduce_fusion(batch_size: int):
     return (
         # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
@@ -175,7 +173,6 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         # the dynamic token dim, so statically-off configs must short-circuit
         # before reaching them.
         and batch_size > 0
-        and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
     )
 
 
@@ -528,36 +525,10 @@ class LayerCommunicator:
                 gathered_last_layer_output is residual
                 # An accumulator that copies on append already holds a snapshot.
                 and not getattr(captured_last_layer_outputs, "copies_on_append", False)
-                and not self._post_attn_residual_is_read_only(residual)
             ):
                 gathered_last_layer_output = residual.clone()
             captured_last_layer_outputs.append(gathered_last_layer_output)
         return hidden_states, residual
-
-    def _post_attn_residual_is_read_only(self, residual: torch.Tensor) -> bool:
-        """True if ``prepare_mlp``'s post-attention RMSNorm leaves ``residual``
-        untouched, so Eagle3 aux capture can keep its reference and skip the clone.
-
-        Only the flashinfer all-reduce-fusion path writes a fresh ``residual_out``
-        (see ``flashinfer_allreduce_residual_rmsnorm``); the aiter fused kernel and
-        every plain norm fold into ``residual`` in place. That path is reachable
-        only from the ``_gather_*`` communicate-fns, and only when they fall past
-        their input-scattered branch.
-        """
-        norm_fn = getattr(
-            self._communicate_with_all_reduce_and_layer_norm_fn,
-            "func",
-            self._communicate_with_all_reduce_and_layer_norm_fn,
-        )
-        uses_gather_norm = norm_fn in (
-            CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
-            CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual_moe,
-        )
-        return (
-            uses_gather_norm
-            and not get_attn_tp_context().input_scattered
-            and apply_flashinfer_allreduce_fusion(residual.shape[0])
-        )
 
     def prepare_attn(
         self,
@@ -851,7 +822,12 @@ class LayerCommunicator:
 
         return (
             (
-                apply_flashinfer_allreduce_fusion(batch_size)
+                (
+                    apply_flashinfer_allreduce_fusion(batch_size)
+                    # FlashInfer fuses exactly one collective, while hybrid MoE
+                    # parallelism requires EP followed by MoE-TP.
+                    and _supports_collective_topology(use_attn_tp_group=False)
+                )
                 or (
                     _use_aiter
                     and batch_size > 0

@@ -199,6 +199,9 @@ def _forward_with_allreduce_fusion(
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
+            attention_tensor_model_parallel_all_reduce,
+            moe_expert_parallel_all_reduce,
+            moe_tensor_model_parallel_all_reduce,
             tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
@@ -206,7 +209,9 @@ def _forward_with_allreduce_fusion(
             flashinfer_allreduce_residual_rmsnorm,
         )
 
-        if use_attn_tp_group:
+        if _use_aiter:
+            world_size = get_parallel().tp_size
+        elif use_attn_tp_group:
             world_size = get_parallel().attn_tp_size
         else:
             if get_parallel().moe_ep_size > 1:
@@ -231,16 +236,26 @@ def _forward_with_allreduce_fusion(
                     residual=residual,
                     weight=weight,
                     eps=norm_module.variance_epsilon,
-                    max_token_num=max(x.shape[0], 2048),
+                    max_token_num=x.shape[0],
                     use_attn_tp_group=use_attn_tp_group,
                 )
                 if fused_result[0] is not None:
                     return fused_result
 
-            # For AITER route, preserve correctness when fused path is unavailable.
-            if _use_aiter and get_exec().comm.enable_aiter_allreduce_fusion:
+            # A fused backend may reject the shape or fail workspace setup.
+            # Preserve the collective before falling back to ordinary RMSNorm.
+            if _use_aiter:
                 x = tensor_model_parallel_all_reduce(x)
-                return norm_module.forward(x, residual, None)
+            elif use_attn_tp_group:
+                all_reduce = attention_tensor_model_parallel_all_reduce
+                x = all_reduce(x)
+            elif get_parallel().moe_ep_size > 1:
+                x = moe_expert_parallel_all_reduce(x)
+                if get_parallel().moe_tp_size > 1:
+                    x = moe_tensor_model_parallel_all_reduce(x)
+            else:
+                x = moe_tensor_model_parallel_all_reduce(x)
+            return norm_module.forward(x, residual, None)
 
     return norm_module.forward(x, residual, post_residual_addition)
 
