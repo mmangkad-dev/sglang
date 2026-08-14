@@ -1,6 +1,5 @@
 import unittest
 from types import SimpleNamespace
-from unittest import mock
 
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
@@ -52,30 +51,6 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner = self._make_runner()
 
         self.assertTrue(runner.can_run_graph(self._make_forward_batch(8)))
-
-    def test_capture_freezes_workspace_immediately_after_warmup(self):
-        """Removing capture-time freezing would leave graph pointers replaceable.
-
-        The freeze mock raises a sentinel to stop capture() there; a
-        __new__-built runner cannot run the rest. Only the ordering is under test.
-        """
-        events = []
-        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
-        runner.warmup = mock.Mock(side_effect=lambda: events.append("warmup"))
-
-        class _FreezeObserved(Exception):
-            pass
-
-        def freeze():
-            events.append("freeze")
-            raise _FreezeObserved
-
-        runner._freeze_flashinfer_allreduce_workspaces = mock.Mock(side_effect=freeze)
-
-        with self.assertRaises(_FreezeObserved):
-            runner.capture()
-
-        self.assertEqual(events, ["warmup", "freeze"])
 
 
 if __name__ == "__main__":

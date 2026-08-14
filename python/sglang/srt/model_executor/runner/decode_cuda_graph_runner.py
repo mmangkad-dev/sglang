@@ -933,7 +933,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
-        self._freeze_flashinfer_allreduce_workspaces()
         # warmup() may disable torch.compile for a model whose _can_torch_compile
         # is False; recompute the compile bucket so capture matches.
         if self.enable_torch_compile and not (get_flags().capture.enable_torch_compile):

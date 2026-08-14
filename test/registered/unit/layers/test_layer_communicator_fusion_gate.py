@@ -1,10 +1,12 @@
 import types
 import unittest
+from contextlib import ExitStack
 from unittest.mock import patch
 
 from sglang.srt.layers import communicator as comm
 from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -31,22 +33,44 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
     Qwen3-30B-A3B with --tp-size 4 --ep-size 2.
     """
 
-    def _should_fuse(self, *, moe_ep_size, moe_tp_size):
+    def _should_fuse(self, *, moe_ep_size, moe_tp_size, aiter=False):
         forward_batch = types.SimpleNamespace(
             input_ids=types.SimpleNamespace(shape=(8,))
         )
-        with (
-            patch.object(comm, "is_enable_moe_cp_allgather", return_value=False),
-            patch.object(comm, "apply_flashinfer_allreduce_fusion", return_value=True),
-            patch.object(
-                comm,
-                "get_attn_tp_context",
-                return_value=types.SimpleNamespace(input_scattered=False),
-            ),
-            get_parallel().override(
-                moe_ep_size=moe_ep_size, moe_tp_size=moe_tp_size, tp_size=4
-            ),
-        ):
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(comm, "is_enable_moe_cp_allgather", return_value=False)
+            )
+            stack.enter_context(patch.object(comm, "_use_aiter", aiter))
+            stack.enter_context(
+                patch.object(
+                    comm, "apply_flashinfer_allreduce_fusion", return_value=not aiter
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    comm,
+                    "get_attn_tp_context",
+                    return_value=types.SimpleNamespace(input_scattered=False),
+                )
+            )
+            stack.enter_context(
+                get_parallel().override(
+                    moe_ep_size=moe_ep_size, moe_tp_size=moe_tp_size, tp_size=4
+                )
+            )
+            if aiter:
+                # Only the AITER branch reads these; the FlashInfer branch
+                # short-circuits before them.
+                stack.enter_context(
+                    get_context().override_server_args(
+                        enable_aiter_allreduce_fusion=True
+                    )
+                )
+                stack.enter_context(get_flags().dp.override(enabled=False))
+                stack.enter_context(
+                    get_flags().moe.override(a2a_backend=MoeA2ABackend.NONE)
+                )
             return LayerCommunicator.should_fuse_mlp_allreduce_with_next_layer(
                 _fake_communicator(), forward_batch
             )
@@ -59,6 +83,11 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
 
     def test_pure_ep_still_fuses(self):
         self.assertTrue(self._should_fuse(moe_ep_size=4, moe_tp_size=1))
+
+    def test_hybrid_ep_tp_still_fuses_under_aiter(self):
+        """AITER reduces over the whole TP group, the same sum as EP then MoE-TP,
+        so the FlashInfer-only restriction must not disable it."""
+        self.assertTrue(self._should_fuse(moe_ep_size=2, moe_tp_size=2, aiter=True))
 
 
 if __name__ == "__main__":
