@@ -963,18 +963,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight, layer.w2_weight_scale, num_warps
             )
 
-            # Rebind the existing Parameters so state exports contain the
+            # Rebind the existing weight Parameters so state exports contain the
             # tensors consumed by Triton while preserving weight-loader attrs.
             # Keep the wrappers' original Tensor objects while sharing their
             # backing storage with the registered Parameters.
             for name, tensor in (
                 ("w13_weight", w13_weight),
-                ("w13_weight_scale", w13_scale),
                 ("w2_weight", w2_weight),
-                ("w2_weight_scale", w2_scale),
             ):
                 param = getattr(layer, name)
                 param.data = tensor.storage.data
+
+            # The scales must NOT be rebound the same way: repointing them frees
+            # the pre-swizzle scale storage, and the Hopper mxfp4 matmul then
+            # faults with an illegal address on the released pages. Leave the
+            # registered scale Parameters alone and publish the swizzled scales
+            # under their own names, so they still round trip through the
+            # sharded state and land in the buffers the kernels read.
+            for name, tensor in (
+                ("w13_weight_scale_triton", w13_scale),
+                ("w2_weight_scale_triton", w2_scale),
+            ):
+                layer.register_buffer(name, tensor.storage.data, persistent=True)
 
             self.w13_precision_config = PrecisionConfig(
                 b_mx_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
