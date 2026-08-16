@@ -1655,6 +1655,21 @@ class DummyModelLoader(BaseModelLoader):
         return model.eval()
 
 
+def _materialize_for_save(tensor: torch.Tensor) -> torch.Tensor:
+    """Prepare one state-dict tensor for a save boundary.
+
+    ``_filter_subtensors`` deliberately passes non-contiguous tensors through
+    (kernel-ready layouts such as the MXFP4 Triton swizzle are strided views),
+    and safetensors rejects those, so every writer has to materialize first.
+    Repack on the tensor's own device rather than after the host transfer: a
+    non-contiguous CUDA tensor would otherwise cross PCIe as a strided copy and
+    then be re-laid-out on the CPU. The intermediate is freed as soon as the
+    caller stores the result, so the extra device memory is one tensor rather
+    than a whole part. The live runtime layout is never modified.
+    """
+    return tensor.contiguous().to("cpu")
+
+
 class ShardedStateLoader(BaseModelLoader):
     """
     Model loader that directly loads each worker's model state dict, which
@@ -1831,11 +1846,7 @@ class ShardedStateLoader(BaseModelLoader):
                 part_idx += 1
                 total_size = 0
                 state_dict_part = {}
-            # Kernel-ready layouts can be non-contiguous. Materialize them at
-            # the save boundary without changing the live runtime layout.
-            state_dict_part[key] = (
-                tensor.detach().to(device="cpu", copy=False).contiguous()
-            )
+            state_dict_part[key] = _materialize_for_save(tensor)
             total_size += param_size
         if len(state_dict_part) > 0:
             filename = pattern.format(rank=rank, part=part_idx)
@@ -3520,7 +3531,7 @@ class RemoteModelLoader(BaseModelLoader):
             state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
             for key, tensor in state_dict.items():
                 r_key = f"{model_name}/keys/rank_{rank}/{key}"
-                client.set(r_key, tensor)
+                client.set(r_key, _materialize_for_save(tensor))
 
             for root, _, files in os.walk(model_path):
                 for file_name in files:

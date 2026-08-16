@@ -392,10 +392,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.with_bias = with_bias
         mxfp4_block = 32
         triton_kernels_padding_alignment = 64
-        # These Parameters are also referenced by Triton wrappers, which are
-        # outside the temporary parameter mapping used by CPU offload.
+        # w13_weight/w2_weight are rebound to Triton wrapper storage in
+        # process_weights_after_loading, and those wrappers sit outside the
+        # temporary parameter mapping CPU offload installs, so the offloaders
+        # must leave them on device. Note this marker is read at construction
+        # time -- make_layers wraps the layer before any weight is loaded or
+        # swizzled -- so it has to be set here rather than at swizzle time.
+        # Only the two weights are marked: the scale Parameters are never
+        # rebound, so offloading them stays safe.
         triton_runtime_attrs = (
-            {"_sglang_keep_on_device": True} if self.use_triton_kernels else None
+            {"_sglang_keep_on_device": True} if self.use_triton_kernels else {}
         )
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
@@ -484,8 +490,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         layer.register_parameter("w13_weight", w13_weight)
-        set_weight_attrs(w13_weight, extra_weight_attrs)
-        set_weight_attrs(w13_weight, triton_runtime_attrs)
+        set_weight_attrs(w13_weight, {**extra_weight_attrs, **triton_runtime_attrs})
 
         w13_weight_scale = torch.nn.Parameter(
             torch.full(
@@ -501,7 +506,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
-        set_weight_attrs(w13_weight_scale, triton_runtime_attrs)
         w13_weight_scale.quant_method = "group"
 
         create_bias = with_bias or not _is_hip
@@ -528,8 +532,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         layer.register_parameter("w2_weight", w2_weight)
-        set_weight_attrs(w2_weight, extra_weight_attrs)
-        set_weight_attrs(w2_weight, triton_runtime_attrs)
+        set_weight_attrs(w2_weight, {**extra_weight_attrs, **triton_runtime_attrs})
 
         w2_weight_scale = torch.nn.Parameter(
             torch.full(
@@ -545,7 +548,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
-        set_weight_attrs(w2_weight_scale, triton_runtime_attrs)
         w2_weight_scale.quant_method = "group"
 
         if create_bias:
@@ -974,12 +976,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 param = getattr(layer, name)
                 param.data = tensor.storage.data
 
-            # The scales must NOT be rebound the same way: repointing them frees
-            # the pre-swizzle scale storage, and the Hopper mxfp4 matmul then
-            # faults with an illegal address on the released pages. Leave the
-            # registered scale Parameters alone and publish the swizzled scales
-            # under their own names, so they still round trip through the
-            # sharded state and land in the buffers the kernels read.
+            # The scales must NOT be rebound the same way. Repointing them
+            # reliably makes test_gpt_oss_4gpu_mxfp4 die with an illegal address
+            # in _matmul_NNT_bf16xbf16xmxfp4_16x256x128x1_swiglu, on the first
+            # real batch after warmup. Bisecting the four entries on that test:
+            # rebinding both weights passes, rebinding either scale reproduces
+            # the fault. The causal chain past that is NOT established -- note
+            # the swizzled scale owns its own, larger storage (the layout pads
+            # it), so what repointing releases is the pre-swizzle scale, which
+            # no kernel reads. Do not "clean this up" into a symmetric rebind
+            # without re-running that test.
+            #
+            # Instead publish the swizzled scales under their own names, so they
+            # still round trip through the sharded state: they reach
+            # state_dict() and a sharded load copies into the storage the
+            # kernels read, exactly as the rebound weights do.
             for name, tensor in (
                 ("w13_weight_scale_triton", w13_scale),
                 ("w2_weight_scale_triton", w2_scale),
