@@ -1656,16 +1656,12 @@ class DummyModelLoader(BaseModelLoader):
 
 
 def _materialize_for_save(tensor: torch.Tensor) -> torch.Tensor:
-    """Prepare one state-dict tensor for a save boundary.
+    """Make one state-dict tensor safe to write.
 
-    ``_filter_subtensors`` deliberately passes non-contiguous tensors through
-    (kernel-ready layouts such as the MXFP4 Triton swizzle are strided views),
-    and safetensors rejects those, so every writer has to materialize first.
-    Repack on the tensor's own device rather than after the host transfer: a
-    non-contiguous CUDA tensor would otherwise cross PCIe as a strided copy and
-    then be re-laid-out on the CPU. The intermediate is freed as soon as the
-    caller stores the result, so the extra device memory is one tensor rather
-    than a whole part. The live runtime layout is never modified.
+    ``_filter_subtensors`` passes non-contiguous tensors through (kernel-ready
+    layouts are strided views) and safetensors rejects those. Repack on the
+    tensor's own device so a strided copy never crosses PCIe; the intermediate
+    is freed per tensor. The live runtime layout is untouched.
     """
     return tensor.contiguous().to("cpu")
 

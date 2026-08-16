@@ -392,14 +392,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.with_bias = with_bias
         mxfp4_block = 32
         triton_kernels_padding_alignment = 64
-        # w13_weight/w2_weight are rebound to Triton wrapper storage in
-        # process_weights_after_loading, and those wrappers sit outside the
-        # temporary parameter mapping CPU offload installs, so the offloaders
-        # must leave them on device. Note this marker is read at construction
-        # time -- make_layers wraps the layer before any weight is loaded or
-        # swizzled -- so it has to be set here rather than at swizzle time.
-        # Only the two weights are marked: the scale Parameters are never
-        # rebound, so offloading them stays safe.
+        # w13/w2_weight get rebound onto Triton wrapper storage in
+        # process_weights_after_loading, and those wrappers are invisible to the
+        # parameter mapping CPU offload installs, so they must stay on device.
+        # Set here because the marker is read at construction time: make_layers
+        # wraps the layer before anything is loaded or swizzled. Scales are
+        # never rebound, so they stay offloadable.
         triton_runtime_attrs = (
             {"_sglang_keep_on_device": True} if self.use_triton_kernels else {}
         )
@@ -965,10 +963,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight, layer.w2_weight_scale, num_warps
             )
 
-            # Rebind the existing weight Parameters so state exports contain the
-            # tensors consumed by Triton while preserving weight-loader attrs.
-            # Keep the wrappers' original Tensor objects while sharing their
-            # backing storage with the registered Parameters.
+            # Rebind the weight Parameters onto the wrapper storage so exports
+            # carry what Triton reads, keeping weight-loader attrs intact.
             for name, tensor in (
                 ("w13_weight", w13_weight),
                 ("w2_weight", w2_weight),
@@ -976,21 +972,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 param = getattr(layer, name)
                 param.data = tensor.storage.data
 
-            # The scales must NOT be rebound the same way. Repointing them
-            # reliably makes test_gpt_oss_4gpu_mxfp4 die with an illegal address
-            # in _matmul_NNT_bf16xbf16xmxfp4_16x256x128x1_swiglu, on the first
-            # real batch after warmup. Bisecting the four entries on that test:
-            # rebinding both weights passes, rebinding either scale reproduces
-            # the fault. The causal chain past that is NOT established -- note
-            # the swizzled scale owns its own, larger storage (the layout pads
-            # it), so what repointing releases is the pre-swizzle scale, which
-            # no kernel reads. Do not "clean this up" into a symmetric rebind
-            # without re-running that test.
-            #
-            # Instead publish the swizzled scales under their own names, so they
-            # still round trip through the sharded state: they reach
-            # state_dict() and a sharded load copies into the storage the
-            # kernels read, exactly as the rebound weights do.
+            # Scales must NOT be rebound the same way: repointing either one
+            # makes test_gpt_oss_4gpu_mxfp4 die with an illegal address in
+            # _matmul_NNT_bf16xbf16xmxfp4_16x256x128x1_swiglu on the first real
+            # batch after warmup, while rebinding both weights is fine. The
+            # cause past that is NOT established -- the swizzled scale owns
+            # separate padded storage, so repointing only releases the
+            # pre-swizzle scale, which no kernel reads. Don't make this
+            # symmetric without rerunning that test. Publishing them under
+            # their own names still round trips: they reach state_dict() and a
+            # sharded load copies into the storage the kernels read.
             for name, tensor in (
                 ("w13_weight_scale_triton", w13_scale),
                 ("w2_weight_scale_triton", w2_scale),

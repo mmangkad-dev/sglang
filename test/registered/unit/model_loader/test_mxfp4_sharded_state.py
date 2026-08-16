@@ -23,14 +23,12 @@ from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod  # noqa: E402
 from sglang.srt.model_loader.loader import ShardedStateLoader  # noqa: E402
 from sglang.srt.utils.offloader import OffloaderV1  # noqa: E402
 
-# Weights are rebound in place: the registered Parameter is repointed at the
-# storage the Triton wrapper reads. Scales are not -- repointing them triggers
-# an illegal address in the Hopper mxfp4 matmul (see mxfp4.py) -- so the
-# swizzled scales are published as separate persistent buffers instead.
+# Weights are rebound onto the Triton wrapper storage; scales are not, since
+# repointing them triggers an illegal address in the mxfp4 matmul (see
+# mxfp4.py), so the swizzled scales are published as separate buffers.
 _RUNTIME_WEIGHT_NAMES = ("w13_weight", "w2_weight")
 _RUNTIME_SCALE_NAMES = ("w13_weight_scale_triton", "w2_weight_scale_triton")
 _RUNTIME_STATE_NAMES = _RUNTIME_WEIGHT_NAMES + _RUNTIME_SCALE_NAMES
-# The pre-swizzle scale Parameters, which must survive post-processing untouched.
 _PRESWIZZLE_SCALE_NAMES = ("w13_weight_scale", "w2_weight_scale")
 
 
@@ -106,13 +104,12 @@ def _storage_offsets(tensor):
 
 
 class TestMxfp4SwizzledStorageCoverage(CustomTestCase):
-    """The save/load round trip materializes the swizzled tensors with
-    `.contiguous()` and restores them with `copy_`, which only moves logically
-    reachable elements. That is byte-exact only while every storage byte of a
-    swizzled tensor is addressed by exactly one logical index. This is a
-    property of triton_kernels' layouts, not of this repo, so pin it directly:
-    a layout bump that introduces unreachable padding must fail here rather
-    than surface as an accuracy drop in a reloaded checkpoint.
+    """Pin the layout property the save/load round trip depends on.
+
+    `.contiguous()` + `copy_` only move logically reachable elements, so the
+    round trip is byte-exact only while every storage byte is addressed by
+    exactly one logical index. That is triton_kernels' behavior, not ours, so a
+    layout bump must fail here instead of as a silent accuracy drop.
     """
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
@@ -147,14 +144,12 @@ class TestMxfp4SwizzledStorageCoverage(CustomTestCase):
             ("scale", swizzled_scale),
         ):
             tensor = wrapper.storage.data
-            # No storage byte is unreachable from a logical index.
             self.assertEqual(
                 tensor.numel() * tensor.element_size(),
                 tensor.untyped_storage().nbytes(),
-                f"{name}: swizzled layout has unreachable storage bytes, so "
-                f"contiguous()/copy_ would silently drop them on reload",
+                f"{name}: unreachable storage bytes, which contiguous()/copy_ "
+                f"would silently drop on reload",
             )
-            # ...and no byte is addressed twice.
             offsets = _storage_offsets(tensor)
             self.assertEqual(
                 offsets.unique().numel(),
@@ -230,8 +225,8 @@ class TestMxfp4ShardedState(CustomTestCase):
                 destination_state,
             ),
         ):
-            # Every tensor the kernels read must be exported, and must be the
-            # same storage the kernels read, so a sharded load lands in it.
+            # Everything the kernels read is exported, and is the same storage
+            # they read, so a sharded load lands in it.
             for name in _RUNTIME_STATE_NAMES:
                 self.assertIn(name, state)
                 entry = getattr(layer, name)
@@ -242,15 +237,13 @@ class TestMxfp4ShardedState(CustomTestCase):
                 )
                 self.assertEqual(runtime_tensor.storage.data.stride(), entry.stride())
 
-            # The weight Parameters are rebound in place, so identity and the
-            # weight-loader attrs they carry must survive.
+            # Rebound in place, so identity and weight-loader attrs survive.
             for name in _RUNTIME_WEIGHT_NAMES:
                 parameter = getattr(layer, name)
                 self.assertIs(parameter, original_parameters[name])
                 self.assertTrue(parameter._sglang_keep_on_device)
 
-            # The pre-swizzle scale Parameters must be left completely alone:
-            # repointing them is what triggers the illegal memory access.
+            # Left completely alone: repointing these is what faults.
             runtime_scale_ptrs = {
                 runtime_tensors[name].storage.data.data_ptr()
                 for name in _RUNTIME_SCALE_NAMES
