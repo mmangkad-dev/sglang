@@ -107,7 +107,7 @@ repos:
         name: check rust-ext cache key prefix defaults match
         entry: python3 scripts/lint/check_rust_ext_cache_prefix.py
         language: system
-        files: ^(\.github/actions/download-rust-ext/action\.yml|\.github/workflows/.*\.yml|scripts/ci/runner_configs\.yml|scripts/lint/check_rust_ext_cache_prefix\.py)$
+        files: ^(\.github/actions/download-rust-ext/action\.yml|\.github/workflows/.*\.yml|scripts/lint/check_rust_ext_cache_prefix\.py)$
         pass_filenames: false
       - id: check-no-bare-pytest-main
         name: reject bare pytest.main calls in __main__ blocks

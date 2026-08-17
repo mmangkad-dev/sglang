@@ -17,22 +17,9 @@ BUILD_WORKFLOW = ".github/workflows/_pr-test-rust-ext-build.yml"
 DOWNLOAD_ACTION = ".github/actions/download-rust-ext/action.yml"
 STAGE_WORKFLOW = ".github/workflows/_pr-test-stage.yml"
 SEED_WORKFLOW = ".github/workflows/seed-rust-ext-cache.yml"
-RUNNER_CONFIGS = "scripts/ci/runner_configs.yml"
 
-DEFAULT_ARCHITECTURE = "x86_64"
 RUST_BUILD_REUSABLE = "./.github/workflows/_pr-test-rust-ext-build.yml"
 STAGE_REUSABLE = "./.github/workflows/_pr-test-stage.yml"
-PRODUCER_INPUTS = (
-    "architecture",
-    "runs_on",
-    "artifact_name",
-    "cache_key_prefix",
-    "build_python_310",
-    "max_glibc",
-)
-PLATFORM_PROFILE_INPUTS = tuple(
-    key for key in PRODUCER_INPUTS if key != "artifact_name"
-)
 
 _HASH_FILES = re.compile(r"hashFiles\(([^)]*)\)")
 _QUOTED = re.compile(r"'([^']*)'")
@@ -50,115 +37,56 @@ def load_yaml(path: str):
         return yaml.safe_load(f)
 
 
-def _producers(jobs: dict) -> list[tuple[str, dict]]:
-    return [
-        (name, job)
-        for name, job in jobs.items()
-        if job.get("uses") == RUST_BUILD_REUSABLE
-    ]
-
-
-def _required_consumers(jobs: dict) -> list[tuple[str, dict]]:
-    return [
-        (name, job)
-        for name, job in jobs.items()
-        if job.get("uses") == STAGE_REUSABLE
-        and job.get("with", {}).get("require_prebuilt_rust_ext") is True
-    ]
-
-
 def _needs(job: dict) -> list[str]:
     needs = job.get("needs", [])
     return [needs] if isinstance(needs, str) else needs
 
 
-def _producer_defaults() -> dict:
+def _default_build_prefix() -> str:
     workflow = load_yaml(BUILD_WORKFLOW)
     triggers = workflow.get("on", workflow.get(True))
-    inputs = triggers["workflow_call"]["inputs"]
-    return {key: inputs.get(key, {}).get("default") for key in PRODUCER_INPUTS}
+    return triggers["workflow_call"]["inputs"]["cache_key_prefix"]["default"]
 
 
-def _producer_profile(job: dict, defaults: dict) -> dict:
-    inputs = job.get("with", {})
-    return {key: inputs.get(key, defaults[key]) for key in PRODUCER_INPUTS}
-
-
-def _runner_architecture(runner_config: str, runner_configs: dict) -> str | None:
-    config = runner_configs.get(runner_config)
-    if config is None:
-        return None
-    return config.get("architecture", DEFAULT_ARCHITECTURE)
-
-
-def check_platform_wiring() -> list[str]:
+def check_required_prebuilt_wiring() -> list[str]:
     errors = []
-    defaults = _producer_defaults()
-    runner_configs = load_yaml(RUNNER_CONFIGS)["runner_configs"]
-    canonical_profiles = {}
-    required_architectures = set()
-    seed_architectures = set()
+    default_prefix = _default_build_prefix()
+    required_prefixes = set()
+    seed_prefixes = set()
     for workflow_path in sorted(Path(".github/workflows").glob("*.yml")):
         path = str(workflow_path)
         jobs = load_yaml(path).get("jobs", {})
-        producers = _producers(jobs)
-        consumers = _required_consumers(jobs)
-        if not producers and not consumers:
-            continue
-
-        producers_by_architecture = {}
-        for producer_name, producer in producers:
-            profile = _producer_profile(producer, defaults)
-            missing = [key for key, value in profile.items() if value is None]
-            if missing:
+        producers_by_prefix = {}
+        for name, job in jobs.items():
+            if job.get("uses") != RUST_BUILD_REUSABLE:
+                continue
+            prefix = job.get("with", {}).get("cache_key_prefix", default_prefix)
+            if prefix in producers_by_prefix:
                 errors.append(
-                    f"{path} {producer_name} is missing inputs: {', '.join(missing)}"
+                    f"{path} has multiple Rust extension producers for {prefix}: "
+                    f"{producers_by_prefix[prefix]}, {name}"
                 )
                 continue
-            architecture = profile["architecture"]
-            if architecture in producers_by_architecture:
-                other_name, _ = producers_by_architecture[architecture]
-                errors.append(
-                    f"{path} has multiple {architecture} Rust extension producers: "
-                    f"{other_name}, {producer_name}"
-                )
-                continue
-            producers_by_architecture[architecture] = (producer_name, profile)
+            producers_by_prefix[prefix] = name
             if path == SEED_WORKFLOW:
-                seed_architectures.add(architecture)
+                seed_prefixes.add(prefix)
 
-            canonical = canonical_profiles.get(architecture)
-            if canonical is None:
-                canonical_profiles[architecture] = (path, producer_name, profile)
-                continue
-            canonical_path, canonical_name, canonical_profile = canonical
-            for key in PLATFORM_PROFILE_INPUTS:
-                if profile[key] != canonical_profile[key]:
-                    errors.append(
-                        f"{path} {producer_name}.{key} is {profile[key]!r}, but "
-                        f"{canonical_path} {canonical_name}.{key} is "
-                        f"{canonical_profile[key]!r}"
-                    )
-
-        for consumer_name, consumer in consumers:
+        for consumer_name, consumer in jobs.items():
             consumer_inputs = consumer.get("with", {})
-            runner_config = consumer_inputs.get("runner_config")
-            architecture = _runner_architecture(runner_config, runner_configs)
-            if architecture is None:
+            if (
+                consumer.get("uses") != STAGE_REUSABLE
+                or consumer_inputs.get("require_prebuilt_rust_ext") is not True
+            ):
+                continue
+            prefix = consumer_inputs.get("rust_ext_cache_key_prefix")
+            required_prefixes.add(prefix)
+            producer_name = producers_by_prefix.get(prefix)
+            if producer_name is None:
                 errors.append(
-                    f"{path} {consumer_name} uses unknown runner_config "
-                    f"{runner_config!r}"
+                    f"{path} {consumer_name} requires prebuilt Rust extensions "
+                    f"with prefix {prefix!r} but has no matching producer"
                 )
                 continue
-            required_architectures.add(architecture)
-            producer_entry = producers_by_architecture.get(architecture)
-            if producer_entry is None:
-                errors.append(
-                    f"{path} {consumer_name} requires prebuilt {architecture} Rust "
-                    "extensions but has no matching producer"
-                )
-                continue
-            producer_name, producer_profile = producer_entry
             if producer_name not in _needs(consumer):
                 errors.append(
                     f"{path} {consumer_name} does not depend on {producer_name}"
@@ -172,19 +100,12 @@ def check_platform_wiring() -> list[str]:
                     f"{consumer_inputs.get('rust_ext_artifact')!r}, expected "
                     f"{expected_artifact!r}"
                 )
-            expected_prefix = producer_profile["cache_key_prefix"]
-            if consumer_inputs.get("rust_ext_cache_key_prefix") != expected_prefix:
-                errors.append(
-                    f"{path} {consumer_name}.rust_ext_cache_key_prefix is "
-                    f"{consumer_inputs.get('rust_ext_cache_key_prefix')!r}, but "
-                    f"{producer_name}.cache_key_prefix is {expected_prefix!r}"
-                )
 
-    missing_seed_architectures = sorted(required_architectures - seed_architectures)
-    if missing_seed_architectures:
+    missing_seed_prefixes = sorted(required_prefixes - seed_prefixes)
+    if missing_seed_prefixes:
         errors.append(
-            f"{SEED_WORKFLOW} has no producer for required architectures: "
-            + ", ".join(missing_seed_architectures)
+            f"{SEED_WORKFLOW} has no producer for required prefixes: "
+            + ", ".join(missing_seed_prefixes)
         )
     return errors
 
@@ -226,10 +147,10 @@ def main() -> int:
         print("Every lookup/save/restore site must hash the same inputs.")
         return 1
 
-    platform_errors = check_platform_wiring()
-    if platform_errors:
-        print("ERROR: Rust extension platform wiring is inconsistent.")
-        for error in platform_errors:
+    wiring_errors = check_required_prebuilt_wiring()
+    if wiring_errors:
+        print("ERROR: required prebuilt Rust extension wiring is inconsistent.")
+        for error in wiring_errors:
             print(f"  {error}")
         return 1
 

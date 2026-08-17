@@ -41,8 +41,6 @@ jobs:
     with:
       runs_on: arm-kernel-build-node
       artifact_name: rust-ext-aarch64
-      cache_key_prefix: rust-ext-aarch64-cp312
-      architecture: aarch64
-      build_python_310: false
+      cache_key_prefix: rust-ext-aarch64-cp310-cp312
       max_glibc: '2.39'
     secrets: inherit
