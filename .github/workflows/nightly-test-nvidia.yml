@@ -86,7 +86,9 @@ jobs:
     with:
       runs_on: arm-kernel-build-node
       artifact_name: rust-ext-aarch64
-      cache_key_prefix: rust-ext-aarch64-cp310-cp312
+      cache_key_prefix: rust-ext-aarch64-cp312
+      build_python_310: false
+      max_glibc: '2.39'
       git_ref: ${{ inputs.ref || '' }}
       skip_pr_test_health_check: true
     secrets: inherit
@@ -165,7 +167,8 @@ jobs:
       job_timeout_minutes: '420'
       scheduled: true
       rust_ext_artifact: ${{ needs.rust-ext-build-arm.outputs.artifact_name }}
-      rust_ext_cache_key_prefix: rust-ext-aarch64-cp310-cp312
+      rust_ext_cache_key_prefix: rust-ext-aarch64-cp312
+      require_prebuilt_rust_ext: true
     secrets: inherit
 
   nightly-8-gpu-h200:

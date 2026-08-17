@@ -9,6 +9,7 @@ silently fall back to source builds at install time.
 
 import re
 import sys
+from pathlib import Path
 
 import yaml
 
@@ -18,10 +19,22 @@ STAGE_WORKFLOW = ".github/workflows/_pr-test-stage.yml"
 PR_WORKFLOW = ".github/workflows/pr-test.yml"
 NIGHTLY_WORKFLOW = ".github/workflows/nightly-test-nvidia.yml"
 SEED_WORKFLOW = ".github/workflows/seed-rust-ext-cache.yml"
+RUNNER_CONFIGS = "scripts/ci/runner_configs.yml"
 
-AARCH64_ARTIFACT = "rust-ext-aarch64"
-AARCH64_CACHE_KEY_PREFIX = "rust-ext-aarch64-cp310-cp312"
-AARCH64_RUNNER = "arm-kernel-build-node"
+AARCH64 = "aarch64"
+AARCH64_CACHE_PREFIX = "rust-ext-aarch64-"
+RUST_BUILD_REUSABLE = "./.github/workflows/_pr-test-rust-ext-build.yml"
+STAGE_REUSABLE = "./.github/workflows/_pr-test-stage.yml"
+ARM_PRODUCER_INPUTS = (
+    "runs_on",
+    "artifact_name",
+    "cache_key_prefix",
+    "build_python_310",
+    "max_glibc",
+)
+ARM_CONSUMER_INPUTS = {
+    "rust_ext_cache_key_prefix": "cache_key_prefix",
+}
 
 _HASH_FILES = re.compile(r"hashFiles\(([^)]*)\)")
 _QUOTED = re.compile(r"'([^']*)'")
@@ -39,44 +52,120 @@ def load_yaml(path: str):
         return yaml.safe_load(f)
 
 
+def _aarch64_runner_configs() -> set[str]:
+    configs = load_yaml(RUNNER_CONFIGS)["runner_configs"]
+    return {
+        name
+        for name, config in configs.items()
+        if config.get("architecture") == AARCH64
+    }
+
+
+def _arm_producers(jobs: dict) -> list[tuple[str, dict]]:
+    return [
+        (name, job)
+        for name, job in jobs.items()
+        if job.get("uses") == RUST_BUILD_REUSABLE
+        and job.get("with", {})
+        .get("cache_key_prefix", "")
+        .startswith(AARCH64_CACHE_PREFIX)
+    ]
+
+
+def _arm_consumers(
+    jobs: dict, aarch64_runner_configs: set[str]
+) -> list[tuple[str, dict]]:
+    return [
+        (name, job)
+        for name, job in jobs.items()
+        if job.get("uses") == STAGE_REUSABLE
+        and job.get("with", {}).get("runner_config") in aarch64_runner_configs
+    ]
+
+
+def _needs(job: dict) -> list[str]:
+    needs = job.get("needs", [])
+    return [needs] if isinstance(needs, str) else needs
+
+
 def check_aarch64_wiring() -> list[str]:
     errors = []
-    for path, build_job, consumer_job in (
-        (PR_WORKFLOW, "rust-ext-build-arm", "base-c-test-4-gpu-gb300"),
-        (NIGHTLY_WORKFLOW, "rust-ext-build-arm", "nightly-4-gpu-gb300"),
-    ):
-        jobs = load_yaml(path)["jobs"]
-        build_inputs = jobs[build_job]["with"]
-        consumer_inputs = jobs[consumer_job]["with"]
-        expected_build_inputs = {
-            "runs_on": AARCH64_RUNNER,
-            "artifact_name": AARCH64_ARTIFACT,
-            "cache_key_prefix": AARCH64_CACHE_KEY_PREFIX,
-        }
-        for key, expected in expected_build_inputs.items():
-            if build_inputs.get(key) != expected:
-                errors.append(
-                    f"{path} {build_job}.{key} is {build_inputs.get(key)!r}, "
-                    f"expected {expected!r}"
-                )
-        if consumer_inputs.get("rust_ext_cache_key_prefix") != AARCH64_CACHE_KEY_PREFIX:
-            errors.append(
-                f"{path} {consumer_job}.rust_ext_cache_key_prefix is "
-                f"{consumer_inputs.get('rust_ext_cache_key_prefix')!r}, "
-                f"expected {AARCH64_CACHE_KEY_PREFIX!r}"
-            )
+    aarch64_runner_configs = _aarch64_runner_configs()
+    if not aarch64_runner_configs:
+        return [f"{RUNNER_CONFIGS} defines no architecture: {AARCH64} pools"]
 
-    seed_inputs = load_yaml(SEED_WORKFLOW)["jobs"]["seed-aarch64"]["with"]
-    for key, expected in {
-        "runs_on": AARCH64_RUNNER,
-        "artifact_name": AARCH64_ARTIFACT,
-        "cache_key_prefix": AARCH64_CACHE_KEY_PREFIX,
-    }.items():
-        if seed_inputs.get(key) != expected:
+    canonical_path = None
+    canonical_inputs = None
+    producer_paths = set()
+    for workflow_path in sorted(Path(".github/workflows").glob("*.yml")):
+        path = str(workflow_path)
+        jobs = load_yaml(path).get("jobs", {})
+        producers = _arm_producers(jobs)
+        consumers = _arm_consumers(jobs, aarch64_runner_configs)
+        if not producers and not consumers:
+            continue
+        if len(producers) != 1:
             errors.append(
-                f"{SEED_WORKFLOW} seed-aarch64.{key} is "
-                f"{seed_inputs.get(key)!r}, expected {expected!r}"
+                f"{path} has {len(producers)} aarch64 Rust extension producers; "
+                "expected exactly one when it produces or consumes aarch64 modules"
             )
+            continue
+
+        producer_name, producer = producers[0]
+        producer_paths.add(path)
+        producer_inputs = producer.get("with", {})
+        missing = [key for key in ARM_PRODUCER_INPUTS if key not in producer_inputs]
+        if missing:
+            errors.append(
+                f"{path} {producer_name} is missing inputs: {', '.join(missing)}"
+            )
+            continue
+
+        if canonical_inputs is None:
+            canonical_path = path
+            canonical_inputs = producer_inputs
+        else:
+            for key in ARM_PRODUCER_INPUTS:
+                if producer_inputs[key] != canonical_inputs[key]:
+                    errors.append(
+                        f"{path} {producer_name}.{key} is {producer_inputs[key]!r}, "
+                        f"but {canonical_path} uses {canonical_inputs[key]!r}"
+                    )
+
+        for consumer_name, consumer in consumers:
+            consumer_inputs = consumer.get("with", {})
+            if producer_name not in _needs(consumer):
+                errors.append(
+                    f"{path} {consumer_name} does not depend on {producer_name}"
+                )
+            expected_artifact = (
+                "${{ needs." + producer_name + ".outputs.artifact_name }}"
+            )
+            if consumer_inputs.get("rust_ext_artifact") != expected_artifact:
+                errors.append(
+                    f"{path} {consumer_name}.rust_ext_artifact is "
+                    f"{consumer_inputs.get('rust_ext_artifact')!r}, expected "
+                    f"{expected_artifact!r}"
+                )
+            if consumer_inputs.get("require_prebuilt_rust_ext") is not True:
+                errors.append(
+                    f"{path} {consumer_name}.require_prebuilt_rust_ext must be true"
+                )
+            for consumer_key, producer_key in ARM_CONSUMER_INPUTS.items():
+                if consumer_inputs.get(consumer_key) != producer_inputs[producer_key]:
+                    errors.append(
+                        f"{path} {consumer_name}.{consumer_key} is "
+                        f"{consumer_inputs.get(consumer_key)!r}, but "
+                        f"{producer_name}.{producer_key} is "
+                        f"{producer_inputs[producer_key]!r}"
+                    )
+
+    required_producer_paths = {PR_WORKFLOW, NIGHTLY_WORKFLOW, SEED_WORKFLOW}
+    missing_paths = sorted(required_producer_paths - producer_paths)
+    if missing_paths:
+        errors.append(
+            "missing aarch64 Rust extension producer in: " + ", ".join(missing_paths)
+        )
     return errors
 
 

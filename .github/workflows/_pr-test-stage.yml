@@ -62,6 +62,10 @@ on:
         description: 'Architecture and Python-ABI-specific cache prefix used when the Rust extension artifact is unavailable.'
         type: string
         default: 'rust-ext-x86_64-cp310-cp312'
+      require_prebuilt_rust_ext:
+        description: 'Fail instead of compiling from source when the exact prebuilt Rust extension ABI is unavailable.'
+        type: boolean
+        default: false
 
       scheduled:
         description: 'The caller is a nightly or weekly workflow, not a per-commit one. Switches on per-file timeouts derived from est_time, the full jit_kernel grids, metrics upload, and serial shards unless dispatched with full_parallel.'
@@ -146,15 +150,51 @@ jobs:
           merge-multiple: true
           pattern: wheel-python3.10-cuda*
 
+      # Editable-install source builds remain covered by pr-test-rust.yml and
+      # pr-test-sgl-router.yml; CUDA stages consume the per-architecture build.
       - uses: ./.github/actions/download-rust-ext
+        id: rust_ext
         with:
           artifact_name: ${{ inputs.rust_ext_artifact }}
           cache_key_prefix: ${{ inputs.rust_ext_cache_key_prefix }}
+
+      - name: Require matching prebuilt Rust extensions
+        if: inputs.require_prebuilt_rust_ext
+        env:
+          RUST_EXT_HIT: ${{ steps.rust_ext.outputs.hit }}
+        run: |
+          set -euo pipefail
+          if [ "${RUST_EXT_HIT}" != "true" ]; then
+              echo "::error::No prebuilt Rust extensions were restored"
+              exit 1
+          fi
+          suffix="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+          for module in server grpc multimodal; do
+              path="python/sglang/srt/rust_extensions/_${module}${suffix}"
+              if [ ! -f "${path}" ]; then
+                  echo "::error::Missing prebuilt Rust extension ${path}"
+                  exit 1
+              fi
+          done
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ fromJson(inputs.check_changes).sgl_kernel }} bash ${{ steps.rc.outputs.install }}
+
+      - name: Import required prebuilt Rust extensions
+        if: inputs.require_prebuilt_rust_ext
+        run: |
+          set -euo pipefail
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
+          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
+          python3 - <<'PY'
+          import importlib
+
+          for module in ("server", "grpc", "multimodal"):
+              importlib.import_module(f"sglang.srt.rust_extensions._{module}")
+              print(f"imported sglang.srt.rust_extensions._{module}")
+          PY
 
       - name: Warmup DeepGEMM JIT Compilation
         if: inputs.warmup_deep_gemm_models != ''

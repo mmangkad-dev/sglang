@@ -24,7 +24,7 @@ on:
   workflow_call:
     inputs:
       runs_on:
-        description: 'Runner label for the compile job. Must be self-hosted: its glibc has to satisfy max_glibc, and the cargo build cache needs a persistent ~/.cache.'
+        description: 'Runner label for the compile job. Must be self-hosted for the persistent cargo cache; built modules are checked against max_glibc before publication.'
         type: string
         required: true
       restore_runs_on:
@@ -39,8 +39,12 @@ on:
         description: 'Cache key prefix. Callers share it on purpose to reuse each other''s build; it encodes the arch and the interpreter ABI set, since the modules are portable across neither.'
         type: string
         default: rust-ext-x86_64-cp310-cp312
+      build_python_310:
+        description: 'Build Python 3.10 modules in addition to the always-built Python 3.12 modules.'
+        type: boolean
+        default: true
       max_glibc:
-        description: 'Highest GLIBC symbol version the built .so files may require. Set by the oldest test runner image, jammy at glibc 2.35 - the pools are not all on one image.'
+        description: 'Highest GLIBC symbol version the built .so files may require. Consumers independently verify that their host provides at least this version.'
         type: string
         default: '2.35'
       git_ref:
@@ -162,6 +166,7 @@ jobs:
       # No crate sets abi3, so build one module set per interpreter the pools
       # run (h100 ships 3.10, h20 ships 3.12); EXT_SUFFIX keeps them apart.
       - name: Set up Python 3.10
+        if: inputs.build_python_310
         id: py310
         uses: actions/setup-python@v5
         with:
@@ -199,7 +204,11 @@ jobs:
           # Best-effort, like ci_cleanup_venv.sh: under set -e a failing EXIT trap
           # would fail the step, and nothing here is worth keeping for a postmortem.
           trap 'rm -rf "${venv_root}" || true' EXIT
-          for python_bin in "${{ steps.py310.outputs.python-path }}" "${{ steps.py312.outputs.python-path }}"; do
+          python_bins=("${{ steps.py312.outputs.python-path }}")
+          if [ "${{ inputs.build_python_310 }}" = "true" ]; then
+              python_bins=("${{ steps.py310.outputs.python-path }}" "${python_bins[@]}")
+          fi
+          for python_bin in "${python_bins[@]}"; do
               minor="$("${python_bin}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
               export CARGO_TARGET_DIR="${cargo_target_root}/py${minor}"
               venv="${venv_root}/py${minor}"

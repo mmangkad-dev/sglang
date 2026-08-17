@@ -234,7 +234,10 @@ jobs:
   rust-ext-build-arm:
     needs: [check-changes, call-gate]
     # Keep aarch64 modules in a separate cache namespace. The restore path runs
-    # on a hosted runner; only a cache miss occupies the dedicated ARM builder.
+    # on a hosted runner. A miss intentionally queues once on the shared ARM
+    # builder instead of rebuilding on every GB300 shard or occupying a GPU.
+    # GB300 is fixed at CPython 3.12 / aarch64 / glibc 2.39, so build only that
+    # ABI and verify the produced modules stay within its glibc ceiling.
     if: |
       !cancelled() &&
       needs.check-changes.result == 'success' &&
@@ -243,7 +246,9 @@ jobs:
     with:
       runs_on: arm-kernel-build-node
       artifact_name: rust-ext-aarch64
-      cache_key_prefix: rust-ext-aarch64-cp310-cp312
+      cache_key_prefix: rust-ext-aarch64-cp312
+      build_python_310: false
+      max_glibc: '2.39'
       git_ref: ${{ inputs.git_ref || '' }}
       skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
     secrets: inherit
@@ -472,7 +477,7 @@ jobs:
     secrets: inherit
 
   base-c-test-4-gpu-gb300:
-    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-arm]
+    needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels-arm, rust-ext-build-arm]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -484,7 +489,8 @@ jobs:
       run_timeout_minutes: '30'
       timeout_per_file: '1800'
       rust_ext_artifact: ${{ needs.rust-ext-build-arm.outputs.artifact_name }}
-      rust_ext_cache_key_prefix: rust-ext-aarch64-cp310-cp312
+      rust_ext_cache_key_prefix: rust-ext-aarch64-cp312
+      require_prebuilt_rust_ext: true
     secrets: inherit
 
   base-c-test-8-gpu-b300:
