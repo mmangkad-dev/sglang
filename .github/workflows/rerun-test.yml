@@ -116,12 +116,12 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
-      # No artifact_name: a workflow_dispatch has no rust-ext-build job of its own,
-      # so reruns require the architecture-specific cache seeded by normal CI.
+      # No artifact_name: a workflow_dispatch has no rust-ext-build job of its own.
+      # Use the architecture-specific cache when visible; otherwise installation
+      # compiles from source, since PR-workflow caches may be inaccessible here.
       - uses: ./.github/actions/download-rust-ext
         with:
           cache_key_prefix: ${{ inputs.rust_ext_cache_key_prefix }}
-          required: 'true'
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(inputs.install_timeout) }}
@@ -215,7 +215,6 @@ jobs:
       - uses: ./.github/actions/download-rust-ext
         with:
           cache_key_prefix: ${{ inputs.rust_ext_cache_key_prefix }}
-          required: 'true'
 
       - name: Install dependencies (diffusion)
         timeout-minutes: 20

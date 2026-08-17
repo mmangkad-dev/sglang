@@ -7,6 +7,7 @@ own. These files cannot reference one another, and a mismatch makes every pool
 silently fall back to source builds at install time.
 """
 
+import ast
 import re
 import sys
 from pathlib import Path
@@ -16,10 +17,14 @@ import yaml
 BUILD_WORKFLOW = ".github/workflows/_pr-test-rust-ext-build.yml"
 DOWNLOAD_ACTION = ".github/actions/download-rust-ext/action.yml"
 STAGE_WORKFLOW = ".github/workflows/_pr-test-stage.yml"
+RERUN_WORKFLOW = ".github/workflows/rerun-test.yml"
 SEED_WORKFLOW = ".github/workflows/seed-rust-ext-cache.yml"
+SLASH_HANDLER = "scripts/ci/utils/slash_command_handler.py"
 
 RUST_BUILD_REUSABLE = "./.github/workflows/_pr-test-rust-ext-build.yml"
 STAGE_REUSABLE = "./.github/workflows/_pr-test-stage.yml"
+DOWNLOAD_ACTION_REUSABLE = "./.github/actions/download-rust-ext"
+SLASH_PREFIX_CONSTANT = "_DEFAULT_RUST_EXT_CACHE_KEY_PREFIX"
 
 _HASH_FILES = re.compile(r"hashFiles\(([^)]*)\)")
 _QUOTED = re.compile(r"'([^']*)'")
@@ -35,6 +40,41 @@ def hashed_inputs(path: str) -> list[tuple[str, ...]]:
 def load_yaml(path: str):
     with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def load_python_string(path: str, name: str) -> str:
+    with open(path, encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=path)
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == name
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            return node.value.value
+    raise ValueError(f"{path} has no string assignment for {name}")
+
+
+def check_rerun_source_fallback(rerun: dict) -> list[str]:
+    errors = []
+    downloads = []
+    for job_name, job in rerun["jobs"].items():
+        for step in job.get("steps", []):
+            if step.get("uses") == DOWNLOAD_ACTION_REUSABLE:
+                downloads.append((job_name, step))
+    if not downloads:
+        return [f"{RERUN_WORKFLOW} has no Rust extension download steps"]
+    for job_name, step in downloads:
+        if str(step.get("with", {}).get("required", "false")).lower() == "true":
+            errors.append(
+                f"{RERUN_WORKFLOW} {job_name} requires an evictable cross-workflow "
+                "cache; reruns must retain source-build fallback"
+            )
+    return errors
 
 
 def _needs(job: dict) -> list[str]:
@@ -114,6 +154,7 @@ def main() -> int:
     workflow = load_yaml(BUILD_WORKFLOW)
     action = load_yaml(DOWNLOAD_ACTION)
     stage = load_yaml(STAGE_WORKFLOW)
+    rerun = load_yaml(RERUN_WORKFLOW)
 
     # yaml 1.1 parses the `on:` key as boolean True
     triggers = workflow.get("on", workflow.get(True))
@@ -123,13 +164,23 @@ def main() -> int:
     stage_prefix = stage_triggers["workflow_call"]["inputs"][
         "rust_ext_cache_key_prefix"
     ]["default"]
+    rerun_triggers = rerun.get("on", rerun.get(True))
+    rerun_prefix = rerun_triggers["workflow_dispatch"]["inputs"][
+        "rust_ext_cache_key_prefix"
+    ]["default"]
+    slash_prefix = load_python_string(SLASH_HANDLER, SLASH_PREFIX_CONSTANT)
 
-    if len({save_prefix, restore_prefix, stage_prefix}) != 1:
+    if (
+        len({save_prefix, restore_prefix, stage_prefix, rerun_prefix, slash_prefix})
+        != 1
+    ):
         print("ERROR: rust-ext cache_key_prefix defaults do not match.")
         print(f"  {BUILD_WORKFLOW} saves under:    {save_prefix}")
         print(f"  {DOWNLOAD_ACTION} restores with: {restore_prefix}")
         print(f"  {STAGE_WORKFLOW} forwards:        {stage_prefix}")
-        print("Bump all three together, or every pool falls back to source builds.")
+        print(f"  {RERUN_WORKFLOW} defaults to:     {rerun_prefix}")
+        print(f"  {SLASH_HANDLER} dispatches:       {slash_prefix}")
+        print("Bump all five together, or consumers miss the shared cache.")
         return 1
 
     # Adding a file to one key alone permanently misses the other's entries.
@@ -151,6 +202,13 @@ def main() -> int:
     if wiring_errors:
         print("ERROR: required prebuilt Rust extension wiring is inconsistent.")
         for error in wiring_errors:
+            print(f"  {error}")
+        return 1
+
+    fallback_errors = check_rerun_source_fallback(rerun)
+    if fallback_errors:
+        print("ERROR: rerun Rust extension source fallback is disabled.")
+        for error in fallback_errors:
             print(f"  {error}")
         return 1
 
