@@ -868,6 +868,19 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 self.quantized_layers
             )
 
+    def is_mxfp8_weight_scale(self, weight_name: str) -> bool:
+        """True for the ``<module>.weight_scale`` of an MXFP8 module.
+
+        ModelOpt names the MXFP8 1x32 UE8M0 block scale ``weight_scale``, while
+        sglang's block-quantized ``Fp8LinearMethod`` registers it as
+        ``weight_scale_inv``. NVFP4 modules of the same checkpoint keep
+        ``weight_scale``, so the loader has to decide per module.
+        """
+        if not weight_name.endswith(".weight_scale"):
+            return False
+        module = weight_name.removesuffix(".weight_scale")
+        return self._resolve_quant_algo(module) == "MXFP8"
+
     def _resolve_quant_algo(self, prefix: str) -> Optional[str]:
         for candidate in self._quantized_layer_prefix_candidates(prefix):
             if candidate in self.quantized_layers:

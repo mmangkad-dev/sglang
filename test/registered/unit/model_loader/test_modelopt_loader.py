@@ -906,6 +906,64 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             "FP8",
         )
 
+    def test_mixed_precision_renames_only_mxfp8_block_scales(self):
+        """MXFP8 and NVFP4 both ship ``weight_scale``, but only MXFP8 is renamed.
+
+        sglang's block-quantized ``Fp8LinearMethod`` registers the MXFP8 1x32
+        UE8M0 block scale as ``weight_scale_inv``, so a MIXED_PRECISION
+        checkpoint (e.g. mmangkad/Qwen3.8-27B-NVFP4: MXFP8 attention + NVFP4
+        MLP) used to drop every attention scale on the floor and serve garbage.
+        Renaming unconditionally would break the NVFP4 modules instead, whose
+        ``weight_scale`` is the name their linear method registers.
+        """
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.layers.0.self_attn.q_proj": {
+                        "quant_algo": "MXFP8",
+                        "group_size": 32,
+                    },
+                    "model.layers.0.mlp.gate_proj": {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                    },
+                    "lm_head": {"quant_algo": "NVFP4", "group_size": 16},
+                },
+            }
+        )
+
+        weight = torch.empty(1)
+        names = [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.q_proj.weight_scale",
+            "model.layers.0.mlp.gate_proj.weight_scale",
+            "model.layers.0.mlp.gate_proj.weight_scale_2",
+            "lm_head.weight_scale",
+        ]
+
+        model = nn.Module()
+        model.quant_config = quant_config
+        loaded_names = []
+        model.load_weights = lambda weights: loaded_names.extend(
+            name for name, _ in weights
+        )
+        with patch("sglang.srt.model_loader.loader.is_cuda_alike", return_value=False):
+            DefaultModelLoader.load_weights_and_postprocess(
+                model, iter([(name, weight) for name in names]), torch.device("cpu")
+            )
+
+        self.assertEqual(
+            loaded_names,
+            [
+                "model.layers.0.self_attn.q_proj.weight",
+                "model.layers.0.self_attn.q_proj.weight_scale_inv",
+                "model.layers.0.mlp.gate_proj.weight_scale",
+                "model.layers.0.mlp.gate_proj.weight_scale_2",
+                "lm_head.weight_scale",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

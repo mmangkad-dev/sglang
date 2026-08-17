@@ -345,6 +345,40 @@ def _initialize_model(
     return model_class(**kwargs)
 
 
+def _is_weight_scale(weight_name: str) -> bool:
+    return weight_name.endswith(".weight_scale")
+
+
+def _rename_mxfp8_weight_scales_to_inv(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+    quant_config: Optional[QuantizationConfig],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Rename ModelOpt's MXFP8 block scale to the name sglang registers it under.
+
+    ModelOpt writes the 1x32 UE8M0 block scale as ``<module>.weight_scale``;
+    sglang's block-quantized ``Fp8LinearMethod`` registers it as
+    ``weight_scale_inv``. Without the rename the scale silently never loads and
+    the layer runs with an all-zero UE8M0 exponent (a 2^-127 multiplier).
+
+    In a MIXED_PRECISION checkpoint only some modules are MXFP8 — NVFP4 modules
+    in the same file keep ``weight_scale`` — so the config decides per name.
+    """
+    if quant_config is None:
+        return weights
+
+    if quant_config.get_name() == "mxfp8":
+        is_mxfp8_scale = _is_weight_scale
+    elif quant_config.get_name() == "modelopt_mixed":
+        is_mxfp8_scale = quant_config.is_mxfp8_weight_scale
+    else:
+        return weights
+
+    return (
+        (f"{name}_inv" if is_mxfp8_scale(name) else name, loaded_weight)
+        for name, loaded_weight in weights
+    )
+
+
 def _post_load_weights(model: nn.Module) -> None:
     # Loaders that bypass `model.load_weights()` (dummy / sharded state / remote instance /
     # remote fs) must trigger the model's post-load fixup explicitly; `model.load_weights()`
@@ -1015,15 +1049,7 @@ class DefaultModelLoader(BaseModelLoader):
             and quant_config.get_name() == "modelopt_fp4"
             and not quant_config.is_checkpoint_nvfp4_serialized
         )
-        is_mxfp8 = quant_config is not None and quant_config.get_name() == "mxfp8"
-        if is_mxfp8:
-            weights = (
-                (
-                    f"{name}_inv" if name.endswith(".weight_scale") else name,
-                    loaded_weight,
-                )
-                for name, loaded_weight in weights
-            )
+        weights = _rename_mxfp8_weight_scales_to_inv(weights, quant_config)
 
         if is_nvfp4_online or is_modelopt_fp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
