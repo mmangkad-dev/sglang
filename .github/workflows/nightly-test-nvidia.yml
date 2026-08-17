@@ -79,6 +79,17 @@ jobs:
       force_continue_on_error: true
     secrets: inherit
 
+  rust-ext-build:
+    needs: check-changes
+    if: github.repository == 'sgl-project/sglang' && inputs.runner_filter != '4-gpu-gb300'
+    uses: ./.github/workflows/_pr-test-rust-ext-build.yml
+    with:
+      runs_on: 1-gpu-5090
+      artifact_name: rust-ext-x86_64-nightly
+      git_ref: ${{ inputs.ref || '' }}
+      skip_pr_test_health_check: true
+    secrets: inherit
+
   rust-ext-build-arm:
     needs: check-changes
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-gb300')
@@ -93,7 +104,7 @@ jobs:
     secrets: inherit
 
   nightly-1-gpu-large:
-    needs: check-changes
+    needs: [check-changes, rust-ext-build]
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '1-gpu-large')
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -105,10 +116,12 @@ jobs:
       run_timeout_minutes: '120'
       job_timeout_minutes: '180'
       scheduled: true
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+      require_prebuilt_rust_ext: true
     secrets: inherit
 
   nightly-2-gpu-large:
-    needs: check-changes
+    needs: [check-changes, rust-ext-build]
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '2-gpu-large')
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -120,10 +133,12 @@ jobs:
       run_timeout_minutes: '240'
       job_timeout_minutes: '300'
       scheduled: true
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+      require_prebuilt_rust_ext: true
     secrets: inherit
 
   nightly-4-gpu-h100:
-    needs: check-changes
+    needs: [check-changes, rust-ext-build]
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-h100')
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -135,10 +150,12 @@ jobs:
       run_timeout_minutes: '120'
       job_timeout_minutes: '180'
       scheduled: true
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+      require_prebuilt_rust_ext: true
     secrets: inherit
 
   nightly-4-gpu-b200:
-    needs: check-changes
+    needs: [check-changes, rust-ext-build]
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-b200')
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -150,6 +167,8 @@ jobs:
       run_timeout_minutes: '150'
       job_timeout_minutes: '210'
       scheduled: true
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+      require_prebuilt_rust_ext: true
     secrets: inherit
 
   nightly-4-gpu-gb300:
@@ -171,7 +190,7 @@ jobs:
     secrets: inherit
 
   nightly-8-gpu-h200:
-    needs: check-changes
+    needs: [check-changes, rust-ext-build]
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '8-gpu-h200')
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -183,10 +202,12 @@ jobs:
       run_timeout_minutes: '300'
       job_timeout_minutes: '360'
       scheduled: true
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+      require_prebuilt_rust_ext: true
     secrets: inherit
 
   nightly-8-gpu-b200:
-    needs: check-changes
+    needs: [check-changes, rust-ext-build]
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '8-gpu-b200')
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -198,11 +219,14 @@ jobs:
       run_timeout_minutes: '360'
       job_timeout_minutes: '420'
       scheduled: true
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+      require_prebuilt_rust_ext: true
     secrets: inherit
 
   # Hand-written because it is not a registry suite: it drives run_comparison.py
   # and publishes a dashboard rather than running test files.
   nightly-test-diffusion:
+    needs: rust-ext-build
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == 'diffusion')
     runs-on: 4-gpu-h100
     timeout-minutes: 300
@@ -217,6 +241,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - uses: ./.github/actions/download-rust-ext
+        with:
+          artifact_name: ${{ needs.rust-ext-build.outputs.artifact_name }}
+          required: 'true'
 
       - name: Install dependencies
         run: |
@@ -324,6 +353,7 @@ jobs:
   check-all-jobs:
     if: github.repository == 'sgl-project/sglang' && always()
     needs:
+      - rust-ext-build
       - rust-ext-build-arm
       - nightly-1-gpu-large
       - nightly-2-gpu-large

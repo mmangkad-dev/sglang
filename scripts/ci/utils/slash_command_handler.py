@@ -17,6 +17,7 @@ import runner_configs as _runner_configs  # noqa: E402
 # rerun-test workflow doesn't build sgl-kernel, so b200 stages always use the
 # non-kernel pool when resolving the `$b200_runner` sentinel from runner_configs.yml.
 _B200_DEFAULT_RUNNER = "4-gpu-b200"
+_DEFAULT_RUST_EXT_CACHE_KEY_PREFIX = "rust-ext-x86_64-cp310-cp312"
 
 # install_script values from runner_configs.yml are passed verbatim into a
 # `bash ${{ inputs.install_script }}` step in rerun-test.yml. GHA expression
@@ -722,6 +723,7 @@ def _dispatch_err(suite, msg):
         "install_script": "",
         "install_timeout": "",
         "rdma_devices": "",
+        "rust_ext_cache_key_prefix": _DEFAULT_RUST_EXT_CACHE_KEY_PREFIX,
         "is_cpu": False,
         "error": msg,
     }
@@ -762,6 +764,9 @@ def _resolve_runner_config(rc, full_path, suite):
         "install_script": install_script,
         "install_timeout": str(cfg["install_timeout"]),
         "rdma_devices": cfg.get("rdma_devices", ""),
+        "rust_ext_cache_key_prefix": cfg.get(
+            "rust_ext_cache_key_prefix", _DEFAULT_RUST_EXT_CACHE_KEY_PREFIX
+        ),
         "is_cpu": False,
         "error": None,
     }
@@ -811,6 +816,7 @@ def detect_suite(file_path_from_test):
                 "install_script": "",
                 "install_timeout": "",
                 "rdma_devices": "",
+                "rust_ext_cache_key_prefix": _DEFAULT_RUST_EXT_CACHE_KEY_PREFIX,
                 "is_cpu": True,
                 "error": None,
             }
@@ -885,6 +891,7 @@ def _resolve_test_spec(test_spec):
                 "install_script": "",
                 "install_timeout": "",
                 "rdma_devices": "",
+                "rust_ext_cache_key_prefix": _DEFAULT_RUST_EXT_CACHE_KEY_PREFIX,
                 "error": None,
             }
         ]
@@ -915,6 +922,7 @@ def _resolve_test_spec(test_spec):
                 "install_script": info["install_script"],
                 "install_timeout": info["install_timeout"],
                 "rdma_devices": info["rdma_devices"],
+                "rust_ext_cache_key_prefix": info["rust_ext_cache_key_prefix"],
                 "error": None,
             }
         )
@@ -925,7 +933,7 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
     """
     Dispatch a single workflow run for a batch of resolved test specs that
     share the same dispatch shape (mode + runs_on + install_script +
-    install_timeout + rdma_devices).
+    install_timeout + rdma_devices + Rust extension cache prefix).
 
     Returns a dict with keys: specs, success, test_commands, runner_label, run_url, error.
     """
@@ -935,6 +943,7 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
     install_script = batch[0]["install_script"]
     install_timeout = batch[0]["install_timeout"]
     rdma_devices = batch[0]["rdma_devices"]
+    rust_ext_cache_key_prefix = batch[0]["rust_ext_cache_key_prefix"]
 
     # Join multiple commands with newlines for the workflow to iterate over
     combined_command = "\n".join(test_commands)
@@ -967,6 +976,7 @@ def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker
             "install_script": install_script,
             "install_timeout": install_timeout or "20",
             "rdma_devices": rdma_devices,
+            "rust_ext_cache_key_prefix": rust_ext_cache_key_prefix,
             "reply_comment_id": str(reply_comment_id) if reply_comment_id else "",
             "reply_marker": reply_marker,
         }
@@ -1169,6 +1179,7 @@ def handle_rerun_test(
             r["install_script"],
             r["install_timeout"],
             r["rdma_devices"],
+            r["rust_ext_cache_key_prefix"],
         )
         groups.setdefault(key, []).append(r)
 

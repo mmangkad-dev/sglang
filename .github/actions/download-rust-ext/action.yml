@@ -13,6 +13,10 @@ inputs:
     description: 'Must match what _pr-test-rust-ext-build.yml saves under.'
     required: false
     default: rust-ext-x86_64-cp310-cp312
+  required:
+    description: 'Fail instead of compiling from source when matching modules are unavailable.'
+    required: false
+    default: 'false'
 
 outputs:
   hit:
@@ -68,3 +72,23 @@ runs:
         else
             echo "hit=false" >> "$GITHUB_OUTPUT"
         fi
+
+    - name: Require matching prebuilt Rust extensions
+      if: inputs.required == 'true'
+      shell: bash
+      env:
+        RUST_EXT_HIT: ${{ steps.decide.outputs.hit }}
+      run: |
+        set -euo pipefail
+        if [ "${RUST_EXT_HIT}" != "true" ]; then
+            echo "::error::No prebuilt Rust extensions were restored"
+            exit 1
+        fi
+        suffix="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+        for module in server grpc multimodal; do
+            path="python/sglang/srt/rust_extensions/_${module}${suffix}"
+            if [ ! -f "${path}" ]; then
+                echo "::error::Missing prebuilt Rust extension ${path}"
+                exit 1
+            fi
+        done

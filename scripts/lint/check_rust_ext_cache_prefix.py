@@ -78,7 +78,7 @@ def check_required_prebuilt_wiring() -> list[str]:
                 or consumer_inputs.get("require_prebuilt_rust_ext") is not True
             ):
                 continue
-            prefix = consumer_inputs.get("rust_ext_cache_key_prefix")
+            prefix = consumer_inputs.get("rust_ext_cache_key_prefix", default_prefix)
             required_prefixes.add(prefix)
             producer_name = producers_by_prefix.get(prefix)
             if producer_name is None:

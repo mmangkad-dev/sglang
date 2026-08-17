@@ -153,29 +153,10 @@ jobs:
       # Editable-install source builds remain covered by pr-test-rust.yml and
       # pr-test-sgl-router.yml; CUDA stages consume the per-architecture build.
       - uses: ./.github/actions/download-rust-ext
-        id: rust_ext
         with:
           artifact_name: ${{ inputs.rust_ext_artifact }}
           cache_key_prefix: ${{ inputs.rust_ext_cache_key_prefix }}
-
-      - name: Require matching prebuilt Rust extensions
-        if: inputs.require_prebuilt_rust_ext
-        env:
-          RUST_EXT_HIT: ${{ steps.rust_ext.outputs.hit }}
-        run: |
-          set -euo pipefail
-          if [ "${RUST_EXT_HIT}" != "true" ]; then
-              echo "::error::No prebuilt Rust extensions were restored"
-              exit 1
-          fi
-          suffix="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
-          for module in server grpc multimodal; do
-              path="python/sglang/srt/rust_extensions/_${module}${suffix}"
-              if [ ! -f "${path}" ]; then
-                  echo "::error::Missing prebuilt Rust extension ${path}"
-                  exit 1
-              fi
-          done
+          required: ${{ inputs.require_prebuilt_rust_ext }}
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}

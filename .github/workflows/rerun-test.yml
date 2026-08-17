@@ -36,6 +36,11 @@ on:
         required: false
         type: string
         default: ""
+      rust_ext_cache_key_prefix:
+        description: "Architecture-specific Rust extension cache prefix (cuda only)"
+        required: false
+        type: string
+        default: "rust-ext-x86_64-cp310-cp312"
       pr_head_sha:
         description: "PR head SHA to checkout (for /rerun-test on fork PRs)"
         required: false
@@ -111,8 +116,12 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
-      # No artifact_name: a workflow_dispatch has no rust-ext-build job of its own.
+      # No artifact_name: a workflow_dispatch has no rust-ext-build job of its own,
+      # so reruns require the architecture-specific cache seeded by normal CI.
       - uses: ./.github/actions/download-rust-ext
+        with:
+          cache_key_prefix: ${{ inputs.rust_ext_cache_key_prefix }}
+          required: 'true'
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(inputs.install_timeout) }}
@@ -204,6 +213,9 @@ jobs:
       - uses: ./.github/actions/check-maintenance
 
       - uses: ./.github/actions/download-rust-ext
+        with:
+          cache_key_prefix: ${{ inputs.rust_ext_cache_key_prefix }}
+          required: 'true'
 
       - name: Install dependencies (diffusion)
         timeout-minutes: 20
