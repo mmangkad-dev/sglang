@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Check that the rust-ext cache key stays in sync across its sites.
 
-The build workflow looks up and saves cache entries under its own prefix and
-hashed inputs; the download action restores with its own. Neither file can
-reference the other, and a mismatch in EITHER half makes every pool silently
-fall back to source builds at install time.
+The build workflow looks up and saves cache entries under its own prefix, the
+reusable stage forwards its default, and the download action restores with its
+own. These files cannot reference one another, and a mismatch makes every pool
+silently fall back to source builds at install time.
 """
 
 import re
@@ -14,6 +14,7 @@ import yaml
 
 BUILD_WORKFLOW = ".github/workflows/_pr-test-rust-ext-build.yml"
 DOWNLOAD_ACTION = ".github/actions/download-rust-ext/action.yml"
+STAGE_WORKFLOW = ".github/workflows/_pr-test-stage.yml"
 PR_WORKFLOW = ".github/workflows/pr-test.yml"
 NIGHTLY_WORKFLOW = ".github/workflows/nightly-test-nvidia.yml"
 SEED_WORKFLOW = ".github/workflows/seed-rust-ext-cache.yml"
@@ -82,17 +83,23 @@ def check_aarch64_wiring() -> list[str]:
 def main() -> int:
     workflow = load_yaml(BUILD_WORKFLOW)
     action = load_yaml(DOWNLOAD_ACTION)
+    stage = load_yaml(STAGE_WORKFLOW)
 
     # yaml 1.1 parses the `on:` key as boolean True
     triggers = workflow.get("on", workflow.get(True))
+    stage_triggers = stage.get("on", stage.get(True))
     save_prefix = triggers["workflow_call"]["inputs"]["cache_key_prefix"]["default"]
     restore_prefix = action["inputs"]["cache_key_prefix"]["default"]
+    stage_prefix = stage_triggers["workflow_call"]["inputs"][
+        "rust_ext_cache_key_prefix"
+    ]["default"]
 
-    if save_prefix != restore_prefix:
+    if len({save_prefix, restore_prefix, stage_prefix}) != 1:
         print("ERROR: rust-ext cache_key_prefix defaults do not match.")
         print(f"  {BUILD_WORKFLOW} saves under:    {save_prefix}")
         print(f"  {DOWNLOAD_ACTION} restores with: {restore_prefix}")
-        print("Bump both together, or every pool falls back to source builds.")
+        print(f"  {STAGE_WORKFLOW} forwards:        {stage_prefix}")
+        print("Bump all three together, or every pool falls back to source builds.")
         return 1
 
     # Adding a file to one key alone permanently misses the other's entries.

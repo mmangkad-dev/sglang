@@ -62,10 +62,6 @@ on:
         description: 'Architecture and Python-ABI-specific cache prefix used when the Rust extension artifact is unavailable.'
         type: string
         default: 'rust-ext-x86_64-cp310-cp312'
-      skip_prebuilt_rust_ext:
-        description: 'Take neither the artifact nor the cache, and compile during install.'
-        type: boolean
-        default: false
 
       scheduled:
         description: 'The caller is a nightly or weekly workflow, not a per-commit one. Switches on per-file timeouts derived from est_time, the full jit_kernel grids, metrics upload, and serial shards unless dispatched with full_parallel.'
@@ -151,7 +147,6 @@ jobs:
           pattern: wheel-python3.10-cuda*
 
       - uses: ./.github/actions/download-rust-ext
-        if: ${{ !inputs.skip_prebuilt_rust_ext }}
         with:
           artifact_name: ${{ inputs.rust_ext_artifact }}
           cache_key_prefix: ${{ inputs.rust_ext_cache_key_prefix }}
