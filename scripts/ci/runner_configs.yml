@@ -13,7 +13,7 @@
 #     b200 runner tag from check-changes (see runner_configs.py --map).
 #   - rdma_devices (optional): exported as SGLANG_CI_RDMA_ALL_DEVICES env
 #     to the stage job; absent means unset.
-#   - architecture (optional): explicit uname -m contract for non-x86 pools.
+#   - architecture (optional): extension-module architecture; defaults to x86_64.
 
 _anchors:
   default_install: &default scripts/ci/cuda/ci_install_dependency.sh
