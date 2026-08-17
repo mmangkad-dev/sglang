@@ -12,6 +12,9 @@ on:
       - 'python/setup.py'
       # The key's prefix lives in this file, so a bump there also moves the key.
       - '.github/workflows/_pr-test-rust-ext-build.yml'
+      # Architecture-specific producer settings live here; seed a newly added
+      # architecture immediately when this workflow reaches main.
+      - '.github/workflows/seed-rust-ext-cache.yml'
   workflow_dispatch:
 
 # Only the newest merge needs to seed; earlier ones are already stale.
@@ -27,8 +30,16 @@ permissions:
   issues: read
 
 jobs:
-  seed:
+  seed-x86:
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
     with:
       runs_on: 1-gpu-5090
+    secrets: inherit
+
+  seed-aarch64:
+    uses: ./.github/workflows/_pr-test-rust-ext-build.yml
+    with:
+      runs_on: arm-kernel-build-node
+      artifact_name: rust-ext-aarch64
+      cache_key_prefix: rust-ext-aarch64-cp310-cp312
     secrets: inherit

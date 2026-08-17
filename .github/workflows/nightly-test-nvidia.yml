@@ -79,6 +79,18 @@ jobs:
       force_continue_on_error: true
     secrets: inherit
 
+  rust-ext-build-arm:
+    needs: check-changes
+    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-gb300')
+    uses: ./.github/workflows/_pr-test-rust-ext-build.yml
+    with:
+      runs_on: arm-kernel-build-node
+      artifact_name: rust-ext-aarch64
+      cache_key_prefix: rust-ext-aarch64-cp310-cp312
+      git_ref: ${{ inputs.ref || '' }}
+      skip_pr_test_health_check: true
+    secrets: inherit
+
   nightly-1-gpu-large:
     needs: check-changes
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '1-gpu-large')
@@ -140,7 +152,7 @@ jobs:
     secrets: inherit
 
   nightly-4-gpu-gb300:
-    needs: check-changes
+    needs: [check-changes, rust-ext-build-arm]
     if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '4-gpu-gb300')
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -152,8 +164,8 @@ jobs:
       run_timeout_minutes: '360'
       job_timeout_minutes: '420'
       scheduled: true
-      # aarch64: the rust-ext cache key is x86_64-only, same reason base-c skips it.
-      skip_prebuilt_rust_ext: true
+      rust_ext_artifact: ${{ needs.rust-ext-build-arm.outputs.artifact_name }}
+      rust_ext_cache_key_prefix: rust-ext-aarch64-cp310-cp312
     secrets: inherit
 
   nightly-8-gpu-h200:
@@ -310,6 +322,7 @@ jobs:
   check-all-jobs:
     if: github.repository == 'sgl-project/sglang' && always()
     needs:
+      - rust-ext-build-arm
       - nightly-1-gpu-large
       - nightly-2-gpu-large
       - nightly-4-gpu-h100
