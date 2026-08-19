@@ -321,11 +321,29 @@ def _topk_transform_v2_extend(
         return None
     if not (lengths.is_contiguous() and row_starts.is_contiguous()):
         return None
-    # The plan is preprocessed once per forward from the full expanded seqlens; a
-    # chunked-logits call passes a slice of them, whose row count no longer
-    # matches, and recomputing a per-chunk plan here would undo the saving.
+    # The plan is preprocessed once per forward from dsa_seqlens_expanded, and it
+    # carries a cluster_threshold plus a compacted work-list of the rows the
+    # persistent cluster kernel will process -- a plan built from *different*
+    # lengths makes the main kernel skip a row nobody processed and publish
+    # uninitialized indices as KV slots. `lengths` can be overridden by the caller
+    # (ke_offset), so require the exact tensor rather than merely a matching row
+    # count. This is also what makes attn_metadata.max_seq_len_k a sound bound
+    # below. The chunked-logits loop and the CP path both pass their own lengths and
+    # so land on the legacy kernels.
+    if lengths is not attn_metadata.dsa_seqlens_expanded:
+        return None
     plan = attn_metadata.topk_v2_plan
     if plan is None or plan.shape[0] != num_rows + 1:
+        return None
+    # Kernel-selection bound. The score matrix is as wide as the batch's
+    # concatenated KV, so its width over-estimates the longest row whenever the
+    # batch holds more than one request -- which picks a needlessly wide register
+    # template, and can even route a batch of short rows to the cluster path with
+    # no work for it. max_seq_len_k is the host-side max over the batch's KV
+    # lengths, and dsa_seqlens_expanded's largest entry is exactly one request's KV
+    # length, so it is a tight and valid bound.
+    max_seq_len = min(attn_metadata.max_seq_len_k, logits.shape[1])
+    if max_seq_len <= 0:
         return None
 
     kwargs = {}
@@ -370,13 +388,17 @@ def _topk_transform_v2_extend(
         and out.shape == (num_rows, topk)
         and out.is_contiguous()
     ):
-        topk_transform_extend_v2(logits, lengths, row_starts, out, plan, **kwargs)
+        topk_transform_extend_v2(
+            logits, lengths, row_starts, out, plan, max_seq_len, **kwargs
+        )
         return out
     # The kernel writes every one of the `topk` slots of every row (padding slots
     # included), so a fresh buffer needs no -1 prefill -- skipping it avoids a
     # full-size memset per indexer layer.
     fresh = logits.new_empty((num_rows, topk), dtype=torch.int32)
-    topk_transform_extend_v2(logits, lengths, row_starts, fresh, plan, **kwargs)
+    topk_transform_extend_v2(
+        logits, lengths, row_starts, fresh, plan, max_seq_len, **kwargs
+    )
     return fresh
 
 

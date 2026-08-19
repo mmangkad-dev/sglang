@@ -475,6 +475,12 @@ struct TopKKernel {
   ///   * ragged (`out_offsets`): `position + out_offsets[b]`, an index into the
   ///     concatenated ragged KV buffer. Replaces
   ///     `fast_topk_transform_ragged_fused`.
+  /// \param max_seq_len upper bound on ``seq_lens``, used to pick the level. Unlike
+  /// decode -- where the score width IS the longest row -- an extend score matrix
+  /// is as wide as the batch's concatenated KV, which can be far longer than any
+  /// single row, so the caller supplies the real bound. It MUST be >= every entry
+  /// of ``seq_lens``: too low picks a level whose fixed-unrolled loop cannot cover
+  /// a row and the top-k comes back wrong.
   static void transform_extend(
       const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView seq_lens,
@@ -482,6 +488,7 @@ struct TopKKernel {
       const tvm::ffi::TensorView topk_indices,
       const tvm::ffi::TensorView metadata,
       const uint32_t page_size,
+      const uint32_t max_seq_len,
       const tvm::ffi::Optional<tvm::ffi::TensorView> page_table,
       const tvm::ffi::Optional<tvm::ffi::TensorView> row_to_batch,
       const tvm::ffi::Optional<tvm::ffi::TensorView> out_offsets) {
@@ -538,7 +545,12 @@ struct TopKKernel {
     RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
 
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
-    const auto max_seq_len = static_cast<uint32_t>(L.unwrap());
+    // A row may not read past the score matrix, so the bound cannot exceed its
+    // width; that also catches a caller passing 0 (which would pick level 0 for
+    // arbitrarily long rows).
+    RuntimeCheck(
+        max_seq_len > 0 && max_seq_len <= static_cast<uint32_t>(L.unwrap()),
+        "max_seq_len must be in (0, scores.shape[1]]");
     const auto device = device_.unwrap();
     constexpr uint32_t kClusterFloorSmall = 32768;
     constexpr uint32_t kSmallBatchLowFloor = 15;

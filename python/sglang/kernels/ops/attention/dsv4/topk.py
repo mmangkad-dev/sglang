@@ -125,6 +125,7 @@ def topk_transform_extend_v2(
     row_starts: torch.Tensor,
     out: torch.Tensor,
     metadata: torch.Tensor,
+    max_seq_len: int,
     page_size: int = 0,
     page_table: Optional[torch.Tensor] = None,
     row_to_batch: Optional[torch.Tensor] = None,
@@ -145,6 +146,12 @@ def topk_transform_extend_v2(
     * ragged -- ``out_offsets``: emits ``p + out_offsets[b]``, matching
       ``fast_topk_transform_ragged_fused``.
 
+    ``max_seq_len`` is the kernel-selection bound and MUST be ``>= lengths.max()``
+    (a too-low bound silently picks a level that cannot cover the longest row). It
+    is a separate argument because an extend score matrix is as wide as the whole
+    batch's concatenated KV, so its width is a far looser bound than any row's
+    length -- unlike decode, where the two coincide.
+
     ``metadata`` must come from :func:`plan_topk_v2` over the same ``lengths``, and
     every entry of ``lengths`` must be NON-NEGATIVE (the kernel reads them as
     ``uint32_t``; see :func:`topk_transform_512_v2`). ``scores`` must be fp32 with
@@ -160,6 +167,7 @@ def topk_transform_extend_v2(
         out,
         metadata,
         page_size,
+        max_seq_len,
         page_table,
         row_to_batch,
         out_offsets,

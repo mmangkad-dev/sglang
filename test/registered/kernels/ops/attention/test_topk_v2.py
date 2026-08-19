@@ -368,6 +368,15 @@ EXTEND_CONFIGS = [
     pytest.param([1234, 40001], [64, 64], id="streaming-unaligned"),
     pytest.param([999, 100003], [16, 16], id="cluster-unaligned"),
     pytest.param([16384], [2048], id="reg4-chunked-single"),
+    # Width >> longest row, the shape a multi-request prefill batch actually has.
+    # Verified perf-only, not a guard: passing scores.shape[1] as the bound instead
+    # of max(lengths) is still correct here (0/512 rows differ), just slower -- a
+    # too-HIGH bound only over-selects the template. These cases are coverage for
+    # running Register2 against a Streaming/Cluster-width matrix; what keeps the
+    # bound itself sound is the caller-side contract in
+    # _topk_transform_v2_extend (see test_dsa_topk_backend_extend.py).
+    pytest.param([4096] * 8, [64] * 8, id="wide-width-short-rows"),
+    pytest.param([4099] * 17, [16] * 17, id="wide-width-short-rows-unaligned"),
 ]
 
 
@@ -398,6 +407,7 @@ def test_topk_v2_extend_paged(kv_lens, extend_lens, k: int) -> None:
         row_starts_t,
         out,
         plan_topk_v2(lengths_t),
+        max(lengths),
         page_size=PAGE_SIZE,
         page_table=page_table,
         row_to_batch=row_to_batch_t,
@@ -440,6 +450,7 @@ def test_topk_v2_extend_ragged(kv_lens, extend_lens, k: int) -> None:
         row_starts_t,
         out,
         plan_topk_v2(lengths_t),
+        max(lengths),
         out_offsets=row_starts_t,
     )
     torch.cuda.synchronize()
@@ -450,6 +461,30 @@ def test_topk_v2_extend_ragged(kv_lens, extend_lens, k: int) -> None:
     ref_raw = _extend_reference(scores_cpu, lengths, row_starts, k)
     shifted = _window_view(scores_cpu, lengths, row_starts, batch)
     _assert_topk_close(shifted, ref_raw, our_raw, batch, lengths, k)
+
+
+@pytest.mark.parametrize("bad_bound", [0, 4097])
+@torch.inference_mode()
+def test_topk_v2_extend_rejects_out_of_range_bound(bad_bound: int) -> None:
+    """``max_seq_len`` selects the template, so a bound of 0 (level 0 for any row)
+    or one past the score width (a read out of bounds) must be refused, not
+    silently clamped."""
+    device = "cuda"
+    batch, kv, k = 4, 4096, 2048
+    scores = torch.randn(batch, kv, dtype=torch.float32, device=device)
+    lengths = torch.full((batch,), kv, dtype=torch.int32, device=device)
+    row_starts = torch.zeros(batch, dtype=torch.int32, device=device)
+    out = torch.empty(batch, k, dtype=torch.int32, device=device)
+    with pytest.raises(Exception):
+        topk_transform_extend_v2(
+            scores,
+            lengths,
+            row_starts,
+            out,
+            plan_topk_v2(lengths),
+            bad_bound,
+            out_offsets=row_starts,
+        )
 
 
 @torch.inference_mode()
@@ -467,7 +502,7 @@ def test_topk_v2_extend_requires_exactly_one_transform() -> None:
     row_to_batch = torch.zeros(batch, dtype=torch.int32, device=device)
 
     with pytest.raises(Exception):
-        topk_transform_extend_v2(scores, lengths, row_starts, out, plan)
+        topk_transform_extend_v2(scores, lengths, row_starts, out, plan, kv)
     with pytest.raises(Exception):
         topk_transform_extend_v2(
             scores,
@@ -475,6 +510,7 @@ def test_topk_v2_extend_requires_exactly_one_transform() -> None:
             row_starts,
             out,
             plan,
+            kv,
             page_size=PAGE_SIZE,
             page_table=page_table,
             row_to_batch=row_to_batch,
