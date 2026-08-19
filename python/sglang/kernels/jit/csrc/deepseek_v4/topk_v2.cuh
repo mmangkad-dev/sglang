@@ -154,6 +154,13 @@ SGL_DEVICE void for_each_item(uint32_t topk, const F& f) {
   }
 }
 
+/// Output-completeness invariant, relied on by callers to allocate the output
+/// buffer uninitialized: BOTH writers below cover slot 0..topk-1 of every row.
+/// `trivial_transform` writes each slot directly (-1 past seq_len), and
+/// `problem_transform` -- the single exit of every non-trivial path, including the
+/// cluster epilogue in topk_main_kernel<...,3> -- re-writes all of them from the
+/// staged raw indices, which `handle_tie` has itself filled up to topk. No slot is
+/// left at its incoming value, so no caller needs to pre-fill -1.
 template <bool kPDL>
 SGL_DEVICE void trivial_transform(const TopKProblem& problem) {
   device::PDLWaitPrimary<kPDL>();

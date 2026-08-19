@@ -299,6 +299,57 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
 
 
+SENTINEL = -12345  # not producible by the kernel: outputs are >= 0 or exactly -1
+
+
+@pytest.mark.parametrize(
+    "batch,seq",
+    [
+        (8, 256),  # trivial (seq <= k)
+        (8, 4096),  # Register2
+        (64, 16384),  # Register4
+        (256, 40000),  # Streaming
+        (4, 131072),  # fused small-batch cluster
+        (64, 131072),  # persistent cluster + main<3> epilogue
+    ],
+)
+@torch.inference_mode()
+def test_topk_v2_writes_every_slot(batch: int, seq: int) -> None:
+    """Both callers allocate the output uninitialized, so every slot of every row
+    must be written -- padding slots too. Pre-fill a sentinel the kernel cannot
+    produce and assert none survives, on every template.
+
+    Without this, a template that left padding slots untouched would hand
+    downstream sparse attention an arbitrary int32 as a KV slot instead of a -1 it
+    knows to mask.
+    """
+    k = 2048
+    torch.manual_seed(batch * 31 + seq)
+    device = "cuda"
+    width = (seq + 3) & ~3
+    scores = torch.randn(batch, width, dtype=torch.float32, device=device)[:, :seq]
+    # Mix in short rows so the trivial path and its padding are exercised too.
+    seq_lens = torch.full((batch,), seq, dtype=torch.int32, device=device)
+    seq_lens[0] = 0
+    seq_lens[1 % batch] = min(seq, k // 2)
+    num_pages = (seq + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, _ = _make_page_table(batch, num_pages, "perm", device)
+    plan = plan_topk_v2(seq_lens)
+
+    paged = torch.full((batch, k), SENTINEL, dtype=torch.int32, device=device)
+    topk_transform_512_v2(scores, seq_lens, page_table, paged, PAGE_SIZE, plan)
+    row_starts = torch.zeros(batch, dtype=torch.int32, device=device)
+    ragged = torch.full((batch, k), SENTINEL, dtype=torch.int32, device=device)
+    topk_transform_extend_v2(
+        scores, seq_lens, row_starts, ragged, plan, seq, out_offsets=row_starts
+    )
+    torch.cuda.synchronize()
+
+    for tag, buf in (("paged", paged), ("ragged", ragged)):
+        left = (buf == SENTINEL).sum().item()
+        assert left == 0, f"{tag}: {left} of {batch * k} slots never written"
+
+
 # --- extend entry point (transform_extend) ---------------------------------
 #
 # Extend differs from decode in three ways the kernel has to handle: each row's

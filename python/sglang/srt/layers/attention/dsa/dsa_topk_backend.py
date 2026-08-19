@@ -392,9 +392,8 @@ def _topk_transform_v2_extend(
             logits, lengths, row_starts, out, plan, max_seq_len, **kwargs
         )
         return out
-    # The kernel writes every one of the `topk` slots of every row (padding slots
-    # included), so a fresh buffer needs no -1 prefill -- skipping it avoids a
-    # full-size memset per indexer layer.
+    # Uninitialized, same output-completeness invariant as the paged helper below
+    # -- skipping the -1 pre-fill avoids a full-size memset per indexer layer.
     fresh = logits.new_empty((num_rows, topk), dtype=torch.int32)
     topk_transform_extend_v2(
         logits, lengths, row_starts, fresh, plan, max_seq_len, **kwargs
@@ -465,7 +464,11 @@ def _topk_transform_v2_paged(
     ), "topk_v2_plan must be preprocessed per forward (see DSAMetadata.topk_v2_plan)"
 
     page_size = attn_metadata.page_size
-    out = logits.new_full((num_rows, topk), -1, dtype=torch.int32)
+    # Uninitialized: the kernel covers every one of the `topk` slots of every row,
+    # padding included (see the output-completeness invariant above
+    # trivial_transform in topk_v2.cuh), so a -1 pre-fill is a full-size memset for
+    # nothing. Pinned by test_topk_v2_writes_every_slot.
+    out = logits.new_empty((num_rows, topk), dtype=torch.int32)
     topk_transform_512_v2(logits, lengths_i32, page_table, out, page_size, plan)
     return out
 
