@@ -3259,20 +3259,13 @@ class DeepseekSparseAttnBackend(
         # `_unified_attention_with_output_impl`). Write straight into it instead:
         # that copy is the full attention output, 256 MB per layer at a 16K-token
         # MLA prefill (~1% of the forward). Same convention as the FA3 / trtllm-MHA
-        # / aiter backends; the shape/dtype guard keeps a mismatched or absent
-        # buffer on the copy path.
-        out_buffer = getattr(forward_batch, "_attn_output", None)
+        # / aiter backends. No shape guard: flashinfer validates `out` against
+        # query.shape[:-1] + (kv_lora_rank,) and raises, so a buffer that does not
+        # match the kernel's contract fails here rather than costing throughput
+        # nobody can account for. `.view` likewise raises on a numel mismatch.
+        out_buffer = forward_batch._attn_output
         if out_buffer is not None:
-            if (
-                out_buffer.dtype == torch.bfloat16
-                and out_buffer.is_contiguous()
-                and out_buffer.numel() == batch_size * num_heads * self.kv_lora_rank
-            ):
-                out_buffer = out_buffer.view(
-                    batch_size, 1, num_heads, self.kv_lora_rank
-                )
-            else:
-                out_buffer = None
+            out_buffer = out_buffer.view(batch_size, 1, num_heads, self.kv_lora_rank)
 
         out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,
