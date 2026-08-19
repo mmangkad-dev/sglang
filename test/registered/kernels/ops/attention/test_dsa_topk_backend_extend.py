@@ -280,6 +280,27 @@ def test_extend_falls_back_when_lengths_are_not_the_planned_tensor() -> None:
     _assert_same(out, _legacy_paged(scores, other, row_starts, cu_q, meta))
 
 
+@pytest.mark.parametrize("bad_max_seq_len_k", [0, -1, 10**9])
+@torch.inference_mode()
+def test_extend_falls_back_on_out_of_range_metadata_bound(bad_max_seq_len_k) -> None:
+    """max_seq_len_k out of range means broken metadata, so fall back rather than
+    clamp into it.
+
+    Clamping with min(max_seq_len_k, logits.shape[1]) would look harmless but
+    substitutes a LOWER bound whenever max_seq_len_k is too large -- the one
+    direction that miscomputes the top-k, since a level whose fixed-unrolled loop is
+    too short cannot cover the longest row. Rejecting also leaves the kernel's own
+    range check reachable. Guards against re-introducing the clamp.
+    """
+    scores, lengths, row_starts, cu_q, meta = _build_batch([1000, 5003], [256, 256])
+    meta.max_seq_len_k = bad_max_seq_len_k
+    out, used_v2 = _run(
+        TopkTransformMethod.PAGED, scores, lengths, row_starts, cu_q, meta
+    )
+    assert not used_v2
+    _assert_same(out, _legacy_paged(scores, lengths, row_starts, cu_q, meta))
+
+
 @torch.inference_mode()
 def test_extend_falls_back_without_row_starts() -> None:
     """No row starts marks the dummy-logits path, whose score buffer is only `topk`

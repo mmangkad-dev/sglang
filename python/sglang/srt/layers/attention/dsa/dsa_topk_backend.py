@@ -340,10 +340,17 @@ def _topk_transform_v2_extend(
     # batch holds more than one request -- which picks a needlessly wide register
     # template, and can even route a batch of short rows to the cluster path with
     # no work for it. max_seq_len_k is the host-side max over the batch's KV
-    # lengths, and dsa_seqlens_expanded's largest entry is exactly one request's KV
-    # length, so it is a tight and valid bound.
-    max_seq_len = min(attn_metadata.max_seq_len_k, logits.shape[1])
-    if max_seq_len <= 0:
+    # lengths and dsa_seqlens_expanded's largest entry is exactly one request's KV
+    # length, so for EXTEND the two are the same number: a tight, valid bound.
+    #
+    # Reject rather than clamp. A bound past the score width is a broken metadata
+    # invariant, and min()-ing it would silently substitute a LOWER bound -- the one
+    # direction that miscomputes the top-k (a too-small level cannot cover the
+    # longest row). Falling back keeps the kernel's own range check reachable
+    # instead of pre-empting it. Unreachable today: logits.shape[1] is the sum of
+    # the batch's KV lengths and max_seq_len_k is their max.
+    max_seq_len = attn_metadata.max_seq_len_k
+    if max_seq_len <= 0 or max_seq_len > logits.shape[1]:
         return None
 
     kwargs = {}
