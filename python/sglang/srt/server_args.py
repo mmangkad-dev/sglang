@@ -4939,46 +4939,7 @@ class ServerArgs:
             decode_cuda_graph_config.max_bs = self.torch_compile_max_bs
 
         if prefill_cuda_graph_config.max_bs is None:
-            # Refer to pr #15927, by default we set the prefill max_bs to the chunked prefill size.
-            # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
-            # To avoid the performance regression, we set max_bs to 2048 by default.
-            #
-            # DSA (DeepSeek-V3.2 / GLM-5.x) raises the cap when its prefill runs
-            # under breakable CUDA graph, whose graph breaks keep the
-            # sparse-attention and indexer kernels on their eager dispatch, so the
-            # piecewise dispatch concern above does not apply -- it still does on
-            # tc_piecewise and full, which therefore keep 2048. Above 2048 the cap
-            # forced an eager forward through a launch-bound region: on
-            # GLM-5.2-NVFP4 (TP4, GB300) capturing it raised single-request prefill
-            # throughput 1.78x at 3K tokens, 1.37x at 4K and 1.07x at 6K.
-            #
-            # It stops at DSA_PREFILL_CUDA_GRAPH_MAX_TOKENS rather than following
-            # chunked_prefill_size, because a replay executes its whole bucket:
-            # past ~6K tokens the forward is GPU-bound (capture is worth +0.8% at
-            # 8K and +0.1% at 16K) while rounding a batch up to the next bucket
-            # costs 1-4% of real work. Serving A/B confirmed the crossover -- with
-            # coverage to 16K, 16000- and 16128-token batches padded to 16384 and
-            # prefill throughput went DOWN ~1% at 8K/16K inputs. Larger prefills
-            # keep running eager at their exact shape.
-            if not self.use_mla_backend():
-                prefill_cuda_graph_config.max_bs = self.chunked_prefill_size
-            elif self._widens_dsa_prefill_breakable_graph():
-                # chunked_prefill_size == -1 means chunked prefill is OFF (set for
-                # --enable-mis and for multimodal archs that cannot chunk, and
-                # settable directly). Taking the min with it would yield max_bs=-1,
-                # which empties the capture ladder -- every candidate is dropped by
-                # `s <= max_bs` -- and PrefillCudaGraphRunner then asserts on an
-                # empty bs list. With chunking off the forward is bounded by
-                # max_prefill_tokens instead, so the token cap alone is the bound.
-                prefill_cuda_graph_config.max_bs = (
-                    DSA_PREFILL_CUDA_GRAPH_MAX_TOKENS
-                    if self.chunked_prefill_size <= 0
-                    else min(
-                        self.chunked_prefill_size, DSA_PREFILL_CUDA_GRAPH_MAX_TOKENS
-                    )
-                )
-            else:
-                prefill_cuda_graph_config.max_bs = 2048
+            prefill_cuda_graph_config.max_bs = self._default_prefill_cuda_graph_max_bs()
 
             # If max_total_tokens is set, cap prefill max_bs to not exceed max_total_tokens.
             if self.max_total_tokens is not None:
@@ -5129,6 +5090,49 @@ class ServerArgs:
         if gpu_mem is not None and gpu_mem > 60 * 1024:
             reserved_mem = max(reserved_mem, 10 * 1024)
         return reserved_mem
+
+    def _default_prefill_cuda_graph_max_bs(self) -> int:
+        """Prefill CUDA-graph token cap to use when the config did not set one.
+
+        Read-only; the caller assigns. Kept out of _handle_gpu_memory_settings so
+        the three-way decision -- which is what the two regressions below were --
+        is testable without standing up the whole memory handler.
+
+        Refer to pr #15927: by default the prefill max_bs is the chunked prefill
+        size. For the MLA backend, piecewise CUDA graph changes kernel dispatch
+        versus the original mode, so it is capped at 2048 to avoid the regression.
+
+        DSA (DeepSeek-V3.2 / GLM-5.x) raises that cap when its prefill runs under
+        breakable CUDA graph, whose graph breaks keep the sparse-attention and
+        indexer kernels on their eager dispatch, so the piecewise dispatch concern
+        does not apply -- it still does on tc_piecewise and full, which therefore
+        keep 2048. Above 2048 the cap instead forced an eager forward through a
+        launch-bound region: on GLM-5.2-NVFP4 (TP4, GB300) capturing it raised
+        single-request prefill throughput 1.78x at 3K tokens, 1.37x at 4K and 1.07x
+        at 6K.
+
+        The raise stops at DSA_PREFILL_CUDA_GRAPH_MAX_TOKENS rather than following
+        chunked_prefill_size, because a replay executes its whole bucket: past ~6K
+        tokens the forward is GPU-bound (capture is worth +0.8% at 8K and +0.1% at
+        16K) while rounding a batch up to the next bucket costs 1-4% of real work.
+        Serving A/B confirmed the crossover -- with coverage to 16K, 16000- and
+        16128-token batches padded to 16384 and prefill throughput went DOWN ~1% at
+        8K/16K inputs. Larger prefills keep running eager at their exact shape.
+        """
+        if not self.use_mla_backend():
+            return self.chunked_prefill_size
+        if not self._widens_dsa_prefill_breakable_graph():
+            return 2048
+        # chunked_prefill_size == -1 means chunked prefill is OFF (set for
+        # --enable-mis and for multimodal archs that cannot chunk, and settable
+        # directly). Taking the min with it would yield max_bs=-1, which empties the
+        # capture ladder -- every candidate is dropped by `s <= max_bs` -- and
+        # PrefillCudaGraphRunner then asserts on an empty bs list. With chunking off
+        # the forward is bounded by max_prefill_tokens instead, so the token cap
+        # alone is the bound.
+        if self.chunked_prefill_size <= 0:
+            return DSA_PREFILL_CUDA_GRAPH_MAX_TOKENS
+        return min(self.chunked_prefill_size, DSA_PREFILL_CUDA_GRAPH_MAX_TOKENS)
 
     def _widens_dsa_prefill_breakable_graph(self) -> bool:
         """Whether the prefill CUDA-graph ladder may run past the legacy 2048-token
