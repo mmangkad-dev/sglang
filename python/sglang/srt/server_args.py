@@ -448,6 +448,12 @@ def add_linear_attn_kernel_backend_choices(choices):
 # off only while the prefill forward is launch-bound; past this point a replay's
 # bucket padding costs more real work than the capture saves (see the max_bs
 # default in _handle_gpu_memory_settings for the measurements).
+#
+# The crossover was measured on GLM-5.2-NVFP4 / TP4 / GB300 and is applied as the
+# default for every is_deepseek_dsa arch on every supported part. It is where that
+# model stops being launch-bound, so a deployment whose prefill is launch-bound
+# further out (fewer layers, slower host, larger TP) may want more; pass
+# cuda_graph_config[prefill].max_bs (or --cuda-graph-max-bs-prefill) to override.
 DSA_PREFILL_CUDA_GRAPH_MAX_TOKENS = 6144
 
 
@@ -4937,10 +4943,11 @@ class ServerArgs:
             # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
             # To avoid the performance regression, we set max_bs to 2048 by default.
             #
-            # DSA (DeepSeek-V3.2 / GLM-5.x) raises the cap: its prefill runs under
-            # breakable CUDA graph, whose graph breaks keep the sparse-attention
-            # and indexer kernels on their eager dispatch, so the piecewise
-            # dispatch concern above does not apply. Above 2048 the cap instead
+            # DSA (DeepSeek-V3.2 / GLM-5.x) raises the cap when its prefill runs
+            # under breakable CUDA graph, whose graph breaks keep the
+            # sparse-attention and indexer kernels on their eager dispatch, so the
+            # piecewise dispatch concern above does not apply -- it still does on
+            # tc_piecewise and full, which therefore keep 2048. Above 2048 the cap
             # forced an eager forward through a launch-bound region: on
             # GLM-5.2-NVFP4 (TP4, GB300) capturing it raised single-request prefill
             # throughput 1.78x at 3K tokens, 1.37x at 4K and 1.07x at 6K.
@@ -4955,7 +4962,7 @@ class ServerArgs:
             # keep running eager at their exact shape.
             if not self.use_mla_backend():
                 prefill_cuda_graph_config.max_bs = self.chunked_prefill_size
-            elif self._uses_dsa_prefill_cuda_graph():
+            elif self._widens_dsa_prefill_breakable_graph():
                 # chunked_prefill_size == -1 means chunked prefill is OFF (set for
                 # --enable-mis and for multimodal archs that cannot chunk, and
                 # settable directly). Taking the min with it would yield max_bs=-1,
@@ -5123,18 +5130,28 @@ class ServerArgs:
             reserved_mem = max(reserved_mem, 10 * 1024)
         return reserved_mem
 
-    def _uses_dsa_prefill_cuda_graph(self) -> bool:
-        """Whether this is a DSA model whose prefill CUDA graph may cover the full
-        chunked-prefill token budget (see the max_bs default and the graph
-        reserve). Guarded so a config without a resolvable HF config -- unit-level
-        constructions, non-model paths -- keeps the conservative MLA default."""
+    def _widens_dsa_prefill_breakable_graph(self) -> bool:
+        """Whether the prefill CUDA-graph ladder may run past the legacy 2048-token
+        MLA cap: a DSA model captured by the BREAKABLE backend.
+
+        The backend is part of the condition, not just the model. Only breakable
+        keeps the sparse-attention and indexer kernels on their eager dispatch via
+        graph breaks; tc_piecewise (auto-selected for multimodal
+        piecewise-allowlisted archs, which include the DSA arch
+        PixtralForConditionalGeneration) and full capture them, so the
+        kernel-dispatch regression the 2048 cap exists to avoid still applies
+        there. _handle_cuda_graph_config() has already resolved the backend by the
+        time _handle_gpu_memory_settings runs, so this costs nothing.
+
+        Keep this in agreement with the widened-ladder arm of reserve_for_graph_mb:
+        whenever this returns True that arm must fire, or the wider ladder is
+        captured against a reserve sized for the narrow one.
+        """
         from sglang.srt.configs.model_config import is_deepseek_dsa
 
-        try:
-            hf_config = self.get_model_config().hf_config
-        except Exception:
+        if self.cuda_graph_config.prefill.backend != Backend.BREAKABLE:
             return False
-        return is_deepseek_dsa(hf_config)
+        return is_deepseek_dsa(self.get_model_config().hf_config)
 
     def reserve_for_graph_mb(self) -> float:
         decode_cuda_graph_config = self.cuda_graph_config.decode
@@ -5181,9 +5198,16 @@ class ServerArgs:
                 # 54 / 6144 (the DSA default) 3.8 vs 3.93 GB, 74 / 16384 7.6 vs
                 # 7.50 GB. The flat 1.5 GB below underestimates the wider ladders,
                 # and the shortfall comes out of the KV pool's headroom instead.
-                reserved_mem += (
+                # max() with the legacy flat value: the fit is calibrated on one
+                # model, and this arm also covers a non-DSA MLA model whose prefill
+                # max_bs was raised by hand, where the per-bucket term (which
+                # tracks segments per forward, i.e. layer count) and the per-token
+                # term (hidden size) both scale differently. Flooring it means no
+                # config can come out of this with a SMALLER reserve than before.
+                reserved_mem += max(
+                    1.5 * 1024,
                     len(prefill_cuda_graph_config.bs) * 36
-                    + max(prefill_cuda_graph_config.bs) * 0.3
+                    + max(prefill_cuda_graph_config.bs) * 0.3,
                 )
             else:
                 # MLA backend overhead is much higher than expected with fa3.
