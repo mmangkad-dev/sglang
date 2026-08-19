@@ -4956,8 +4956,19 @@ class ServerArgs:
             if not self.use_mla_backend():
                 prefill_cuda_graph_config.max_bs = self.chunked_prefill_size
             elif self._uses_dsa_prefill_cuda_graph():
-                prefill_cuda_graph_config.max_bs = min(
-                    self.chunked_prefill_size, DSA_PREFILL_CUDA_GRAPH_MAX_TOKENS
+                # chunked_prefill_size == -1 means chunked prefill is OFF (set for
+                # --enable-mis and for multimodal archs that cannot chunk, and
+                # settable directly). Taking the min with it would yield max_bs=-1,
+                # which empties the capture ladder -- every candidate is dropped by
+                # `s <= max_bs` -- and PrefillCudaGraphRunner then asserts on an
+                # empty bs list. With chunking off the forward is bounded by
+                # max_prefill_tokens instead, so the token cap alone is the bound.
+                prefill_cuda_graph_config.max_bs = (
+                    DSA_PREFILL_CUDA_GRAPH_MAX_TOKENS
+                    if self.chunked_prefill_size <= 0
+                    else min(
+                        self.chunked_prefill_size, DSA_PREFILL_CUDA_GRAPH_MAX_TOKENS
+                    )
                 )
             else:
                 prefill_cuda_graph_config.max_bs = 2048
