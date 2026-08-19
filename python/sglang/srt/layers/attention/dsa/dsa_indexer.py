@@ -1131,8 +1131,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert logits.shape[1] == k_offset
 
             self._mask_init_and_local_tokens(logits, seq_lens_expanded, ks)
-            raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
-            topk_result[:q_offset] = raw_topk_result
+            # Hand the transform the destination slice directly: under CUDA graph
+            # `topk_result` is the static buffer a captured segment reads, so a
+            # backend that honors `out` skips a full-size copy (128 MB per indexer
+            # layer at a 16K prefill). Backends that ignore it return their own
+            # tensor, which the copy below still handles.
+            raw_topk_result = metadata.topk_transform(
+                logits, self.index_topk, ks=ks, out=topk_result[:q_offset]
+            )
+            if raw_topk_result.data_ptr() != topk_result.data_ptr():
+                topk_result[:q_offset] = raw_topk_result
             return topk_result
 
         bytes_per_row = k_offset * self._MQA_LOGITS_BYTES_PER_ELEM

@@ -3253,8 +3253,30 @@ class DeepseekSparseAttnBackend(
             seq_chunks = list(torch.split(seq_lens, cp_meta.split_list, dim=0))
             seq_lens = torch.cat([seq_chunks[i] for i in cp_meta.zigzag_index], dim=0)
 
+        # Piecewise / breakable CUDA graph pre-allocates the attention output at a
+        # fixed address that a downstream captured segment reads, and copies our
+        # result into it when we return a different buffer (see
+        # `_unified_attention_with_output_impl`). Write straight into it instead:
+        # that copy is the full attention output, 256 MB per layer at a 16K-token
+        # MLA prefill (~1% of the forward). Same convention as the FA3 / trtllm-MHA
+        # / aiter backends; the shape/dtype guard keeps a mismatched or absent
+        # buffer on the copy path.
+        out_buffer = getattr(forward_batch, "_attn_output", None)
+        if out_buffer is not None:
+            if (
+                out_buffer.dtype == torch.bfloat16
+                and out_buffer.is_contiguous()
+                and out_buffer.numel() == batch_size * num_heads * self.kv_lora_rank
+            ):
+                out_buffer = out_buffer.view(
+                    batch_size, 1, num_heads, self.kv_lora_rank
+                )
+            else:
+                out_buffer = None
+
         out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,
+            out=out_buffer,
             kv_cache=kv,
             workspace_buffer=self.workspace_buffer,
             qk_nope_head_dim=self.qk_nope_head_dim,

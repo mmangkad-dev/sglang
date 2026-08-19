@@ -33,6 +33,9 @@ using Register4 = impl::TopKRegister<4>;  // <= 16384, register-resident, 1 read
 using Streaming = impl::TopKStreaming;
 using Cluster = impl::TopKCluster<8>;
 
+// Elements per vectorized load in the impls; the ragged window's misalignment is
+// measured against it.
+constexpr uint32_t kVecElems = Register2::kVecSize;
 constexpr uint32_t kBlockSize = impl::TopKConfig::kBlockSize;
 constexpr uint32_t kOccupancy = impl::TopKConfig::kOccupancy;
 constexpr uint32_t kMaxTopK = impl::TopKConfig::kMaxTopK;
@@ -62,10 +65,14 @@ static_assert(sizeof(GlobalMetadata) == 2 * sizeof(int32_t) && sizeof(PlanItem) 
 struct TopKLaunchParams {
   const float* __restrict__ scores;
   const int32_t* __restrict__ seq_lens;
-  const int32_t* __restrict__ page_table;
+  const int32_t* __restrict__ page_table;  // nullptr selects the ragged output transform
   int32_t* __restrict__ page_indices;
   int32_t* __restrict__ raw_indices;      // optional raw (pre-transform) indices output; nullptr if unused
   const PlanItem* __restrict__ metadata;  // [0]=GlobalMetadata, [1+i]=PlanItem
+  // Extend contract only; all nullptr for the decode contract.
+  const int32_t* __restrict__ row_starts;    // per-row start column inside the score row
+  const int32_t* __restrict__ out_offsets;   // ragged output: added to each selected index
+  const int32_t* __restrict__ row_to_batch;  // paged output: row -> page_table row
   int64_t score_stride;
   int64_t page_table_stride;
   uint32_t topk;
@@ -86,14 +93,28 @@ struct TopKLaunchParams {
   }
   SGL_DEVICE TopKProblem problem(uint32_t batch_id, uint32_t seq_len) const {
     const auto k = static_cast<int64_t>(topk);
+    // Ragged rows start at an arbitrary column, so the window base can sit off
+    // the 16B boundary the vectorized loads need; `head` names how many leading
+    // elements the impls must scalar-load to realign. The score row base is 16B
+    // aligned (data_ptr alignment + score_stride % 4 == 0 check on the host), so
+    // the offset alone decides the misalignment.
+    const uint32_t row_start = row_starts != nullptr ? static_cast<uint32_t>(row_starts[batch_id]) : 0u;
+    const uint32_t head = (kVecElems - (row_start % kVecElems)) % kVecElems;
+    // Decode maps row -> page-table row identically; extend has many query rows
+    // per request, so the mapping is supplied.
+    const uint32_t pt_row = row_to_batch != nullptr ? static_cast<uint32_t>(row_to_batch[batch_id]) : batch_id;
     return TopKProblem{
-        .in = scores + batch_id * score_stride,
+        .in = scores + batch_id * score_stride + row_start,
         .out = page_indices + batch_id * k,
         .raw_out = raw_indices != nullptr ? raw_indices + batch_id * k : nullptr,
-        .page_table = page_table + batch_id * page_table_stride,
+        .page_table = page_table != nullptr ? page_table + pt_row * page_table_stride : nullptr,
         .topk = topk,
         .seq_len = seq_len,
         .page_bits = page_bits,
+        // A trivial row (seq_len <= topk) never enters the vectorized impls, so
+        // its head is irrelevant; clamping keeps `seq_len - head` well-defined.
+        .head = seq_len > head ? head : 0u,
+        .out_offset = out_offsets != nullptr ? out_offsets[batch_id] : 0,
     };
   }
   SGL_DEVICE TopKProblem problem(uint32_t batch_id) const {
@@ -429,6 +450,9 @@ struct TopKKernel {
         .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
         .raw_indices = raw_indices_ptr,
         .metadata = static_cast<const PlanItem*>(metadata.data_ptr()),
+        .row_starts = nullptr,
+        .out_offsets = nullptr,
+        .row_to_batch = nullptr,
         .score_stride = S.unwrap(),
         .page_table_stride = P.unwrap(),
         .topk = topk,
@@ -436,6 +460,111 @@ struct TopKKernel {
         .cluster_floor = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor,
     };
 
+    launch(params, batch_size, max_seq_len, device);
+  }
+
+  /// Extend (prefill / draft-extend) variant. Each row's window is
+  /// `scores[b, row_starts[b] : row_starts[b] + seq_lens[b]]` -- unlike decode,
+  /// the window does not start at column 0 and there are many query rows per
+  /// request. The selected window-relative positions go through one of two output
+  /// transforms, exactly one of which must be supplied:
+  ///   * paged (`page_table` + `row_to_batch`): the same page-table transform as
+  ///     `transform`, reading row `row_to_batch[b]` of the compact page table.
+  ///     Replaces sgl_kernel's `fast_topk_transform_fused` prefill kernel, which
+  ///     instead gathers a page_size=1 table.
+  ///   * ragged (`out_offsets`): `position + out_offsets[b]`, an index into the
+  ///     concatenated ragged KV buffer. Replaces
+  ///     `fast_topk_transform_ragged_fused`.
+  static void transform_extend(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView seq_lens,
+      const tvm::ffi::TensorView row_starts,
+      const tvm::ffi::TensorView topk_indices,
+      const tvm::ffi::TensorView metadata,
+      const uint32_t page_size,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> row_to_batch,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> out_offsets) {
+    using namespace host;
+    auto B = SymbolicSize{"batch_size"};
+    auto Bp1 = SymbolicSize{"batch_size_plus_1"};
+    auto L = SymbolicSize{"max_seq_len"};
+    auto S = SymbolicSize{"score_stride"};
+    auto P = SymbolicSize{"page_table_stride"};
+    auto K = SymbolicSize{"topk"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+
+    TensorMatcher({B, L})  // score
+        .with_strides({S, 1})
+        .with_dtype<float>()
+        .with_device(device_)
+        .verify(scores);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(seq_lens);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(row_starts);
+    TensorMatcher({B, K}).with_dtype<int32_t>().with_device(device_).verify(topk_indices);
+    TensorMatcher({Bp1, 2}).with_dtype<int32_t>().with_device(device_).verify(metadata);
+
+    RuntimeCheck(
+        page_table.has_value() != out_offsets.has_value(),
+        "transform_extend takes exactly one of page_table (paged) / out_offsets (ragged)");
+    const int32_t* page_table_ptr = nullptr;
+    const int32_t* row_to_batch_ptr = nullptr;
+    const int32_t* out_offsets_ptr = nullptr;
+    int64_t page_table_stride = 0;
+    uint32_t page_bits = 0;
+    if (page_table.has_value()) {
+      TensorMatcher({-1, -1})
+          .with_strides({P, 1})
+          .with_dtype<int32_t>()
+          .with_device(device_)
+          .verify(page_table.value());
+      RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
+      RuntimeCheck(row_to_batch.has_value(), "paged transform_extend requires row_to_batch");
+      TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(row_to_batch.value());
+      page_table_ptr = static_cast<const int32_t*>(page_table.value().data_ptr());
+      row_to_batch_ptr = static_cast<const int32_t*>(row_to_batch.value().data_ptr());
+      page_table_stride = P.unwrap();
+      page_bits = static_cast<uint32_t>(std::countr_zero(page_size));
+    } else {
+      RuntimeCheck(!row_to_batch.has_value(), "ragged transform_extend takes no row_to_batch");
+      TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(out_offsets.value());
+      out_offsets_ptr = static_cast<const int32_t*>(out_offsets.value().data_ptr());
+    }
+
+    RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
+    RuntimeCheck(Bp1.unwrap() == B.unwrap() + 1, "invalid metadata shape");
+    const auto topk = static_cast<uint32_t>(K.unwrap());
+    RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
+
+    const auto batch_size = static_cast<uint32_t>(B.unwrap());
+    const auto max_seq_len = static_cast<uint32_t>(L.unwrap());
+    const auto device = device_.unwrap();
+    constexpr uint32_t kClusterFloorSmall = 32768;
+    constexpr uint32_t kSmallBatchLowFloor = 15;
+    const auto params = TopKLaunchParams{
+        .scores = static_cast<const float*>(scores.data_ptr()),
+        .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
+        .page_table = page_table_ptr,
+        .page_indices = static_cast<int32_t*>(topk_indices.data_ptr()),
+        .raw_indices = nullptr,
+        .metadata = static_cast<const PlanItem*>(metadata.data_ptr()),
+        .row_starts = static_cast<const int32_t*>(row_starts.data_ptr()),
+        .out_offsets = out_offsets_ptr,
+        .row_to_batch = row_to_batch_ptr,
+        .score_stride = S.unwrap(),
+        .page_table_stride = page_table_stride,
+        .topk = topk,
+        .page_bits = page_bits,
+        .cluster_floor = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor,
+    };
+    launch(params, batch_size, max_seq_len, device);
+  }
+
+ private:
+  static void launch(
+      const TopKLaunchParams& params, uint32_t batch_size, uint32_t max_seq_len, DLDevice device) {
+    using namespace host;
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
     constexpr bool kUsePDL = true;
     if (use_cluster) {

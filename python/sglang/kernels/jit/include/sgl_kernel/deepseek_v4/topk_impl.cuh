@@ -167,18 +167,33 @@ SGL_DEVICE int32_t page_to_indices(const int32_t* __restrict__ page_table, uint3
 }
 
 /// One batch element's worth of work. `emit(pos, raw_idx)` writes the selected raw
-/// index to output slot `pos`; `transform_output` then applies the page-table
+/// index to output slot `pos`; `transform_output` then applies the output
 /// transform in a separate pass (and records the raw index in `raw_out` if set).
+///
+/// Two output transforms are supported, selected by `page_table`:
+///   * paged (page_table != nullptr): `page_table[i >> page_bits] * page_size +
+///     (i & mask)` -- the decode/verify contract, mapping a row-relative position
+///     to a physical page_size=1 KV slot.
+///   * ragged (page_table == nullptr): `i + out_offset` -- the extend contract,
+///     mapping a row-relative position into the concatenated ragged KV buffer.
+///
+/// `in` points at the row's *window* base (already offset by the row's start
+/// column), and `head` is the number of leading elements that sit before the
+/// next 16-byte boundary of `in`. Impls handle those `head` elements as scalars
+/// so their vector loads stay aligned; `head` is 0 whenever the window starts on
+/// a 16-byte boundary, which is always the case for the paged (decode) contract.
 struct TopKProblem {
   const float* __restrict__ in;
   int32_t* __restrict__ out;      // page_indices [topk]
   int32_t* __restrict__ raw_out;  // optional raw (pre-transform) indices [topk]; nullptr if unused
-  const int32_t* __restrict__ page_table;
+  const int32_t* __restrict__ page_table;  // nullptr selects the ragged transform
   uint32_t topk;
   uint32_t seq_len;
   uint32_t page_bits;
+  uint32_t head;       // leading unaligned elements of `in` (0..kVecSize-1)
+  int32_t out_offset;  // ragged transform: added to every selected index
 
-  // Write the raw selected index; the page-table transform is applied afterwards
+  // Write the raw selected index; the output transform is applied afterwards
   // by transform_output() in a separate, pipelined pass. Keeping the per-element
   // page_table gather off the atomic-serialized scatter loop is measurably faster
   // for both short and long context.
@@ -187,7 +202,13 @@ struct TopKProblem {
   }
   SGL_DEVICE void transform_output(uint32_t t, int32_t raw) const {
     if (raw_out != nullptr) raw_out[t] = raw;
-    out[t] = raw < 0 ? -1 : page_to_indices(page_table, raw, page_bits);
+    if (raw < 0) {
+      out[t] = -1;
+    } else if (page_table == nullptr) {
+      out[t] = raw + out_offset;
+    } else {
+      out[t] = page_to_indices(page_table, raw, page_bits);
+    }
   }
 };
 
@@ -450,19 +471,28 @@ struct TopKRadixBase : TopKConfig {
   };
 
  protected:
+  /// Visit every element of `in[0, seq_len)` exactly once, calling
+  /// `fn(value, index)` with `index` relative to `in`. `head` (0..kVecSize-1)
+  /// elements at the front are visited as scalars, so `in + head` -- and hence
+  /// every vector load below -- is 16-byte aligned even when the caller's window
+  /// starts off-boundary. `head` is a uniform (grid-constant-derived) value, so
+  /// the extra branch costs nothing on the aligned path.
   template <typename F>
-  SGL_DEVICE static void for_each_input(const float* __restrict__ in, uint32_t seq_len, F&& fn) {
+  SGL_DEVICE static void for_each_input(
+      const float* __restrict__ in, uint32_t seq_len, F&& fn, uint32_t head = 0) {
     const auto tx = threadIdx.x;
-    const uint32_t num_full = seq_len / kVecSize;  // fully-in-bounds vectors
+    if (head != 0 && tx < head) fn(in[tx], tx);
+    const float* __restrict__ body = in + head;
+    const uint32_t num_full = (seq_len - head) / kVecSize;  // fully-in-bounds vectors
 
     vec_t next_vec;
     uint32_t vi = tx;
-    if (vi < num_full) next_vec.load(in, vi);
+    if (vi < num_full) next_vec.load(body, vi);
     while (vi < num_full) {
       const auto cur = next_vec;
-      const auto base = vi * kVecSize;
+      const auto base = head + vi * kVecSize;
       vi += kBlockSize;
-      if (vi < num_full) next_vec.load(in, vi);
+      if (vi < num_full) next_vec.load(body, vi);
 #pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j) {
         fn(cur[j], base + j);
@@ -471,7 +501,7 @@ struct TopKRadixBase : TopKConfig {
 
     // Tail: at most one partial vector, `rem` in [0, kVecSize).
     static_assert(kVecSize <= kBlockSize);  // ensure tail correctness
-    const uint32_t tail_start = num_full * kVecSize;
+    const uint32_t tail_start = head + num_full * kVecSize;
     if (tx < seq_len - tail_start) {
       const auto idx = tail_start + tx;
       fn(in[idx], idx);
@@ -551,8 +581,16 @@ struct TopKRegister : TopKRadixBase<12> {
     // a scalar remainder on the LAST lanes (which own the fewest full vectors, so
     // it overlaps the busy lanes' extra vector). The full path has no per-element
     // bounds check, keeping register pressure low enough to hold all vectors.
-    const uint32_t num_full = problem.seq_len / kVecSize;
-    const uint32_t tail_start = num_full * kVecSize;
+    //
+    // `head` mirrors the tail at the front: the ragged (extend) contract hands us
+    // a window whose first element can sit up to kVecSize-1 elements past the last
+    // 16B boundary, so those elements are scalar-loaded on the FIRST lanes and the
+    // vector region starts at the aligned `body` pointer. head == 0 (always true
+    // for the paged contract) leaves the loops below bit-identical to before.
+    const uint32_t head = problem.head;
+    const float* __restrict__ body = problem.in + head;
+    const uint32_t num_full = (problem.seq_len - head) / kVecSize;
+    const uint32_t tail_start = head + num_full * kVecSize;
     const uint32_t tail = problem.seq_len - tail_start;
 
     // Phase 1: load full vectors + build histogram
@@ -561,7 +599,10 @@ struct TopKRegister : TopKRadixBase<12> {
     for (uint32_t i = 0; i < kLocalVecs; ++i) {
       const auto vi = tx + kBlockSize * i;
       if (vi >= num_full) break;
-      local_vecs[i].load(problem.in, vi);
+      local_vecs[i].load(body, vi);
+    }
+    if (head != 0 && tx < head) {
+      atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(problem.in[tx])], 1);
     }
 #pragma unroll
     for (uint32_t i = 0; i < kLocalVecs; ++i) {
@@ -596,10 +637,13 @@ struct TopKRegister : TopKRadixBase<12> {
           smem->tie.values[count_eq] = {val, idx};
       }
     };
+    if (head != 0 && tx < head) {
+      collect(problem.in[tx], tx);
+    }
 #pragma unroll
     for (uint32_t i = 0; i < kLocalVecs; ++i) {
       const auto vi = tx + kBlockSize * i;
-      const auto base = vi * kVecSize;
+      const auto base = head + vi * kVecSize;
       if (vi >= num_full) break;
 #pragma unroll
       for (uint32_t j = 0; j < kVecSize; ++j)
@@ -646,10 +690,14 @@ struct TopKStreaming : TopKRegister<2> {
     PDLWaitPrimary<kUsePDL>();
 
     // Phase 1: Load and build histogram
-    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
-      const auto bin = extract_coarse_bin<kHistBits>(val);
-      atomicAdd(&smem->histogram[bin], 1);
-    });
+    for_each_input(
+        problem.in,
+        problem.seq_len,
+        [&](float val, uint32_t) {
+          const auto bin = extract_coarse_bin<kHistBits>(val);
+          atomicAdd(&smem->histogram[bin], 1);
+        },
+        problem.head);
     __syncthreads();
 
     // Phase 2: Find the threshold bin
@@ -664,19 +712,23 @@ struct TopKStreaming : TopKRegister<2> {
     const float v_hi = coarse_bin_lower_bound<kHistBits>(threshold_bin + 1);
     const float v_lo = coarse_bin_lower_bound<kHistBits>(threshold_bin);
     const auto topk = problem.topk;
-    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
-      if (val >= v_hi) {
-        const auto pos = atomicAdd(&smem->count_gt, 1);
-        if (pos < topk) [[likely]] {
-          problem.emit(pos, idx);
-        }
-      } else if (val >= v_lo) {
-        const auto count_eq = atomicAdd(&smem->count_eq, 1);
-        if (count_eq < kMaxNumTie) [[likely]] {
-          smem->tie.values[count_eq] = {val, idx};
-        }
-      }
-    });
+    for_each_input(
+        problem.in,
+        problem.seq_len,
+        [&](float val, uint32_t idx) {
+          if (val >= v_hi) {
+            const auto pos = atomicAdd(&smem->count_gt, 1);
+            if (pos < topk) [[likely]] {
+              problem.emit(pos, idx);
+            }
+          } else if (val >= v_lo) {
+            const auto count_eq = atomicAdd(&smem->count_eq, 1);
+            if (count_eq < kMaxNumTie) [[likely]] {
+              smem->tie.values[count_eq] = {val, idx};
+            }
+          }
+        },
+        problem.head);
 
     // Phase 4: Handle ties. Drive the output layout from the *collect* counts so it
     // is self-consistent with the fp32 classification above (rather than the fp16
@@ -721,12 +773,21 @@ struct TopKCluster : TopKRadixBase<10> {
     const auto this_rank = blockIdx.y;
     const bool is_primary = (this_rank == 0);
 
+    // The `head` unaligned elements are excluded from the chunk split (so every
+    // rank's chunk starts on a 16B boundary) and handled by the primary rank as
+    // scalars, exactly like the single-block paths. `head` is 0 for the paged
+    // contract, leaving the split below unchanged.
     constexpr uint32_t kAlignElems = kWarpSize * kVecSize;
-    const uint32_t chunk_size = div_ceil(problem.seq_len, kClusterSize * kAlignElems) * kAlignElems;
-    const uint32_t chunk_start = min(this_rank * chunk_size, problem.seq_len);
-    const uint32_t chunk_finish = min(chunk_start + chunk_size, problem.seq_len);
+    const uint32_t head = problem.head;
+    const float* __restrict__ head_in = problem.in;
+    const uint32_t body_seq_len = problem.seq_len - head;
+    const uint32_t chunk_size = div_ceil(body_seq_len, kClusterSize * kAlignElems) * kAlignElems;
+    const uint32_t chunk_start = min(this_rank * chunk_size, body_seq_len);
+    const uint32_t chunk_finish = min(chunk_start + chunk_size, body_seq_len);
     const uint32_t local_seq_len = chunk_finish - chunk_start;
-    problem.in += chunk_start;
+    problem.in += head + chunk_start;
+    // Global (window-relative) index of this rank's chunk start.
+    const uint32_t chunk_base = head + chunk_start;
 
     {
       typename Smem::kHistVec hist_vec;
@@ -740,7 +801,11 @@ struct TopKCluster : TopKRadixBase<10> {
     __syncthreads();
     PDLWaitPrimary<kUsePDL>();
 
-    // Phase 1: Load and build histogram over this rank's contiguous chunk.
+    // Phase 1: Load and build histogram over this rank's contiguous chunk, plus
+    // the window's unaligned head on the primary rank.
+    if (head != 0 && is_primary && tx < head) {
+      atomicAdd(&smem->histogram[extract_coarse_bin<kHistBits>(head_in[tx])], 1);
+    }
     for_each_input(problem.in, local_seq_len, [&](float val, uint32_t) {
       const auto bin = extract_coarse_bin<kHistBits>(val);
       atomicAdd(&smem->histogram[bin], 1);
@@ -792,7 +857,7 @@ struct TopKCluster : TopKRadixBase<10> {
     if (!is_primary) {
       // stage to tmp_out first before writing to global/DSMEM
       for_each_input(problem.in, local_seq_len, [&](float val, uint32_t local_idx) {
-        const auto idx = chunk_start + local_idx;
+        const auto idx = chunk_base + local_idx;
         if (val >= v_hi) {
           const auto pos = atomicAdd(&smem->count_gt, 1);
           if (pos < topk) [[likely]] {
@@ -837,8 +902,7 @@ struct TopKCluster : TopKRadixBase<10> {
         }
       }
     } else {
-      for_each_input(problem.in, local_seq_len, [&](float val, uint32_t local_idx) {
-        const auto idx = chunk_start + local_idx;
+      const auto collect_primary = [&](float val, uint32_t idx) {
         if (val >= v_hi) {
           const auto pos = atomicAdd(&smem->count_gt, 1);
           if (pos < topk) [[likely]] {
@@ -850,6 +914,12 @@ struct TopKCluster : TopKRadixBase<10> {
             smem->tie.values[count_eq] = {val, idx};
           }
         }
+      };
+      if (head != 0 && tx < head) {
+        collect_primary(head_in[tx], tx);
+      }
+      for_each_input(problem.in, local_seq_len, [&](float val, uint32_t local_idx) {
+        collect_primary(val, chunk_base + local_idx);
       });
 
       cluster.sync();

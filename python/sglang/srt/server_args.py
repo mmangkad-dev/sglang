@@ -444,6 +444,13 @@ def add_linear_attn_kernel_backend_choices(choices):
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
 
 
+# Token cap for the DSA prefill breakable-CUDA-graph bucket ladder. Capture pays
+# off only while the prefill forward is launch-bound; past this point a replay's
+# bucket padding costs more real work than the capture saves (see the max_bs
+# default in _handle_gpu_memory_settings for the measurements).
+DSA_PREFILL_CUDA_GRAPH_MAX_TOKENS = 6144
+
+
 @dataclasses.dataclass
 class ServerArgs:
     """Server-wide configuration for SGLang.
@@ -4929,8 +4936,29 @@ class ServerArgs:
             # Refer to pr #15927, by default we set the prefill max_bs to the chunked prefill size.
             # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
             # To avoid the performance regression, we set max_bs to 2048 by default.
+            #
+            # DSA (DeepSeek-V3.2 / GLM-5.x) raises the cap: its prefill runs under
+            # breakable CUDA graph, whose graph breaks keep the sparse-attention
+            # and indexer kernels on their eager dispatch, so the piecewise
+            # dispatch concern above does not apply. Above 2048 the cap instead
+            # forced an eager forward through a launch-bound region: on
+            # GLM-5.2-NVFP4 (TP4, GB300) capturing it raised single-request prefill
+            # throughput 1.78x at 3K tokens, 1.37x at 4K and 1.07x at 6K.
+            #
+            # It stops at DSA_PREFILL_CUDA_GRAPH_MAX_TOKENS rather than following
+            # chunked_prefill_size, because a replay executes its whole bucket:
+            # past ~6K tokens the forward is GPU-bound (capture is worth +0.8% at
+            # 8K and +0.1% at 16K) while rounding a batch up to the next bucket
+            # costs 1-4% of real work. Serving A/B confirmed the crossover -- with
+            # coverage to 16K, 16000- and 16128-token batches padded to 16384 and
+            # prefill throughput went DOWN ~1% at 8K/16K inputs. Larger prefills
+            # keep running eager at their exact shape.
             if not self.use_mla_backend():
                 prefill_cuda_graph_config.max_bs = self.chunked_prefill_size
+            elif self._uses_dsa_prefill_cuda_graph():
+                prefill_cuda_graph_config.max_bs = min(
+                    self.chunked_prefill_size, DSA_PREFILL_CUDA_GRAPH_MAX_TOKENS
+                )
             else:
                 prefill_cuda_graph_config.max_bs = 2048
 
@@ -5084,6 +5112,19 @@ class ServerArgs:
             reserved_mem = max(reserved_mem, 10 * 1024)
         return reserved_mem
 
+    def _uses_dsa_prefill_cuda_graph(self) -> bool:
+        """Whether this is a DSA model whose prefill CUDA graph may cover the full
+        chunked-prefill token budget (see the max_bs default and the graph
+        reserve). Guarded so a config without a resolvable HF config -- unit-level
+        constructions, non-model paths -- keeps the conservative MLA default."""
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+
+        try:
+            hf_config = self.get_model_config().hf_config
+        except Exception:
+            return False
+        return is_deepseek_dsa(hf_config)
+
     def reserve_for_graph_mb(self) -> float:
         decode_cuda_graph_config = self.cuda_graph_config.decode
         prefill_cuda_graph_config = self.cuda_graph_config.prefill
@@ -5112,6 +5153,27 @@ class ServerArgs:
             if not self.use_mla_backend():
                 # Only non-torch memory is counted; torch memory is reused by cuda graph capture.
                 reserved_mem += len(prefill_cuda_graph_config.bs) * 8
+            elif (
+                prefill_cuda_graph_config.backend == Backend.BREAKABLE
+                and prefill_cuda_graph_config.bs
+                and max(prefill_cuda_graph_config.bs) > 2048
+            ):
+                # Breakable prefill capture beyond the legacy 2048 cap. Two
+                # components, both measured on GLM-5.2-NVFP4 (TP4, GB300) by
+                # differencing the per-bucket avail_mem the capture loop logs:
+                #   * ~36 MB per captured bucket for the graph objects themselves
+                #     (a breakable capture is ~2 segments per layer, so this is
+                #     large and scales with the bucket count, not the shape), and
+                #   * ~0.3 MB per token of the largest bucket for the shared
+                #     mempool holding that bucket's activations.
+                # Predicted vs measured: 42 buckets / 2048 tokens 2.1 vs 2.10 GB,
+                # 54 / 6144 (the DSA default) 3.8 vs 3.93 GB, 74 / 16384 7.6 vs
+                # 7.50 GB. The flat 1.5 GB below underestimates the wider ladders,
+                # and the shortfall comes out of the KV pool's headroom instead.
+                reserved_mem += (
+                    len(prefill_cuda_graph_config.bs) * 36
+                    + max(prefill_cuda_graph_config.bs) * 0.3
+                )
             else:
                 # MLA backend overhead is much higher than expected with fa3.
                 reserved_mem += 1.5 * 1024

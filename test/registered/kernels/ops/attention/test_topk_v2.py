@@ -29,7 +29,11 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2, topk_transform_512_v2
+from sglang.kernels.ops.attention.dsv4.topk import (
+    plan_topk_v2,
+    topk_transform_512_v2,
+    topk_transform_extend_v2,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -293,6 +297,189 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
     our_raw = _run_raw(scores, seq_lens, page_table, k)
     ref_raw = _reference(scores, seq_lens, k)
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
+
+
+# --- extend entry point (transform_extend) ---------------------------------
+#
+# Extend differs from decode in three ways the kernel has to handle: each row's
+# score window starts at an arbitrary column (``row_starts``, so the window base
+# can sit off the 16-byte boundary the vectorized loads need), many query rows map
+# to one request's page table (``row_to_batch``), and the output transform may be
+# a ragged offset add instead of a page-table gather.
+#
+# Row starts are the cumulative KV lengths of the preceding requests in the batch,
+# so the deliberately non-multiple-of-4 lengths below are what a real batch looks
+# like -- they exercise the unaligned-head path on every template.
+
+
+def _extend_batch(kv_lens, extend_lens):
+    """Build one extend batch: per-row window length / start / request index.
+
+    Row i of request r covers ``scores[i, start_r : start_r + len]`` where the
+    lengths ramp up to the request's KV length, exactly as the indexer's
+    ``seqlens_expanded`` / ``indexer_k_start_end`` do.
+    """
+    starts = [sum(kv_lens[:r]) for r in range(len(kv_lens))]
+    lengths, row_starts, row_to_batch = [], [], []
+    for r, (kv, e) in enumerate(zip(kv_lens, extend_lens)):
+        lengths += list(range(kv - e + 1, kv + 1))
+        row_starts += [starts[r]] * e
+        row_to_batch += [r] * e
+    return lengths, row_starts, row_to_batch, sum(kv_lens)
+
+
+def _window_view(scores_cpu, lengths, row_starts, batch):
+    """Re-base every row on its window start so column j means window position j.
+
+    ``_assert_topk_close`` looks up scores by the indices under test, which are
+    window-relative; padding short rows with -inf keeps the stack rectangular
+    without making a padded slot selectable.
+    """
+    widest = max(lengths)
+    return torch.stack(
+        [
+            torch.nn.functional.pad(
+                scores_cpu[i, row_starts[i] : row_starts[i] + lengths[i]],
+                (0, widest - lengths[i]),
+                value=float("-inf"),
+            )
+            for i in range(batch)
+        ]
+    )
+
+
+def _extend_reference(scores_cpu, lengths, row_starts, k):
+    ref = []
+    for i, (L, st) in enumerate(zip(lengths, row_starts)):
+        window = scores_cpu[i, st : st + L]
+        if L <= k:
+            ref.append(list(range(L)))
+        else:
+            ref.append(torch.topk(window, k, sorted=False).indices.tolist())
+    return ref
+
+
+EXTEND_CONFIGS = [
+    # (kv_lens, extend_lens) -- id names the template the longest row reaches.
+    pytest.param([4096], [4096], id="reg2-single-aligned"),
+    pytest.param([3001, 2503], [512, 512], id="reg2-two-unaligned"),
+    pytest.param([1000, 5003, 9001], [256, 256, 256], id="reg4-three-unaligned"),
+    pytest.param([900, 1700], [256, 256], id="trivial-two-unaligned"),
+    pytest.param([1234, 40001], [64, 64], id="streaming-unaligned"),
+    pytest.param([999, 100003], [16, 16], id="cluster-unaligned"),
+    pytest.param([16384], [2048], id="reg4-chunked-single"),
+]
+
+
+@pytest.mark.parametrize("k", [1024, 2048])
+@pytest.mark.parametrize("kv_lens,extend_lens", EXTEND_CONFIGS)
+@torch.inference_mode()
+def test_topk_v2_extend_paged(kv_lens, extend_lens, k: int) -> None:
+    """Paged extend: emitted slots must equal the page-size-1 gather of the
+    selected window positions through row ``row_to_batch[i]`` of the page table."""
+    torch.manual_seed(sum(kv_lens) * 31 + k)
+    device = "cuda"
+    lengths, row_starts, row_to_batch, kv_total = _extend_batch(kv_lens, extend_lens)
+    batch = len(lengths)
+    width = (kv_total + 3) & ~3
+    scores = torch.randn(batch, width, dtype=torch.float32, device=device)[:, :kv_total]
+    lengths_t = torch.tensor(lengths, dtype=torch.int32, device=device)
+    row_starts_t = torch.tensor(row_starts, dtype=torch.int32, device=device)
+    row_to_batch_t = torch.tensor(row_to_batch, dtype=torch.int32, device=device)
+
+    num_pages = (max(kv_lens) + PAGE_SIZE - 1) // PAGE_SIZE
+    page_table, inv_cpu = _make_page_table(
+        len(kv_lens), num_pages, "perm", device, per_row=True
+    )
+    out = torch.full((batch, k), -1, dtype=torch.int32, device=device)
+    topk_transform_extend_v2(
+        scores,
+        lengths_t,
+        row_starts_t,
+        out,
+        plan_topk_v2(lengths_t),
+        page_size=PAGE_SIZE,
+        page_table=page_table,
+        row_to_batch=row_to_batch_t,
+    )
+    torch.cuda.synchronize()
+
+    out_cpu = out.cpu().tolist()
+    our_raw = [_invert(out_cpu[i], inv_cpu[row_to_batch[i]]) for i in range(batch)]
+    scores_cpu = scores.cpu()
+    ref_raw = _extend_reference(scores_cpu, lengths, row_starts, k)
+    # Compare in window coordinates: shift the score row so column 0 is the
+    # window start, matching the raw indices both sides produce.
+    shifted = _window_view(scores_cpu, lengths, row_starts, batch)
+    _assert_topk_close(shifted, ref_raw, our_raw, batch, lengths, k)
+
+
+@pytest.mark.parametrize("k", [1024, 2048])
+@pytest.mark.parametrize("kv_lens,extend_lens", EXTEND_CONFIGS)
+@torch.inference_mode()
+def test_topk_v2_extend_ragged(kv_lens, extend_lens, k: int) -> None:
+    """Ragged extend: emitted indices must be ``window position + out_offset``.
+
+    The indexer passes the row's own KV start as the offset, so the emitted value
+    is the absolute column of the selected score -- which is what makes this
+    checkable without a page table.
+    """
+    torch.manual_seed(sum(kv_lens) * 17 + k)
+    device = "cuda"
+    lengths, row_starts, _, kv_total = _extend_batch(kv_lens, extend_lens)
+    batch = len(lengths)
+    width = (kv_total + 3) & ~3
+    scores = torch.randn(batch, width, dtype=torch.float32, device=device)[:, :kv_total]
+    lengths_t = torch.tensor(lengths, dtype=torch.int32, device=device)
+    row_starts_t = torch.tensor(row_starts, dtype=torch.int32, device=device)
+
+    out = torch.full((batch, k), -1, dtype=torch.int32, device=device)
+    topk_transform_extend_v2(
+        scores,
+        lengths_t,
+        row_starts_t,
+        out,
+        plan_topk_v2(lengths_t),
+        out_offsets=row_starts_t,
+    )
+    torch.cuda.synchronize()
+
+    out_cpu = out.cpu().tolist()
+    our_raw = [[v - row_starts[i] for v in out_cpu[i] if v != -1] for i in range(batch)]
+    scores_cpu = scores.cpu()
+    ref_raw = _extend_reference(scores_cpu, lengths, row_starts, k)
+    shifted = _window_view(scores_cpu, lengths, row_starts, batch)
+    _assert_topk_close(shifted, ref_raw, our_raw, batch, lengths, k)
+
+
+@torch.inference_mode()
+def test_topk_v2_extend_requires_exactly_one_transform() -> None:
+    """Supplying both output transforms, or neither, must fail loudly rather than
+    silently pick one -- the two emit different index spaces."""
+    device = "cuda"
+    batch, kv, k = 4, 4096, 2048
+    scores = torch.randn(batch, kv, dtype=torch.float32, device=device)
+    lengths = torch.full((batch,), kv, dtype=torch.int32, device=device)
+    row_starts = torch.zeros(batch, dtype=torch.int32, device=device)
+    out = torch.empty(batch, k, dtype=torch.int32, device=device)
+    plan = plan_topk_v2(lengths)
+    page_table = torch.zeros(1, kv // PAGE_SIZE, dtype=torch.int32, device=device)
+    row_to_batch = torch.zeros(batch, dtype=torch.int32, device=device)
+
+    with pytest.raises(Exception):
+        topk_transform_extend_v2(scores, lengths, row_starts, out, plan)
+    with pytest.raises(Exception):
+        topk_transform_extend_v2(
+            scores,
+            lengths,
+            row_starts,
+            out,
+            plan,
+            page_size=PAGE_SIZE,
+            page_table=page_table,
+            row_to_batch=row_to_batch,
+            out_offsets=row_starts,
+        )
 
 
 if __name__ == "__main__":

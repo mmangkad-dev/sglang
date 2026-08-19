@@ -40,6 +40,7 @@ def _jit_topk_v2_module():
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=[
             ("topk_transform", "TopKKernel::transform"),
+            ("topk_transform_extend", "TopKKernel::transform_extend"),
             ("topk_plan", "TopKKernel::plan"),
         ],
     )
@@ -115,4 +116,51 @@ def topk_transform_512_v2(
         page_size,
         metadata,
         out_raw_indices,
+    )
+
+
+def topk_transform_extend_v2(
+    scores: torch.Tensor,
+    lengths: torch.Tensor,
+    row_starts: torch.Tensor,
+    out: torch.Tensor,
+    metadata: torch.Tensor,
+    page_size: int = 0,
+    page_table: Optional[torch.Tensor] = None,
+    row_to_batch: Optional[torch.Tensor] = None,
+    out_offsets: Optional[torch.Tensor] = None,
+) -> None:
+    """Fused top-k + output transform for the extend phase (DeepSeek-V4 top-k v2).
+
+    The extend counterpart of :func:`topk_transform_512_v2`: row ``b`` selects the
+    top-k of ``scores[b, row_starts[b] : row_starts[b] + lengths[b]]`` and writes
+    the transformed positions into ``out[b]``, ``-1`` padded. Exactly one output
+    transform must be given:
+
+    * paged -- ``page_table`` (the compact page-size-``page_size`` table) plus
+      ``row_to_batch`` (row -> page-table row): emits
+      ``page_table[row_to_batch[b], p // page_size] * page_size + p % page_size``,
+      the same physical page-size-1 KV slots as sgl_kernel's
+      ``fast_topk_transform_fused`` without materializing a page-size-1 table.
+    * ragged -- ``out_offsets``: emits ``p + out_offsets[b]``, matching
+      ``fast_topk_transform_ragged_fused``.
+
+    ``metadata`` must come from :func:`plan_topk_v2` over the same ``lengths``, and
+    every entry of ``lengths`` must be NON-NEGATIVE (the kernel reads them as
+    ``uint32_t``; see :func:`topk_transform_512_v2`). ``scores`` must be fp32 with
+    unit row stride and a row stride that is a multiple of 4 (16-byte vectorized
+    loads); ``row_starts`` may be arbitrary -- the kernel scalar-loads each row's
+    unaligned head.
+    """
+    module = _jit_topk_v2_module()
+    module.topk_transform_extend(
+        scores,
+        lengths,
+        row_starts,
+        out,
+        metadata,
+        page_size,
+        page_table,
+        row_to_batch,
+        out_offsets,
     )

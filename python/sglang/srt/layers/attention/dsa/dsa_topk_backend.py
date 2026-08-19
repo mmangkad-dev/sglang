@@ -87,7 +87,12 @@ class DSATopKBackend(Enum):
         row_starts: Optional[torch.Tensor] = None,
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """``out``: optional caller-owned ``(num_rows, topk)`` int32 destination.
+        Only the extend v2 path honors it (it saves copying the result into the
+        graph's static top-k buffer); every other path ignores it and returns a
+        freshly allocated tensor, which the caller must still handle."""
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
 
@@ -113,6 +118,36 @@ class DSATopKBackend(Enum):
             == attn_metadata.real_page_table.shape[0]
         ):
             return _topk_transform_v2_paged(logits, lengths, topk, attn_metadata)
+
+        # Extend-shaped top-k for the SGL backend routes to the same DeepSeek-V4
+        # v2 JIT kernel through its extend entry point, which adds the per-row
+        # score window (row_starts) the prefill logits matrix needs. Both output
+        # transforms are covered: PAGED reads the compact page-size-64 table via
+        # row_to_batch (so the wide page-size-1 gather disappears) and RAGGED adds
+        # topk_indices_offset. Measured 1.4-2.3x the legacy tilelang-derived
+        # kernels on prefill shapes -- the scores stay register-resident and are
+        # read once instead of twice.
+        #
+        # Unlike the decode PAGED dispatch above this is a best-effort fast path:
+        # the legacy kernels remain correct for every input, so preconditions the
+        # v2 kernel cannot serve (a chunked-logits call whose per-chunk row count
+        # no longer matches the per-forward plan, a non-16B-aligned score stride,
+        # the dummy-logits path that passes no row starts) fall through to them
+        # below rather than failing.
+        if self.should_use_topk_v2():
+            v2_extend = _topk_transform_v2_extend(
+                logits=logits,
+                lengths=lengths,
+                topk=topk,
+                topk_transform_method=topk_transform_method,
+                row_starts=row_starts,
+                topk_indices_offset=topk_indices_offset,
+                batch_idx_list=batch_idx_list,
+                attn_metadata=attn_metadata,
+                out=out,
+            )
+            if v2_extend is not None:
+                return v2_extend
 
         # The legacy transforms below read attn_metadata.page_table_1 (page_size=1),
         # which is always present here: the fold only drops it for the decode case
@@ -237,6 +272,112 @@ def _topk_unfused(
     topk_indices[:, :valid_topk] = topk_local_indices
 
     return topk_indices
+
+
+def _topk_transform_v2_extend(
+    *,
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    topk_transform_method: TopkTransformMethod,
+    row_starts: Optional[torch.Tensor],
+    topk_indices_offset: Optional[torch.Tensor],
+    batch_idx_list: Optional[List[int]],
+    attn_metadata,
+    out: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Extend-phase fused top-k + transform via the DeepSeek-V4 v2 JIT kernel.
+
+    Returns ``(num_rows, topk)`` int32 indices -- physical page-size-1 KV slots for
+    PAGED, ragged-buffer indices for RAGGED, ``-1`` padded -- identical in meaning
+    to ``fast_topk_transform_fused`` / ``fast_topk_transform_ragged_fused``.
+    Returns None when this call does not meet the kernel's preconditions, so the
+    caller falls through to those legacy kernels.
+
+    Every precondition is a property of shapes/strides/dtypes the caller already
+    holds on the host -- no device reads -- so the check is cheap and CUDA-graph
+    safe.
+    """
+    num_rows = logits.shape[0]
+    # row_starts is the per-row start column. Its absence marks either a decode
+    # shape (handled by the fold above) or the dummy-logits path, whose score
+    # buffer is only `topk` columns wide and so cannot be indexed by the
+    # (possibly much larger) row lengths.
+    if row_starts is None or batch_idx_list is not None:
+        return None
+    if not (0 < topk <= 2048):
+        return None
+    # The indexer (DeepGEMM) emits fp32 scores with unit row stride and a
+    # 16B-aligned row stride, which is exactly this kernel's ABI.
+    if (
+        logits.dtype != torch.float32
+        or logits.stride(1) != 1
+        or logits.stride(0) % 4 != 0
+    ):
+        return None
+    if lengths.dtype != torch.int32 or row_starts.dtype != torch.int32:
+        return None
+    if lengths.shape[0] != num_rows or row_starts.shape[0] != num_rows:
+        return None
+    if not (lengths.is_contiguous() and row_starts.is_contiguous()):
+        return None
+    # The plan is preprocessed once per forward from the full expanded seqlens; a
+    # chunked-logits call passes a slice of them, whose row count no longer
+    # matches, and recomputing a per-chunk plan here would undo the saving.
+    plan = attn_metadata.topk_v2_plan
+    if plan is None or plan.shape[0] != num_rows + 1:
+        return None
+
+    kwargs = {}
+    if topk_transform_method == TopkTransformMethod.PAGED:
+        page_table = attn_metadata.real_page_table
+        row_to_batch = attn_metadata.token_to_batch_idx
+        if page_table is None or row_to_batch is None:
+            return None
+        if page_table.dtype != torch.int32 or row_to_batch.dtype != torch.int32:
+            return None
+        if page_table.stride(1) != 1 or not row_to_batch.is_contiguous():
+            return None
+        if row_to_batch.shape[0] != num_rows:
+            return None
+        kwargs = dict(
+            page_size=attn_metadata.page_size,
+            page_table=page_table,
+            row_to_batch=row_to_batch,
+        )
+    elif topk_transform_method == TopkTransformMethod.RAGGED:
+        if topk_indices_offset is None:
+            return None
+        if (
+            topk_indices_offset.dtype != torch.int32
+            or topk_indices_offset.shape[0] < num_rows
+            or topk_indices_offset.stride(0) != 1
+        ):
+            return None
+        kwargs = dict(out_offsets=topk_indices_offset[:num_rows])
+    else:
+        return None
+
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_extend_v2
+
+    # Write straight into the caller's buffer when it gave us one: under CUDA
+    # graph the caller's buffer is the static top-k tensor a captured segment
+    # reads, so this replaces a full-size copy (128 MB per indexer layer at a 16K
+    # prefill) with nothing.
+    if (
+        out is not None
+        and out.dtype == torch.int32
+        and out.shape == (num_rows, topk)
+        and out.is_contiguous()
+    ):
+        topk_transform_extend_v2(logits, lengths, row_starts, out, plan, **kwargs)
+        return out
+    # The kernel writes every one of the `topk` slots of every row (padding slots
+    # included), so a fresh buffer needs no -1 prefill -- skipping it avoids a
+    # full-size memset per indexer layer.
+    fresh = logits.new_empty((num_rows, topk), dtype=torch.int32)
+    topk_transform_extend_v2(logits, lengths, row_starts, fresh, plan, **kwargs)
+    return fresh
 
 
 def _topk_transform_v2_paged(
