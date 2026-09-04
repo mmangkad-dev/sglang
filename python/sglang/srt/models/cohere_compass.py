@@ -275,9 +275,11 @@ class CohereCompassTextModel(nn.Module):
 
         # DeepStack: the visual features tapped at ``deepstack_visual_indexes``
         # of the vision tower are added to decoder layers 0..N-1, in order.
-        self.num_deepstack_embeddings = len(
-            getattr(config, "deepstack_visual_indexes", None) or []
-        )
+        # Read directly: the field is injected by
+        # ``CohereCompassForConditionalGeneration``, so a missing one means the
+        # text/vision configs were never joined and every visual residual would
+        # otherwise be silently dropped.
+        self.num_deepstack_embeddings = len(config.deepstack_visual_indexes)
         self.deepstack_embed_to_decoder_layer = range(self.num_deepstack_embeddings)
         if not self.pp_group.is_first_rank:
             assert self.start_layer >= self.num_deepstack_embeddings, (
@@ -364,11 +366,15 @@ class CohereCompassForConditionalGeneration(Qwen3VLForConditionalGeneration):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        # The text config needs the vision tower's DeepStack tap count before the
-        # language model is built, since it decides which decoder layers get a
-        # visual residual added.
+        # DeepStack ties the vision tower's tap count to the decoder layers that
+        # receive a visual residual, so the text config has to carry it before
+        # the language model is built. A language-model-only load has no tower
+        # and therefore no taps.
+        self.language_model_only = getattr(config, "language_model_only", False)
         config.text_config.deepstack_visual_indexes = (
-            config.vision_config.deepstack_visual_indexes
+            []
+            if self.language_model_only
+            else list(config.vision_config.deepstack_visual_indexes)
         )
         super().__init__(
             config,
@@ -376,11 +382,41 @@ class CohereCompassForConditionalGeneration(Qwen3VLForConditionalGeneration):
             prefix=prefix,
             language_model_cls=CohereCompassTextModel,
         )
+        self._pin_vision_interpolation(self.visual)
+
+        # The tap count the decoder was built for must match the number of
+        # DeepStack embeddings the vision tower actually produces; a mismatch
+        # means visual residuals would land on the wrong layers or be dropped.
+        if hasattr(self, "model"):
+            assert (
+                self.model.num_deepstack_embeddings == self.num_deepstack_embeddings
+            ), (
+                "DeepStack tap count mismatch between the vision tower "
+                f"({self.num_deepstack_embeddings}) and the decoder "
+                f"({self.model.num_deepstack_embeddings})"
+            )
+
         # Cohere scales logits before sampling.
         self.logit_scale = config.text_config.logit_scale
         self.logits_processor = LogitsProcessor(
             self.config, logit_scale=self.logit_scale
         )
+
+    @staticmethod
+    def _pin_vision_interpolation(visual: Optional[nn.Module]) -> None:
+        """Force corner-aligned position-embedding interpolation on the tower.
+
+        CohereCompass's reference vision tower fixes corner alignment
+        (transformers sets ``interpolation_align_corners = True``), and SGLang's
+        eager Qwen3-VL path is corner-aligned unconditionally. The ViT
+        CUDA-graph path instead follows the global
+        ``enable_precise_embedding_interpolation`` flag, which defaults off, so
+        leaving the inherited value in place would make
+        ``SGLANG_VIT_ENABLE_CUDA_GRAPH`` change the vision embeddings rather
+        than only how they are computed. Pin it as a model invariant.
+        """
+        if visual is not None:
+            visual.align_corners = True
 
 
 EntryClass = CohereCompassForConditionalGeneration
