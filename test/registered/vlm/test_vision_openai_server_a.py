@@ -21,6 +21,7 @@ from sglang.test.test_utils import (
 )
 from sglang.test.vlm_utils import (
     IMAGE_MAN_IRONING_URL,
+    VIDEO_JOBS_URL,
     AudioOpenAITestMixin,
     CustomTestCase,
     ImageOpenAITestMixin,
@@ -29,7 +30,7 @@ from sglang.test.vlm_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=560, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=650, stage="base-b", runner_config="1-gpu-large")
 
 
 # --- Qwen3-VL grounding regression (deepstack fusion) --------------------------
@@ -242,6 +243,66 @@ class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     extra_args = [
         "--reasoning-parser=glm45",
     ]
+
+
+class TestNorthMicroVisionServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
+    # CohereCompass: Qwen3-VL native-resolution vision tower + Cohere
+    # Command-A text decoder (interleaved sliding-window M-RoPE / global NoPE
+    # layers, so this also covers the hybrid-SWA KV pool on a VLM).
+    model = "CohereLabs/North-Micro-Vision-Instruct"
+    extra_args = [
+        # The model card validates multimodal prompts to 8K, but the shared
+        # video fixture expands past that; the LM backbone carries 128K.
+        "--context-length=16384",
+        "--cuda-graph-max-bs-decode=4",
+    ]
+
+    def _assert_describes_video(self, response):
+        """Subject-agnostic video assertion.
+
+        The shared mixin asserts the clip's subject ("iPod"/"device"), which a
+        2.4B model that was not trained for video does not reliably name -- it
+        transcribes the on-screen captions instead. Keep the video decode +
+        per-frame M-RoPE path covered, and only assert what the model does get
+        right: a non-trivial description of a person against a dark backdrop.
+        """
+        text = response.choices[0].message.content
+        self.assertIsInstance(text, str)
+        self.assertGreater(len(text), 0)
+        lowered = text.lower()
+        self.assertTrue(
+            any(word in lowered for word in ("man", "person", "speaker", "presenter")),
+            f"video response should describe a person: {text}",
+        )
+        self.assertTrue(
+            "dark" in lowered or "black" in lowered,
+            f"video response should describe the dark backdrop: {text}",
+        )
+
+    def test_video_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        response = client.chat.completions.create(
+            model="default",
+            messages=self.prepare_video_messages(
+                self.get_or_download_file(VIDEO_JOBS_URL)
+            ),
+            temperature=0,
+            max_tokens=256,
+            **(self.get_vision_request_kwargs()),
+        )
+        self._assert_describes_video(response)
+
+    def test_video_images_chat_completion(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        response = client.chat.completions.create(
+            model="default",
+            messages=self.prepare_video_images_messages(
+                self.get_or_download_file(VIDEO_JOBS_URL)
+            ),
+            temperature=0,
+            max_tokens=256,
+        )
+        self._assert_describes_video(response)
 
 
 class TestQwen2AudioServer(AudioOpenAITestMixin):

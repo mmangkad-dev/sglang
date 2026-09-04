@@ -1,0 +1,39 @@
+# Copyright 2026 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+"""Multimodal processor for CohereCompass (North Micro Vision)."""
+
+import re
+
+from sglang.srt.models.cohere_compass import CohereCompassForConditionalGeneration
+from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+
+
+class CohereCompassMultimodalProcessor(QwenVLImageProcessor):
+    """Qwen3-VL style preprocessing with Cohere's upper-case placeholder tokens."""
+
+    models = [CohereCompassForConditionalGeneration]
+
+    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        super().__init__(hf_config, server_args, _processor, *args, **kwargs)
+
+        self.mm_tokens = MultimodalSpecialTokens(
+            image_token="<|VISION_START|><|IMAGE_PAD|><|VISION_END|>",
+            image_token_id=hf_config.image_token_id,
+            # The regex that matches already-expanded image tokens.
+            image_token_regex=re.compile(
+                r"<\|VISION_START\|>(?:<\|IMAGE_PAD\|>)+<\|VISION_END\|>"
+            ),
+            video_token_id=self.VIDEO_TOKEN_ID,
+        ).build(_processor)

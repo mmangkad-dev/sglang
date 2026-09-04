@@ -73,6 +73,7 @@ def get_rope_index(
     if (
         model_type.startswith("qwen3_vl")
         or model_type.startswith("qwen3_vl_moe")
+        or model_type.startswith("cohere_compass")
         or model_type.startswith("qwen3_5")
         or model_type.startswith("interns2_mobius")
     ) and video_grid_thw is not None:
@@ -158,6 +159,7 @@ def get_rope_index(
                     "qwen2_vl",
                     "qwen3_vl",
                     "qwen3_vl_moe",
+                    "cohere_compass",
                     "qwen3_5",
                     "qwen3_5_moe",
                     "intern_s2_preview",

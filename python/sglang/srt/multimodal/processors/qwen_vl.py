@@ -311,6 +311,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5_moe",
             "intern_s2_preview",
             "interns2_mobius",
+            "cohere_compass",
         ):
             # Two workers overlap CPU preprocessing without over-fragmenting
             # burst arrivals into smaller GPU prefill batches. Higher counts can
@@ -521,6 +522,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5_moe",
             "intern_s2_preview",
             "interns2_mobius",
+            "cohere_compass",
         ):
             return None
 
@@ -656,6 +658,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 "qwen3_5",
                 "qwen3_5_moe",
                 "intern_s2_preview",
+                "cohere_compass",
             ]
             and video_timestamps is not None
         ):
@@ -765,6 +768,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5_moe",
             "intern_s2_preview",
             "interns2_mobius",
+            "cohere_compass",
         ):
             processor_kwargs.update(
                 video_metadata=video_metadata,
@@ -894,7 +898,13 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             self.keep_mm_features_on_device
             and self.server_args.mm_enable_dp_encoder
             and self.model_type
-            in ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
+            in (
+                "qwen3_vl",
+                "qwen3_vl_moe",
+                "qwen3_5",
+                "qwen3_5_moe",
+                "cohere_compass",
+            )
         ):
             return
         for item in mm_items:
