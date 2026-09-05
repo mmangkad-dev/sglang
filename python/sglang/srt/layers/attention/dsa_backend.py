@@ -2930,6 +2930,9 @@ class DeepseekSparseAttnBackend(
                 is_causal=causal,
                 return_lse=False,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                # No row here is inactive: MHA_ONE_SHOT rows always carry at
+                # least one extend token and one cached token.
+                skip_all_rows_active_check=True,
             )
 
         # Use FA3 for SM90 (Hopper/H200)

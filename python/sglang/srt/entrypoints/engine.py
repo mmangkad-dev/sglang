@@ -1698,14 +1698,20 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Check flashinfer version
     if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
+        from sglang.srt.layers.attention.attention_registry import (
+            TRTLLM_RAGGED_PREFILL_BACKENDS,
+        )
+
+        attn_backends = attention_backends_of(resolved_view(cfg))
         if (
-            "flashinfer" in attention_backends_of(resolved_view(cfg))
+            "flashinfer" in attn_backends
+            or not TRTLLM_RAGGED_PREFILL_BACKENDS.isdisjoint(attn_backends)
             or cfg.dsa_topk_backend == "flashinfer"
             or cfg.speculative_dsa_topk_backend == "flashinfer"
         ):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.18",
+                "0.6.18.post1",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",

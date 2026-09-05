@@ -1131,6 +1131,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             o_sf_scale=o_sf_scale,
             out=out_buffer,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+            # No row here is inactive: the causal path gives every row an equal
+            # q_len and kv_len, and the chunked-prefix path repairs zero-KV rows
+            # through fixup_zero_kv_rows.
+            skip_all_rows_active_check=True,
         )
 
     def _set_kv_and_concat_q_fused(
