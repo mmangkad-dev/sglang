@@ -38,13 +38,6 @@ if TYPE_CHECKING:
 
 ATTENTION_BACKENDS = {}
 
-# Backends passing skip_all_rows_active_check to
-# trtllm_ragged_attention_deepseek, which FlashInfer added in 0.6.18.post1;
-# the launch-time version assert reads this. Add a backend when it adopts it.
-TRTLLM_RAGGED_PREFILL_BACKENDS = frozenset(
-    {"trtllm_mla", "tokenspeed_mla", "cutedsl_mla", "dsa", "nsa"}
-)
-
 
 def register_attention_backend(name):
     def decorator(fn):

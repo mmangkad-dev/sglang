@@ -163,8 +163,7 @@ class TRTLLMMLAPrefillMetadata:
     cum_seq_lens: torch.Tensor
     seq_lens: torch.Tensor
     fallback_to_flashinfer_impl: bool = False
-    # Host mirror of the per-row extend lengths, and whether all of them are
-    # positive. Both feed the ragged kernel's empty-row contract.
+    # Extend lengths, not whole-sequence lengths, mirrored on the host.
     seq_lens_cpu: Optional[torch.Tensor] = None
     all_rows_active: bool = False
 
@@ -1121,10 +1120,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
-        # The kernel must compact empty rows, and derives them from the device
-        # indptrs (a host sync) unless it is told otherwise. Hand it the host
-        # mirrors when a row may be empty; skip the scan only when every row is
-        # known positive, which is what the flag's contract requires.
+        # Without lengths the kernel reads the device indptrs to find empty
+        # rows, which blocks the host; absent mirrors mean every row is positive.
         if q_seq_lens_cpu is None:
             row_kwargs = {"skip_all_rows_active_check": True}
         else:
@@ -1160,9 +1157,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         kv_lens_cpu: Optional[torch.Tensor] = None,
         kv_has_zero: bool = False,
     ) -> dict:
-        """Host row lengths for the ragged kernel, or {} when every row is
-        known positive and the kernel may skip its own scan. Pure CPU: both
-        sources are computed once per forward on the host."""
+        # Empty means every row is positive, which lets the kernel skip its own
+        # scan; both length sources are host-side already, so this never syncs.
         metadata = self.forward_prefill_metadata
         if metadata.all_rows_active and not kv_has_zero:
             return {}

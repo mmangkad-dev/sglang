@@ -2911,23 +2911,16 @@ class DeepseekSparseAttnBackend(
             import flashinfer
 
             seq_lens = metadata.cache_seqlens_int32
-            # MHA_ONE_SHOT is only chosen for extend batches, whose rows each
-            # carry at least one extend token and one cached token; assert that
-            # before letting the kernel skip its own empty-row scan.
+            # kv here is the whole sequence, never shorter than the extend
+            # length, so a positive extend length makes the row active on both
+            # sides; otherwise the kernel needs the lengths to compact.
             extend_lens_cpu = forward_batch.extend_seq_lens_cpu
-            seq_lens_cpu = forward_batch.seq_lens_cpu
-            all_rows_active = (
-                extend_lens_cpu is not None
-                and seq_lens_cpu is not None
-                and min(extend_lens_cpu) > 0
-                and int(seq_lens_cpu.min()) > 0
-            )
-            if all_rows_active:
+            if min(extend_lens_cpu) > 0:
                 row_kwargs = {"skip_all_rows_active_check": True}
             else:
                 row_kwargs = {
                     "q_seq_lens_cpu": torch.tensor(extend_lens_cpu, dtype=torch.int32),
-                    "kv_seq_lens_cpu": seq_lens_cpu.to(torch.int32),
+                    "kv_seq_lens_cpu": forward_batch.seq_lens_cpu.to(torch.int32),
                 }
             return flashinfer.prefill.trtllm_ragged_attention_deepseek(
                 query=q,
