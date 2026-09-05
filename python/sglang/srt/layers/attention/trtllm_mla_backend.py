@@ -163,6 +163,10 @@ class TRTLLMMLAPrefillMetadata:
     cum_seq_lens: torch.Tensor
     seq_lens: torch.Tensor
     fallback_to_flashinfer_impl: bool = False
+    # Host mirror of the per-row extend lengths, and whether all of them are
+    # positive. Both feed the ragged kernel's empty-row contract.
+    seq_lens_cpu: Optional[torch.Tensor] = None
+    all_rows_active: bool = False
 
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -846,6 +850,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 cum_seq_lens_q,
                 seq_lens,
                 fallback_to_flashinfer_impl,
+                seq_lens_cpu=torch.tensor(
+                    forward_batch.extend_seq_lens_cpu, dtype=torch.int32
+                ),
+                all_rows_active=min(forward_batch.extend_seq_lens_cpu) > 0,
             )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
@@ -1104,6 +1112,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         return_lse: bool,
         out_buffer: torch.Tensor,
         o_sf_scale: float = 1.0,
+        q_seq_lens_cpu: Optional[torch.Tensor] = None,
+        kv_seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
         """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
         in model-native dtype; subclasses do any kernel-specific quantization.
@@ -1111,6 +1121,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
+        # The kernel must compact empty rows, and derives them from the device
+        # indptrs (a host sync) unless it is told otherwise. Hand it the host
+        # mirrors when a row may be empty; skip the scan only when every row is
+        # known positive, which is what the flag's contract requires.
+        if q_seq_lens_cpu is None:
+            row_kwargs = {"skip_all_rows_active_check": True}
+        else:
+            row_kwargs = {
+                "q_seq_lens_cpu": q_seq_lens_cpu,
+                "kv_seq_lens_cpu": kv_seq_lens_cpu,
+            }
         return flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=q,
             key=k,
@@ -1131,11 +1152,27 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             o_sf_scale=o_sf_scale,
             out=out_buffer,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
-            # No row here is inactive: the causal path gives every row an equal
-            # q_len and kv_len, and the chunked-prefix path repairs zero-KV rows
-            # through fixup_zero_kv_rows.
-            skip_all_rows_active_check=True,
+            **row_kwargs,
         )
+
+    def _row_len_mirrors(
+        self,
+        kv_lens_cpu: Optional[torch.Tensor] = None,
+        kv_has_zero: bool = False,
+    ) -> dict:
+        """Host row lengths for the ragged kernel, or {} when every row is
+        known positive and the kernel may skip its own scan. Pure CPU: both
+        sources are computed once per forward on the host."""
+        metadata = self.forward_prefill_metadata
+        if metadata.all_rows_active and not kv_has_zero:
+            return {}
+        q_lens_cpu = metadata.seq_lens_cpu
+        if kv_lens_cpu is None:
+            kv_lens_cpu = q_lens_cpu
+        return {
+            "q_seq_lens_cpu": q_lens_cpu,
+            "kv_seq_lens_cpu": kv_lens_cpu.to(torch.int32),
+        }
 
     def _set_kv_and_concat_q_fused(
         self,
@@ -1751,6 +1788,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 return_lse=True,
                 out_buffer=out,
                 o_sf_scale=-1.0,
+                **self._row_len_mirrors(
+                    kv_lens_cpu=forward_batch.prefix_chunk_seq_lens_cpu[chunk_idx],
+                    kv_has_zero=forward_batch.prefix_chunk_has_zero_kv[chunk_idx],
+                ),
             )
 
             # The TRT-LLM ragged attention cubin kernel does not correctly
@@ -1794,6 +1835,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 return_lse=forward_batch.mha_return_lse,
                 out_buffer=out,
                 o_sf_scale=1.0,
+                **self._row_len_mirrors(),
             )
 
 

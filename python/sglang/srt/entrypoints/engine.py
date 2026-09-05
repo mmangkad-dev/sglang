@@ -1703,9 +1703,15 @@ def _set_envs_and_config(server_args: ServerArgs):
         )
 
         attn_backends = attention_backends_of(resolved_view(cfg))
+        # The ragged-prefill backends reach FlashInfer only on the CUDA kernel
+        # path; ROCm serves them through TileLang/aiter and installs no
+        # FlashInfer wheel.
+        needs_ragged_prefill = (
+            _is_cuda and not TRTLLM_RAGGED_PREFILL_BACKENDS.isdisjoint(attn_backends)
+        )
         if (
             "flashinfer" in attn_backends
-            or not TRTLLM_RAGGED_PREFILL_BACKENDS.isdisjoint(attn_backends)
+            or needs_ragged_prefill
             or cfg.dsa_topk_backend == "flashinfer"
             or cfg.speculative_dsa_topk_backend == "flashinfer"
         ):
