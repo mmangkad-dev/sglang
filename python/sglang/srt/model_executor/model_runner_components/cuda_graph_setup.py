@@ -36,6 +36,9 @@ from sglang.srt.model_executor.runner import (
     PrefillCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    resolve_prefill_capture_num_tokens,
+)
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -393,13 +396,13 @@ def capture_prefill_graph(
     # each row can contain at most context_length tokens. Their product is
     # therefore the largest aggregate-token bucket capture can represent.
     max_capture_tokens = max_capture_requests * context_length
-    capture_num_tokens = sorted(
-        num_tokens
-        for num_tokens in prefill_config.bs
-        if num_tokens <= max_capture_tokens
+    # Align to attn_tp before bounding: rounding a bucket up can push it past
+    # max_capture_tokens, so the capacity filter has to see the rounded values.
+    capture_num_tokens = resolve_prefill_capture_num_tokens(
+        prefill_config.bs, parallel.attn_tp_size, max_capture_tokens
     )
-    # Resolve the context- and request-capacity-bounded buckets once before
-    # constructing the runner so every backend consumes the same config.
+    # Resolve the aligned, context- and request-capacity-bounded buckets once
+    # before constructing the runner so every backend consumes the same config.
     prefill_config.bs = capture_num_tokens
     if not capture_num_tokens:
         logger.warning(

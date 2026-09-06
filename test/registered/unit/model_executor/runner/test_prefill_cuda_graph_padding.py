@@ -74,7 +74,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         )
 
 
-class TestPrefillCaptureBucketAttnTpAlignment(CustomTestCase):
+class TestResolvePrefillCaptureNumTokens(CustomTestCase):
     """Capture buckets must divide evenly across the attention TP group.
 
     When attn_tp scatters hidden states, every rank needs an equal shard.
@@ -84,33 +84,52 @@ class TestPrefillCaptureBucketAttnTpAlignment(CustomTestCase):
     """
 
     DEFAULT_BUCKETS = [4, 8, 12, 16, 20, 24, 28, 32, 48, 64]
+    NO_LIMIT = 1 << 30
 
-    def _align(self, buckets, attn_tp_size, gathered_buffer):
+    def _resolve(self, buckets, attn_tp_size, gathered_buffer, max_capture_tokens=None):
         with mock.patch.object(
             prefill_mod, "require_gathered_buffer", return_value=gathered_buffer
         ):
-            return prefill_mod._align_capture_num_tokens_to_attn_tp(
-                list(buckets), attn_tp_size
+            return prefill_mod.resolve_prefill_capture_num_tokens(
+                list(buckets),
+                attn_tp_size,
+                self.NO_LIMIT if max_capture_tokens is None else max_capture_tokens,
             )
 
     def test_gathered_buffer_rounds_buckets_up_to_attn_tp(self):
-        aligned = self._align(self.DEFAULT_BUCKETS, 8, True)
-        self.assertEqual(aligned, [8, 16, 24, 32, 48, 64])
-        self.assertTrue(all(n % 8 == 0 for n in aligned))
+        resolved = self._resolve(self.DEFAULT_BUCKETS, 8, True)
+        self.assertEqual(resolved, [8, 16, 24, 32, 48, 64])
+        self.assertTrue(all(n % 8 == 0 for n in resolved))
 
     def test_buckets_untouched_without_gathered_buffer(self):
         self.assertEqual(
-            self._align(self.DEFAULT_BUCKETS, 8, False), self.DEFAULT_BUCKETS
+            self._resolve(self.DEFAULT_BUCKETS, 8, False), self.DEFAULT_BUCKETS
         )
 
     def test_attn_tp_size_one_is_a_no_op(self):
         self.assertEqual(
-            self._align(self.DEFAULT_BUCKETS, 1, True), self.DEFAULT_BUCKETS
+            self._resolve(self.DEFAULT_BUCKETS, 1, True), self.DEFAULT_BUCKETS
         )
 
     def test_explicit_unaligned_bucket_is_rounded_not_dropped(self):
         # --cuda-graph-bs-prefill 28 must still capture a usable bucket.
-        self.assertEqual(self._align([28], 8, True), [32])
+        self.assertEqual(self._resolve([28], 8, True), [32])
+
+    def test_capacity_bound_applies_to_the_rounded_bucket(self):
+        # context_len=28 with a single request slot caps capture at 28 tokens.
+        # 28 fits unrounded, but rounding to 32 does not: it must be dropped
+        # rather than reach capture_prepare()'s request-slot assertion.
+        self.assertEqual(self._resolve([28], 8, True, max_capture_tokens=28), [])
+        self.assertEqual(self._resolve([28], 8, False, max_capture_tokens=28), [28])
+
+    def test_capacity_bound_keeps_surviving_buckets(self):
+        self.assertEqual(
+            self._resolve([8, 24, 28, 64], 8, True, max_capture_tokens=32),
+            [8, 24, 32],
+        )
+
+    def test_rounding_collisions_are_deduped(self):
+        self.assertEqual(self._resolve([25, 26, 27, 28], 8, True), [32])
 
 
 if __name__ == "__main__":

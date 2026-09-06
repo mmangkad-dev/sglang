@@ -44,7 +44,7 @@ import logging
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Union
 
 import torch
 import tqdm
@@ -271,28 +271,45 @@ _PREFILL_STATIC_FIELDS = (
 )
 
 
-def _align_capture_num_tokens_to_attn_tp(
-    capture_num_tokens: list[int], attn_tp_size: int
+def resolve_prefill_capture_num_tokens(
+    capture_num_tokens: Iterable[int],
+    attn_tp_size: int,
+    max_capture_tokens: int,
 ) -> list[int]:
-    """Round prefill capture buckets up to a multiple of ``attn_tp_size``.
+    """Resolve the prefill capture buckets: align to attn_tp, then bound them.
 
-    When the attention TP group scatters/gathers hidden states, every rank must
-    take an equally sized shard: ``_scatter_hidden_states_and_residual`` does
-    ``tensor_split(attn_tp_size)`` and then reduce-scatters. The live path keeps
-    that true by ceil_align'ing global_num_tokens to attn_tp_size (see
+    Alignment: when the attention TP group scatters/gathers hidden states every
+    rank must take an equally sized shard -- ``_scatter_hidden_states_and_residual``
+    does ``tensor_split(attn_tp_size)`` and then reduce-scatters. The live path
+    keeps that true by ceil_align'ing global_num_tokens to attn_tp_size (see
     ``ForwardBatch.prepare_mlp_sync_batch``), but capture builds its batches
     straight from the bucket list, so an unaligned bucket reaches a shape the
     runtime never produces: 28 tokens over attn_tp_size=8 splits
-    [4, 4, 4, 4, 3, 3, 3, 3] and the mismatched collective hangs capture.
+    [4, 4, 4, 4, 3, 3, 3, 3] and the mismatched collective hangs capture. Decode
+    enforces the same invariant when picking its buckets (see
+    ``get_cuda_graph_batch_size_alignment``); this is the prefill counterpart.
 
-    Decode enforces the same invariant when picking its buckets (see
-    ``get_cuda_graph_batch_size_alignment`` / ``_get_capture_bs``); this is the
-    prefill counterpart. Rounding up rather than dropping keeps an explicit
-    --cuda-graph-bs-prefill list non-empty; replay pads to a bucket either way.
+    Bound: rounding up can push a bucket past what the capture dummy batch can
+    represent, so the capacity filter has to run on the *rounded* values --
+    otherwise capture_prepare() trips its request-slot assertion at startup.
+    Dropping such buckets (rather than rounding down to a shape the runtime
+    never produces) leaves capture with the buckets it can actually build; the
+    caller disables prefill capture when nothing survives.
+
+    The result is published to cuda_graph_config[prefill].bs, so DP padding-mode
+    coordination and the other bs consumers see the buckets really captured.
     """
-    if attn_tp_size <= 1 or not require_gathered_buffer():
-        return capture_num_tokens
-    return sorted({ceil_align(n, attn_tp_size) for n in capture_num_tokens})
+    if attn_tp_size > 1 and require_gathered_buffer():
+        capture_num_tokens = (
+            ceil_align(num_tokens, attn_tp_size) for num_tokens in capture_num_tokens
+        )
+    return sorted(
+        {
+            num_tokens
+            for num_tokens in capture_num_tokens
+            if num_tokens <= max_capture_tokens
+        }
+    )
 
 
 class PrefillCudaGraphRunner(BaseCudaGraphRunner):
@@ -329,9 +346,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         assert capture_tokens is not None, "cuda_graph_config[prefill].bs is not set"
         self.capture_num_tokens = sorted(capture_tokens)
         assert self.capture_num_tokens, "cuda_graph_config[prefill].bs is empty"
-        self.capture_num_tokens = _align_capture_num_tokens_to_attn_tp(
-            self.capture_num_tokens, self.attn_tp_size
-        )
 
         # --- runner bounds --------------------------------------------
         self.max_num_tokens = max(self.capture_num_tokens)
