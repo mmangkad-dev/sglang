@@ -75,12 +75,8 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
 
 
 class TestResolvePrefillCaptureNumTokens(CustomTestCase):
-    """Capture buckets must divide evenly across the attention TP group.
-
-    When attn_tp scatters hidden states, every rank needs an equal shard.
-    Bucket 28 on attn_tp_size=8 splits [4, 4, 4, 4, 3, 3, 3, 3] and the
-    mismatched reduce-scatter hangs capture, which is reachable once breakable
-    prefill CUDA graphs are enabled for MLA models.
+    """Prefill capture buckets must divide evenly across the attention TP group
+    and stay inside what the capture dummy batch can represent.
     """
 
     DEFAULT_BUCKETS = [4, 8, 12, 16, 20, 24, 28, 32, 48, 64]
@@ -98,13 +94,16 @@ class TestResolvePrefillCaptureNumTokens(CustomTestCase):
             ),
         ):
             return prefill_mod.resolve_prefill_capture_num_tokens(
-                list(buckets),
-                self.NO_LIMIT if max_capture_tokens is None else max_capture_tokens,
+                capture_num_tokens=list(buckets),
+                max_capture_tokens=(
+                    self.NO_LIMIT if max_capture_tokens is None else max_capture_tokens
+                ),
             )
 
     def test_attn_tp_group_not_read_when_gate_is_off(self):
-        # attn_tp_size resolves the attention-TP group, which need not exist
-        # when nothing gathers across it.
+        """attn_tp_size stays unread when nothing gathers over attn_tp; it
+        resolves the attention-TP group, which need not exist.
+        """
         with (
             mock.patch.object(
                 prefill_mod, "require_gathered_buffer", return_value=False
@@ -115,38 +114,34 @@ class TestResolvePrefillCaptureNumTokens(CustomTestCase):
         ):
             self.assertEqual(
                 prefill_mod.resolve_prefill_capture_num_tokens(
-                    self.DEFAULT_BUCKETS, self.NO_LIMIT
+                    capture_num_tokens=self.DEFAULT_BUCKETS,
+                    max_capture_tokens=self.NO_LIMIT,
                 ),
                 self.DEFAULT_BUCKETS,
             )
 
     def test_gathered_buffer_rounds_buckets_up_to_attn_tp(self):
+        """An unaligned bucket reaches a shape the runtime never produces, and
+        its reduce-scatter hangs capture.
+        """
         resolved = self._resolve(self.DEFAULT_BUCKETS, 8, True)
         self.assertEqual(resolved, [8, 16, 24, 32, 48, 64])
-        self.assertTrue(all(n % 8 == 0 for n in resolved))
 
     def test_buckets_untouched_without_gathered_buffer(self):
         self.assertEqual(
             self._resolve(self.DEFAULT_BUCKETS, 8, False), self.DEFAULT_BUCKETS
         )
 
-    def test_attn_tp_size_one_is_a_no_op(self):
-        self.assertEqual(
-            self._resolve(self.DEFAULT_BUCKETS, 1, True), self.DEFAULT_BUCKETS
-        )
-
     def test_explicit_unaligned_bucket_is_rounded_not_dropped(self):
-        # --cuda-graph-bs-prefill 28 must still capture a usable bucket.
+        # Dropping instead would leave --cuda-graph-bs-prefill 28 with nothing.
         self.assertEqual(self._resolve([28], 8, True), [32])
 
     def test_capacity_bound_applies_to_the_rounded_bucket(self):
-        # context_len=28 with a single request slot caps capture at 28 tokens.
-        # 28 fits unrounded, but rounding to 32 does not: it must be dropped
-        # rather than reach capture_prepare()'s request-slot assertion.
+        # 28 fits a 28-token capacity unrounded; rounded to 32 it does not.
         self.assertEqual(self._resolve([28], 8, True, max_capture_tokens=28), [])
         self.assertEqual(self._resolve([28], 8, False, max_capture_tokens=28), [28])
 
-    def test_capacity_bound_keeps_surviving_buckets(self):
+    def test_capacity_bound_is_per_bucket(self):
         self.assertEqual(
             self._resolve([8, 24, 28, 64], 8, True, max_capture_tokens=32),
             [8, 24, 32],

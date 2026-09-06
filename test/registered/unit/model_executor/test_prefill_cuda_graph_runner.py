@@ -169,13 +169,8 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertIs(capture.runner, prefill_runner)
 
     def test_no_fitting_bucket_falls_back_to_a_graph_capture(self):
-        """The empty-bucket path must still hand back a GraphCapture.
-
-        Bucket resolution can legitimately come up empty -- every configured
-        size exceeds max_capture_requests * context_length, which also happens
-        when attn_tp alignment rounds the last surviving bucket past that
-        bound. Returning the bare eager runner there breaks the caller, which
-        reads ``.runner`` / ``.memory_usage`` / ``.time_usage`` off the result.
+        """An empty bucket list still yields a GraphCapture, not a bare runner;
+        callers read .runner / .memory_usage / .time_usage off the result.
         """
         eager_runner = object()
         override = get_context().override_server_args(

@@ -396,10 +396,9 @@ def capture_prefill_graph(
     # each row can contain at most context_length tokens. Their product is
     # therefore the largest aggregate-token bucket capture can represent.
     max_capture_tokens = max_capture_requests * context_length
-    # Align to attn_tp before bounding: rounding a bucket up can push it past
-    # max_capture_tokens, so the capacity filter has to see the rounded values.
     capture_num_tokens = resolve_prefill_capture_num_tokens(
-        prefill_config.bs, max_capture_tokens
+        capture_num_tokens=prefill_config.bs,
+        max_capture_tokens=max_capture_tokens,
     )
     # Resolve the aligned, context- and request-capacity-bounded buckets once
     # before constructing the runner so every backend consumes the same config.

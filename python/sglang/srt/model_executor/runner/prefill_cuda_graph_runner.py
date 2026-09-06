@@ -272,41 +272,23 @@ _PREFILL_STATIC_FIELDS = (
 
 
 def resolve_prefill_capture_num_tokens(
+    *,
     capture_num_tokens: Iterable[int],
     max_capture_tokens: int,
 ) -> list[int]:
-    """Resolve the prefill capture buckets: align to attn_tp, then bound them.
-
-    Alignment: when the attention TP group scatters/gathers hidden states every
-    rank must take an equally sized shard -- ``_scatter_hidden_states_and_residual``
-    does ``tensor_split(attn_tp_size)`` and then reduce-scatters. The live path
-    keeps that true by ceil_align'ing global_num_tokens to attn_tp_size (see
-    ``ForwardBatch.prepare_mlp_sync_batch``), but capture builds its batches
-    straight from the bucket list, so an unaligned bucket reaches a shape the
-    runtime never produces: 28 tokens over attn_tp_size=8 splits
-    [4, 4, 4, 4, 3, 3, 3, 3] and the mismatched collective hangs capture. Decode
-    enforces the same invariant when picking its buckets (see
-    ``get_cuda_graph_batch_size_alignment``); this is the prefill counterpart.
-
-    Bound: rounding up can push a bucket past what the capture dummy batch can
-    represent, so the capacity filter has to run on the *rounded* values --
-    otherwise capture_prepare() trips its request-slot assertion at startup.
-    Dropping such buckets (rather than rounding down to a shape the runtime
-    never produces) leaves capture with the buckets it can actually build; the
-    caller disables prefill capture when nothing survives.
-
-    The result is published to cuda_graph_config[prefill].bs, so DP padding-mode
-    coordination and the other bs consumers see the buckets really captured.
-    """
+    # attn_tp reduce-scatter hands every rank an equal shard, so a bucket that
+    # does not divide by attn_tp_size hangs capture; the live path ceil_aligns
+    # global_num_tokens the same way in ForwardBatch.prepare_mlp_sync_batch.
     if require_gathered_buffer():
-        # Read attn_tp_size only under the gate: it resolves the attention-TP
-        # group, which need not exist when no gather/scatter is in play.
+        # Resolves the attention-TP group, absent when nothing gathers over it.
         attn_tp_size = get_parallel().attn_tp_size
         if attn_tp_size > 1:
             capture_num_tokens = (
                 ceil_align(num_tokens, attn_tp_size)
                 for num_tokens in capture_num_tokens
             )
+    # Bound after aligning: rounding up can push a bucket past what the capture
+    # dummy batch holds, which trips the request-slot assert in capture_prepare.
     return sorted(
         {
             num_tokens
