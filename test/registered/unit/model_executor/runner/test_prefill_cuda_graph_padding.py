@@ -7,6 +7,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from sglang.srt.model_executor.runner import prefill_cuda_graph_runner as prefill_mod
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -71,6 +72,45 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         attn_backend.prepare_prefill_shared_read_snapshot.assert_called_once_with(
             forward_batch, num_qo_tokens=16
         )
+
+
+class TestPrefillCaptureBucketAttnTpAlignment(CustomTestCase):
+    """Capture buckets must divide evenly across the attention TP group.
+
+    When attn_tp scatters hidden states, every rank needs an equal shard.
+    Bucket 28 on attn_tp_size=8 splits [4, 4, 4, 4, 3, 3, 3, 3] and the
+    mismatched reduce-scatter hangs capture, which is reachable once breakable
+    prefill CUDA graphs are enabled for MLA models.
+    """
+
+    DEFAULT_BUCKETS = [4, 8, 12, 16, 20, 24, 28, 32, 48, 64]
+
+    def _align(self, buckets, attn_tp_size, gathered_buffer):
+        with mock.patch.object(
+            prefill_mod, "require_gathered_buffer", return_value=gathered_buffer
+        ):
+            return prefill_mod._align_capture_num_tokens_to_attn_tp(
+                list(buckets), attn_tp_size
+            )
+
+    def test_gathered_buffer_rounds_buckets_up_to_attn_tp(self):
+        aligned = self._align(self.DEFAULT_BUCKETS, 8, True)
+        self.assertEqual(aligned, [8, 16, 24, 32, 48, 64])
+        self.assertTrue(all(n % 8 == 0 for n in aligned))
+
+    def test_buckets_untouched_without_gathered_buffer(self):
+        self.assertEqual(
+            self._align(self.DEFAULT_BUCKETS, 8, False), self.DEFAULT_BUCKETS
+        )
+
+    def test_attn_tp_size_one_is_a_no_op(self):
+        self.assertEqual(
+            self._align(self.DEFAULT_BUCKETS, 1, True), self.DEFAULT_BUCKETS
+        )
+
+    def test_explicit_unaligned_bucket_is_rounded_not_dropped(self):
+        # --cuda-graph-bs-prefill 28 must still capture a usable bucket.
+        self.assertEqual(self._align([28], 8, True), [32])
 
 
 if __name__ == "__main__":

@@ -130,6 +130,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.utils import (
+    ceil_align,
     get_available_gpu_memory,
     is_cuda,
     is_npu,
@@ -270,6 +271,30 @@ _PREFILL_STATIC_FIELDS = (
 )
 
 
+def _align_capture_num_tokens_to_attn_tp(
+    capture_num_tokens: list[int], attn_tp_size: int
+) -> list[int]:
+    """Round prefill capture buckets up to a multiple of ``attn_tp_size``.
+
+    When the attention TP group scatters/gathers hidden states, every rank must
+    take an equally sized shard: ``_scatter_hidden_states_and_residual`` does
+    ``tensor_split(attn_tp_size)`` and then reduce-scatters. The live path keeps
+    that true by ceil_align'ing global_num_tokens to attn_tp_size (see
+    ``ForwardBatch.prepare_mlp_sync_batch``), but capture builds its batches
+    straight from the bucket list, so an unaligned bucket reaches a shape the
+    runtime never produces: 28 tokens over attn_tp_size=8 splits
+    [4, 4, 4, 4, 3, 3, 3, 3] and the mismatched collective hangs capture.
+
+    Decode enforces the same invariant when picking its buckets (see
+    ``get_cuda_graph_batch_size_alignment`` / ``_get_capture_bs``); this is the
+    prefill counterpart. Rounding up rather than dropping keeps an explicit
+    --cuda-graph-bs-prefill list non-empty; replay pads to a bucket either way.
+    """
+    if attn_tp_size <= 1 or not require_gathered_buffer():
+        return capture_num_tokens
+    return sorted({ceil_align(n, attn_tp_size) for n in capture_num_tokens})
+
+
 class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     """Prefill-phase CUDA graph runner.
 
@@ -304,6 +329,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         assert capture_tokens is not None, "cuda_graph_config[prefill].bs is not set"
         self.capture_num_tokens = sorted(capture_tokens)
         assert self.capture_num_tokens, "cuda_graph_config[prefill].bs is empty"
+        self.capture_num_tokens = _align_capture_num_tokens_to_attn_tp(
+            self.capture_num_tokens, self.attn_tp_size
+        )
 
         # --- runner bounds --------------------------------------------
         self.max_num_tokens = max(self.capture_num_tokens)
