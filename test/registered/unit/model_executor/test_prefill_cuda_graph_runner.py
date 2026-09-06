@@ -168,6 +168,58 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
         self.assertIs(capture.runner, prefill_runner)
 
+    def test_no_fitting_bucket_falls_back_to_a_graph_capture(self):
+        """The empty-bucket path must still hand back a GraphCapture.
+
+        Bucket resolution can legitimately come up empty -- every configured
+        size exceeds max_capture_requests * context_length, which also happens
+        when attn_tp alignment rounds the last surviving bucket past that
+        bound. Returning the bare eager runner there breaks the caller, which
+        reads ``.runner`` / ``.memory_usage`` / ``.time_usage`` off the result.
+        """
+        eager_runner = object()
+        override = get_context().override_server_args(
+            enable_lora=False,
+            enable_prefill_cp=False,
+            pp_size=1,
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(bs=[4096], backend=Backend.BREAKABLE)
+            ),
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        model_runner = SimpleNamespace(
+            device="cuda",
+            gpu_id=0,
+            is_draft_worker=False,
+            lora_manager=None,
+            spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
+            server_args=SimpleNamespace(),
+            model=SimpleNamespace(),
+            # 1 request slot x 8-token context => nothing as large as 4096 fits.
+            model_config=SimpleNamespace(context_len=8, num_hidden_layers=1),
+            layer_info=SimpleNamespace(start_layer=0, end_layer=1),
+            req_to_token_pool=SimpleNamespace(size=1),
+        )
+
+        language_model = SimpleNamespace(layers=[object()])
+
+        with (
+            patch.object(graph_setup, "check_cuda_graph_backend", return_value=False),
+            patch.object(
+                graph_setup, "resolve_language_model", return_value=language_model
+            ),
+        ):
+            capture = capture_prefill_graph(
+                model_runner=model_runner,
+                eager_runner=eager_runner,
+            )
+
+        self.assertIsInstance(capture, graph_setup.GraphCapture)
+        self.assertIs(capture.runner, eager_runner)
+        self.assertEqual(capture.memory_usage, {"prefill": 0})
+        self.assertEqual(capture.time_usage, {"prefill": 0})
+
     def test_eagle_target_tc_piecewise_skips_last_mode_capture(self):
         eager_runner = object()
         # The server-side hidden-state ceiling and graph config are bag leaves.

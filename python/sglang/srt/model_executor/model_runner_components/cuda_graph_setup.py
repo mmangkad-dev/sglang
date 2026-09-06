@@ -399,7 +399,7 @@ def capture_prefill_graph(
     # Align to attn_tp before bounding: rounding a bucket up can push it past
     # max_capture_tokens, so the capacity filter has to see the rounded values.
     capture_num_tokens = resolve_prefill_capture_num_tokens(
-        prefill_config.bs, parallel.attn_tp_size, max_capture_tokens
+        prefill_config.bs, max_capture_tokens
     )
     # Resolve the aligned, context- and request-capacity-bounded buckets once
     # before constructing the runner so every backend consumes the same config.
@@ -415,7 +415,7 @@ def capture_prefill_graph(
             context_length,
             model_runner.req_to_token_pool.size,
         )
-        return eager_runner
+        return result(eager_runner)
 
     # Collect attention layers and moe layers from the model. Keep a VLM
     # wrapper that exposes ``language_model`` unchanged: assigning it to

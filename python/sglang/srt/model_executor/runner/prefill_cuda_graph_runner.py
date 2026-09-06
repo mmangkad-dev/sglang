@@ -273,7 +273,6 @@ _PREFILL_STATIC_FIELDS = (
 
 def resolve_prefill_capture_num_tokens(
     capture_num_tokens: Iterable[int],
-    attn_tp_size: int,
     max_capture_tokens: int,
 ) -> list[int]:
     """Resolve the prefill capture buckets: align to attn_tp, then bound them.
@@ -299,10 +298,15 @@ def resolve_prefill_capture_num_tokens(
     The result is published to cuda_graph_config[prefill].bs, so DP padding-mode
     coordination and the other bs consumers see the buckets really captured.
     """
-    if attn_tp_size > 1 and require_gathered_buffer():
-        capture_num_tokens = (
-            ceil_align(num_tokens, attn_tp_size) for num_tokens in capture_num_tokens
-        )
+    if require_gathered_buffer():
+        # Read attn_tp_size only under the gate: it resolves the attention-TP
+        # group, which need not exist when no gather/scatter is in play.
+        attn_tp_size = get_parallel().attn_tp_size
+        if attn_tp_size > 1:
+            capture_num_tokens = (
+                ceil_align(num_tokens, attn_tp_size)
+                for num_tokens in capture_num_tokens
+            )
     return sorted(
         {
             num_tokens

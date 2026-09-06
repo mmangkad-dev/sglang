@@ -87,13 +87,37 @@ class TestResolvePrefillCaptureNumTokens(CustomTestCase):
     NO_LIMIT = 1 << 30
 
     def _resolve(self, buckets, attn_tp_size, gathered_buffer, max_capture_tokens=None):
-        with mock.patch.object(
-            prefill_mod, "require_gathered_buffer", return_value=gathered_buffer
+        with (
+            mock.patch.object(
+                prefill_mod, "require_gathered_buffer", return_value=gathered_buffer
+            ),
+            mock.patch.object(
+                prefill_mod,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_tp_size=attn_tp_size),
+            ),
         ):
             return prefill_mod.resolve_prefill_capture_num_tokens(
                 list(buckets),
-                attn_tp_size,
                 self.NO_LIMIT if max_capture_tokens is None else max_capture_tokens,
+            )
+
+    def test_attn_tp_group_not_read_when_gate_is_off(self):
+        # attn_tp_size resolves the attention-TP group, which need not exist
+        # when nothing gathers across it.
+        with (
+            mock.patch.object(
+                prefill_mod, "require_gathered_buffer", return_value=False
+            ),
+            mock.patch.object(
+                prefill_mod, "get_parallel", side_effect=AssertionError("no attn tp")
+            ),
+        ):
+            self.assertEqual(
+                prefill_mod.resolve_prefill_capture_num_tokens(
+                    self.DEFAULT_BUCKETS, self.NO_LIMIT
+                ),
+                self.DEFAULT_BUCKETS,
             )
 
     def test_gathered_buffer_rounds_buckets_up_to_attn_tp(self):
