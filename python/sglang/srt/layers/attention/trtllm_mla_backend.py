@@ -162,6 +162,12 @@ class TRTLLMMLAPrefillMetadata:
     max_seq_len: int
     cum_seq_lens: torch.Tensor
     seq_lens: torch.Tensor
+    # Host mirror of seq_lens, so the ragged wrapper can find empty rows
+    # without a per-call device readback.
+    seq_lens_cpu: torch.Tensor
+    # Whether every query row is non-empty. DP/CUDA-graph padding appends
+    # zero-length extend rows (forward_batch_info.py:_pad_inputs_to_size).
+    all_query_rows_active: bool
     fallback_to_flashinfer_impl: bool = False
 
 
@@ -836,10 +842,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             ).int()
             max_seq_len = max(forward_batch.extend_seq_lens_cpu)
             self.forward_prefill_metadata = TRTLLMMLAPrefillMetadata(
-                max_seq_len,
-                cum_seq_lens_q,
-                seq_lens,
-                fallback_to_flashinfer_impl,
+                max_seq_len=max_seq_len,
+                cum_seq_lens=cum_seq_lens_q,
+                seq_lens=seq_lens,
+                seq_lens_cpu=torch.tensor(
+                    forward_batch.extend_seq_lens_cpu, dtype=torch.int32
+                ),
+                all_query_rows_active=all(
+                    length > 0 for length in forward_batch.extend_seq_lens_cpu
+                ),
+                fallback_to_flashinfer_impl=fallback_to_flashinfer_impl,
             )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
@@ -1097,6 +1109,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         is_causal: bool,
         return_lse: bool,
         out_buffer: torch.Tensor,
+        q_seq_lens_cpu: torch.Tensor,
+        kv_seq_lens_cpu: torch.Tensor,
+        all_rows_active: bool,
         o_sf_scale: float = 1.0,
     ):
         """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
@@ -1105,6 +1120,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
+        # The wrapper otherwise derives the row lengths on device and reads
+        # them back with .item(), stalling the host once per kernel call.
+        row_check_kwargs = (
+            {"skip_all_rows_active_check": True}
+            if all_rows_active
+            else {
+                "q_seq_lens_cpu": q_seq_lens_cpu,
+                "kv_seq_lens_cpu": kv_seq_lens_cpu,
+            }
+        )
         return flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=q,
             key=k,
@@ -1125,6 +1150,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             o_sf_scale=o_sf_scale,
             out=out_buffer,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+            **row_check_kwargs,
         )
 
     def _set_kv_and_concat_q_fused(
@@ -1740,6 +1766,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 is_causal=False,
                 return_lse=True,
                 out_buffer=out,
+                q_seq_lens_cpu=self.forward_prefill_metadata.seq_lens_cpu,
+                kv_seq_lens_cpu=forward_batch.prefix_chunk_seq_lens_cpu[chunk_idx],
+                all_rows_active=(
+                    self.forward_prefill_metadata.all_query_rows_active
+                    and not forward_batch.prefix_chunk_has_zero_kv[chunk_idx]
+                ),
                 o_sf_scale=-1.0,
             )
 
@@ -1783,6 +1815,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 is_causal=True,
                 return_lse=forward_batch.mha_return_lse,
                 out_buffer=out,
+                q_seq_lens_cpu=self.forward_prefill_metadata.seq_lens_cpu,
+                kv_seq_lens_cpu=self.forward_prefill_metadata.seq_lens_cpu,
+                all_rows_active=self.forward_prefill_metadata.all_query_rows_active,
                 o_sf_scale=1.0,
             )
 

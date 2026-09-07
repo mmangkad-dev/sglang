@@ -1658,6 +1658,19 @@ class Engine(EngineScoreMixin, EngineBase):
     # score() and async_score() are provided by EngineScoreMixin
 
 
+# Attention backends that dispatch into FlashInfer kernels, under any name.
+_FLASHINFER_BACKED_ATTENTION = frozenset(
+    {
+        "flashinfer",
+        "flashinfer_mla",
+        "trtllm_mha",
+        "trtllm_mla",
+        "cutedsl_mla",
+        "tokenspeed_mla",
+    }
+)
+
+
 def _set_envs_and_config(server_args: ServerArgs):
 
     cfg = resolving_view(server_args)
@@ -1711,14 +1724,19 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Check flashinfer version
     if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
+        # Membership is exact, so backends that reach FlashInfer under another
+        # name (trtllm_mla and the subclasses sharing its prefill hook) must be
+        # listed, or a stale wheel surfaces as a raw TypeError mid-serving.
         if (
-            "flashinfer" in attention_backends_of(resolved_view(cfg))
+            _FLASHINFER_BACKED_ATTENTION.intersection(
+                attention_backends_of(resolved_view(cfg))
+            )
             or cfg.dsa_topk_backend == "flashinfer"
             or cfg.speculative_dsa_topk_backend == "flashinfer"
         ):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.18",
+                "0.6.18.post1",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
