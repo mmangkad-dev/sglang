@@ -695,10 +695,8 @@ class TestIsTorchFxAvailableCompat(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-# `inkling_mm_model` predates the invariant: SGLang's `InklingMMConfig` is
-# registered straight into `CONFIG_MAPPING._extra_content` by
-# `sglang.srt.configs.inkling`, and transformers named its native class
-# `InklingConfig`. Renaming either side is a wider change than this guard.
+# `inkling_mm_model` predates the invariant: `sglang.srt.configs.inkling` writes
+# `InklingMMConfig` straight into `_extra_content`, over a native `InklingConfig`.
 _KNOWN_NAME_MISMATCHES = {"inkling_mm_model"}
 
 
@@ -746,16 +744,6 @@ class TestAutoConfigRegistration(unittest.TestCase):
         ):
             with self.subTest(model_type=model_type):
                 self.assertIs(CONFIG_MAPPING[model_type], expected)
-
-    def test_cosmos3_omni_keeps_the_native_config(self):
-        """SGLang's `Cosmos3Config` is named `Cosmos3Config`, not `Cosmos3OmniConfig`.
-
-        transformers has owned `cosmos3_omni` since before v5.12, so overriding
-        it would drop the type out of the Auto* mappings.
-        """
-        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-
-        self.assertEqual(CONFIG_MAPPING["cosmos3_omni"].__name__, "Cosmos3OmniConfig")
 
 
 if __name__ == "__main__":

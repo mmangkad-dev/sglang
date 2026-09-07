@@ -306,19 +306,16 @@ class ZayaConfig(PretrainedConfig):
 def register_zaya_config() -> None:
     """Register :class:`ZayaConfig` with HuggingFace ``AutoConfig``.
 
-    Safe to call multiple times. ``exist_ok=True`` keeps this idempotent and
-    also makes SGLang's config win over the upstream ``zaya`` config that
-    transformers ships since v5.16 — SGLang's carries the hybrid-pool
-    properties (``full_attention_layer_ids``, ``mamba2_cache_params``) the
-    runtime needs.
+    ``exist_ok=True`` overrides the native ``zaya`` config transformers ships
+    since v5.16; SGLang's carries the hybrid-pool properties the runtime needs,
+    and both classes are named ``ZayaConfig`` so the Auto* mappings still key.
     """
     try:
         from transformers import AutoConfig
 
         AutoConfig.register(ZayaConfig.model_type, ZayaConfig, exist_ok=True)
     except (ValueError, ImportError):
-        # The installed ``transformers`` does not expose ``AutoConfig.register``
-        # (or rejects the registration) — nothing to do.
+        # No ``AutoConfig.register`` in the installed transformers -- skip.
         pass
 
 

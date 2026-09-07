@@ -228,14 +228,10 @@ try:
 except ImportError:
     pass
 
-# Registered without `exist_ok`, so a model type transformers already ships
-# natively keeps the native class in `CONFIG_MAPPING`. `get_config` re-parses
-# every registry entry through the class below anyway, so SGLang still gets its
-# own config; overriding here would only change what `AutoConfig` hands back.
-# That override is actively harmful: `_LazyAutoMapping` keys on the config
-# class `__name__`, so an entry whose name differs from the native one (the
-# `deepseek_v32` / `gemma4_unified` aliases above) drops out of
-# PROCESSOR_MAPPING / TOKENIZER_MAPPING / MODEL_MAPPING.
+# Bare register: `get_config` re-parses every registry entry through the class
+# below, so AutoConfig need not resolve to it. Overriding a native class is
+# unsafe -- `_LazyAutoMapping` keys on the config class `__name__`, so a
+# differently-named shadow drops out of PROCESSOR/TOKENIZER/MODEL_MAPPING.
 for name, cls in _CONFIG_REGISTRY.items():
     try:
         AutoConfig.register(name, cls)
@@ -250,10 +246,8 @@ for name, cls in _CONFIG_REGISTRY.items():
 # Qwen3-VL config relies on. Adding it to `_CONFIG_REGISTRY` would trigger a
 # `from_pretrained` reload that drops that flattening.
 #
-# No `exist_ok`: transformers has shipped a native `cosmos3_omni` since before
-# v5.12 and names its class `Cosmos3OmniConfig`, so this registration has always
-# lost to it. Forcing it through would drop the type out of the Auto* mappings,
-# which key on the config class `__name__`.
+# transformers owns `cosmos3_omni` as `Cosmos3OmniConfig`, so the name
+# constraint above means this registration must lose to it.
 try:
     AutoConfig.register(Cosmos3Config.model_type, Cosmos3Config)
 except ValueError as e:
@@ -267,10 +261,8 @@ except ValueError as e:
 # root config after `AutoConfig.from_pretrained`, matching other multimodal
 # configs that use a text sub-config.
 #
-# `exist_ok=True` because there is no registry re-parse to fall back on here:
-# transformers ships a native `cosmos3_edge` since v5.16, and without the
-# override `AutoConfig` would return that class instead of SGLang's. Safe to
-# force because these classes reuse the native names.
+# `exist_ok=True`: no registry re-parse backs these up, so AutoConfig itself
+# must resolve to SGLang's. Safe because they reuse the native class names.
 for _cosmos3_edge_config_cls in (
     Cosmos3EdgeTextConfig,
     Cosmos3EdgeVisionConfig,
