@@ -250,19 +250,27 @@ for name, cls in _CONFIG_REGISTRY.items():
 # Qwen3-VL config relies on. Adding it to `_CONFIG_REGISTRY` would trigger a
 # `from_pretrained` reload that drops that flattening.
 #
-# `exist_ok=True` because there is no registry re-parse to fall back on here:
-# transformers ships a native `cosmos3_edge` since v5.16, and without the
-# override `AutoConfig` would return that class instead of SGLang's.
+# No `exist_ok`: transformers has shipped a native `cosmos3_omni` since before
+# v5.12 and names its class `Cosmos3OmniConfig`, so this registration has always
+# lost to it. Forcing it through would drop the type out of the Auto* mappings,
+# which key on the config class `__name__`.
 try:
-    AutoConfig.register(Cosmos3Config.model_type, Cosmos3Config, exist_ok=True)
+    AutoConfig.register(Cosmos3Config.model_type, Cosmos3Config)
 except ValueError as e:
-    logger.warning("Failed to register config %s: %s", Cosmos3Config.model_type, e)
+    err = str(e).lower()
+    if "already registered" not in err and "already used" not in err:
+        logger.warning("Failed to register config %s: %s", Cosmos3Config.model_type, e)
 
 # Cosmos3-Edge native text support starts from the checkpoint root config, then
 # consumes ``text_config`` in ``sglang.srt.models.cosmos3_edge``. Keep it out of
 # `_CONFIG_REGISTRY` so the generic parser can flatten text attributes onto the
 # root config after `AutoConfig.from_pretrained`, matching other multimodal
 # configs that use a text sub-config.
+#
+# `exist_ok=True` because there is no registry re-parse to fall back on here:
+# transformers ships a native `cosmos3_edge` since v5.16, and without the
+# override `AutoConfig` would return that class instead of SGLang's. Safe to
+# force because these classes reuse the native names.
 for _cosmos3_edge_config_cls in (
     Cosmos3EdgeTextConfig,
     Cosmos3EdgeVisionConfig,

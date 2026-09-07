@@ -716,13 +716,13 @@ class TestAutoConfigRegistration(unittest.TestCase):
             CONFIG_MAPPING_NAMES,
         )
 
-        from sglang.srt.utils.hf_transformers.common import _CONFIG_REGISTRY
+        import sglang.srt.configs  # noqa: F401  (populates the registrations)
 
-        for model_type, cls in _CONFIG_REGISTRY.items():
+        # `_extra_content` is exactly the set of classes SGLang registered, so
+        # this covers `_CONFIG_REGISTRY` and the standalone registrations alike.
+        for model_type, cls in CONFIG_MAPPING._extra_content.items():
             native_name = CONFIG_MAPPING_NAMES.get(model_type)
-            if native_name is None or CONFIG_MAPPING[model_type] is not cls:
-                continue
-            if model_type in _KNOWN_NAME_MISMATCHES:
+            if native_name is None or model_type in _KNOWN_NAME_MISMATCHES:
                 continue
             with self.subTest(model_type=model_type):
                 self.assertEqual(
@@ -734,19 +734,28 @@ class TestAutoConfigRegistration(unittest.TestCase):
                 )
 
     def test_autoconfig_only_registrations_win_over_native(self):
-        """zaya / cosmos3 have no `_CONFIG_REGISTRY` re-parse to fall back on."""
+        """zaya / cosmos3-edge have no `_CONFIG_REGISTRY` re-parse to fall back on."""
         from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-        from sglang.srt.configs.cosmos3 import Cosmos3Config, Cosmos3EdgeConfig
+        from sglang.srt.configs.cosmos3 import Cosmos3EdgeConfig
         from sglang.srt.configs.zaya import ZayaConfig
 
         for model_type, expected in (
             ("zaya", ZayaConfig),
-            ("cosmos3_omni", Cosmos3Config),
             ("cosmos3_edge", Cosmos3EdgeConfig),
         ):
             with self.subTest(model_type=model_type):
                 self.assertIs(CONFIG_MAPPING[model_type], expected)
+
+    def test_cosmos3_omni_keeps_the_native_config(self):
+        """SGLang's `Cosmos3Config` is named `Cosmos3Config`, not `Cosmos3OmniConfig`.
+
+        transformers has owned `cosmos3_omni` since before v5.12, so overriding
+        it would drop the type out of the Auto* mappings.
+        """
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+        self.assertEqual(CONFIG_MAPPING["cosmos3_omni"].__name__, "Cosmos3OmniConfig")
 
 
 if __name__ == "__main__":
