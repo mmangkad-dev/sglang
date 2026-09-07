@@ -1724,12 +1724,14 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Check flashinfer version
     if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
-        # Membership is exact, so backends that reach FlashInfer under another
-        # name (trtllm_mla and the subclasses sharing its prefill hook) must be
-        # listed, or a stale wheel surfaces as a raw TypeError mid-serving.
+        # Membership is exact, so a backend reaching FlashInfer under another
+        # name must be listed; ROCm ships no wheel, so ask only on CUDA.
         if (
-            _FLASHINFER_BACKED_ATTENTION.intersection(
-                attention_backends_of(resolved_view(cfg))
+            (
+                _is_cuda
+                and _FLASHINFER_BACKED_ATTENTION.intersection(
+                    attention_backends_of(resolved_view(cfg))
+                )
             )
             or cfg.dsa_topk_backend == "flashinfer"
             or cfg.speculative_dsa_topk_backend == "flashinfer"

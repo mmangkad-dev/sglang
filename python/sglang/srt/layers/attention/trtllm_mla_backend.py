@@ -165,8 +165,8 @@ class TRTLLMMLAPrefillMetadata:
     # Host mirror of seq_lens, so the ragged wrapper can find empty rows
     # without a per-call device readback.
     seq_lens_cpu: torch.Tensor
-    # Whether every query row is non-empty. DP/CUDA-graph padding appends
-    # zero-length extend rows (forward_batch_info.py:_pad_inputs_to_size).
+    # Whether every query row is non-empty; DP and CUDA-graph padding
+    # append zero-length extend rows in _pad_inputs_to_size.
     all_query_rows_active: bool
     fallback_to_flashinfer_impl: bool = False
 
@@ -1120,8 +1120,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
-        # The wrapper otherwise derives the row lengths on device and reads
-        # them back with .item(), stalling the host once per kernel call.
+        # Without this the wrapper reads the row lengths back with .item(),
+        # stalling the host once per call; flashinfer-ai/flashinfer#4928.
         row_check_kwargs = (
             {"skip_all_rows_active_check": True}
             if all_rows_active

@@ -319,6 +319,12 @@ class DSAMetadata:
     kpool_extend_plan: Optional[KPoolExtendPlan] = None
     kpool_write_plan: Optional[KPoolWritePlan] = None
 
+    # Host mirrors of the MHA one-shot q/kv lengths, carried through the
+    # context-parallel reshard so they match the rows cu_seqlens_q describes.
+    mha_q_seq_lens_cpu: Optional[torch.Tensor] = None
+    mha_kv_seq_lens_cpu: Optional[torch.Tensor] = None
+    mha_all_rows_active: bool = False
+
 
 @torch.compile
 def _compiled_cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
@@ -895,6 +901,13 @@ class DeepseekSparseAttnBackend(
             draft_token_num = 0
 
         cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
+        cache_seqlens_cpu = (
+            (forward_batch.seq_lens_cpu + draft_token_num).to(torch.int32)
+            if forward_batch.seq_lens_cpu is not None
+            else None
+        )
+        mha_q_seq_lens_cpu = None
+        mha_all_rows_active = False
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
         if forward_batch.seq_lens_cpu is not None:
             max_seqlen_k = int(
@@ -1068,6 +1081,8 @@ class DeepseekSparseAttnBackend(
                 indexer_seq_lens_cpu = indexer_seq_lens_cpu[bs_idx_cpu]
                 indexer_seq_lens = indexer_seq_lens[bs_idx]
                 cache_seqlens_int32 = cache_seqlens_int32[bs_idx]
+                if cache_seqlens_cpu is not None:
+                    cache_seqlens_cpu = cache_seqlens_cpu[bs_idx_cpu]
                 cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
                 max_seqlen_k = (
                     int(indexer_seq_lens_cpu.max().item() + draft_token_num)
@@ -1081,9 +1096,21 @@ class DeepseekSparseAttnBackend(
                     max(extend_seq_lens_cpu) if len(extend_seq_lens_cpu) != 0 else 1
                 )
                 cu_seqlens_q = compute_cu_seqlens(extend_seq_lens.to(torch.int32))
+                mha_q_seq_lens_cpu = torch.tensor(
+                    extend_seq_lens_cpu, dtype=torch.int32
+                )
             else:
                 max_seqlen_q = max_seqlen_k
                 cu_seqlens_q = cu_seqlens_k
+                mha_q_seq_lens_cpu = cache_seqlens_cpu
+            # kv is the whole sequence and never shorter than the query,
+            # so a positive query length settles both sides of the test.
+            mha_all_rows_active = (
+                mha_q_seq_lens_cpu is not None
+                and cache_seqlens_cpu is not None
+                and bool(mha_q_seq_lens_cpu.numel())
+                and int(mha_q_seq_lens_cpu.min()) > 0
+            )
 
             # Check if MHA FP8 dequantization is needed
             mha_dequantize_needed = (
@@ -1197,6 +1224,9 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+            mha_q_seq_lens_cpu=mha_q_seq_lens_cpu,
+            mha_kv_seq_lens_cpu=cache_seqlens_cpu,
+            mha_all_rows_active=mha_all_rows_active,
         )
         metadata = self._init_kpool_metadata(
             metadata,
@@ -3108,6 +3138,17 @@ class DeepseekSparseAttnBackend(
             import flashinfer
 
             seq_lens = metadata.cache_seqlens_int32
+            # Without lengths the wrapper reads them back with .item(),
+            # stalling the host once per call; flashinfer-ai/flashinfer#4928.
+            if metadata.mha_all_rows_active:
+                row_check_kwargs = {"skip_all_rows_active_check": True}
+            elif metadata.mha_q_seq_lens_cpu is not None:
+                row_check_kwargs = {
+                    "q_seq_lens_cpu": metadata.mha_q_seq_lens_cpu,
+                    "kv_seq_lens_cpu": metadata.mha_kv_seq_lens_cpu,
+                }
+            else:
+                row_check_kwargs = {}
             return flashinfer.prefill.trtllm_ragged_attention_deepseek(
                 query=q,
                 key=k,
@@ -3127,6 +3168,7 @@ class DeepseekSparseAttnBackend(
                 is_causal=causal,
                 return_lse=False,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                **row_check_kwargs,
             )
 
         # Use FA3 for SM90 (Hopper/H200)
