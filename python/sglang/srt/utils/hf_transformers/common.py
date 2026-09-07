@@ -228,13 +228,15 @@ try:
 except ImportError:
     pass
 
+# `exist_ok=True`: transformers ships native configs for a growing number of
+# these model types (zaya, glm5_next, kimi_k25, ... since v5.13). SGLang's
+# classes carry runtime-specific fields, so they must stay the resolved config.
+# The remaining ValueError is the model_type/class mismatch check, a real bug.
 for name, cls in _CONFIG_REGISTRY.items():
     try:
-        AutoConfig.register(name, cls)
+        AutoConfig.register(name, cls, exist_ok=True)
     except ValueError as e:
-        err = str(e).lower()
-        if "already registered" not in err and "already used" not in err:
-            logger.warning("Failed to register config %s: %s", name, e)
+        logger.warning("Failed to register config %s: %s", name, e)
 
 # Cosmos3 (understanding tower) reuses the Qwen3-VL config schema. Register it
 # with AutoConfig only (not `_CONFIG_REGISTRY`), so the nested `text_config` is
@@ -242,11 +244,9 @@ for name, cls in _CONFIG_REGISTRY.items():
 # Qwen3-VL config relies on. Adding it to `_CONFIG_REGISTRY` would trigger a
 # `from_pretrained` reload that drops that flattening.
 try:
-    AutoConfig.register(Cosmos3Config.model_type, Cosmos3Config)
+    AutoConfig.register(Cosmos3Config.model_type, Cosmos3Config, exist_ok=True)
 except ValueError as e:
-    err = str(e).lower()
-    if "already registered" not in err and "already used" not in err:
-        logger.warning("Failed to register config %s: %s", Cosmos3Config.model_type, e)
+    logger.warning("Failed to register config %s: %s", Cosmos3Config.model_type, e)
 
 # Cosmos3-Edge native text support starts from the checkpoint root config, then
 # consumes ``text_config`` in ``sglang.srt.models.cosmos3_edge``. Keep it out of
@@ -261,16 +261,16 @@ for _cosmos3_edge_config_cls in (
 ):
     try:
         AutoConfig.register(
-            _cosmos3_edge_config_cls.model_type, _cosmos3_edge_config_cls
+            _cosmos3_edge_config_cls.model_type,
+            _cosmos3_edge_config_cls,
+            exist_ok=True,
         )
     except ValueError as e:
-        err = str(e).lower()
-        if "already registered" not in err and "already used" not in err:
-            logger.warning(
-                "Failed to register config %s: %s",
-                _cosmos3_edge_config_cls.model_type,
-                e,
-            )
+        logger.warning(
+            "Failed to register config %s: %s",
+            _cosmos3_edge_config_cls.model_type,
+            e,
+        )
 
 
 # ---------------------------------------------------------------------------

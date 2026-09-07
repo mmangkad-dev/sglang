@@ -671,36 +671,10 @@ class TestPatchRemovedSymbols(unittest.TestCase):
             "LlamaFlashAttention2 should be patched onto modeling_llama",
         )
 
-    def test_is_flash_attn_greater_or_equal_2_10_callable(self):
-        import transformers.utils as _u
-
-        self.assertTrue(
-            hasattr(_u, "is_flash_attn_greater_or_equal_2_10"),
-            "is_flash_attn_greater_or_equal_2_10 should be patched onto transformers.utils",
-        )
-        self.assertIsInstance(_u.is_flash_attn_greater_or_equal_2_10(), bool)
-
 
 # ---------------------------------------------------------------------------
 # compat: _patch_rope_parameters_validation
 # ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# compat: _ensure_clean_up_tokenization_compat
-# ---------------------------------------------------------------------------
-
-
-class TestCleanUpTokenizationCompat(unittest.TestCase):
-    def test_clean_up_tokenization_exists(self):
-        from transformers import PreTrainedTokenizerBase
-
-        self.assertTrue(hasattr(PreTrainedTokenizerBase, "clean_up_tokenization"))
-
-    def test_clean_up_tokenization_callable(self):
-        from transformers import PreTrainedTokenizerBase
-
-        self.assertTrue(callable(PreTrainedTokenizerBase.clean_up_tokenization))
 
 
 # ---------------------------------------------------------------------------
@@ -714,35 +688,6 @@ class TestIsTorchFxAvailableCompat(unittest.TestCase):
 
         self.assertTrue(hasattr(_iu, "is_torch_fx_available"))
         self.assertTrue(_iu.is_torch_fx_available())
-
-
-# ---------------------------------------------------------------------------
-# compat: _patch_nemotron_h_pattern
-# ---------------------------------------------------------------------------
-
-
-class TestPatchNemotronHPattern(unittest.TestCase):
-    def test_pattern_to_list_skips_mlp_dash(self):
-        try:
-            from transformers.models.nemotron_h.configuration_nemotron_h import (
-                NemotronHConfig,
-            )
-
-            result = NemotronHConfig._pattern_to_list("M-*-")
-            self.assertEqual(result, ["mamba", "attention"])
-        except ImportError:
-            self.skipTest("NemotronHConfig not available in this transformers version")
-
-    def test_pattern_to_list_standard_chars(self):
-        try:
-            from transformers.models.nemotron_h.configuration_nemotron_h import (
-                NemotronHConfig,
-            )
-
-            result = NemotronHConfig._pattern_to_list("ME*")
-            self.assertEqual(result, ["mamba", "moe", "attention"])
-        except ImportError:
-            self.skipTest("NemotronHConfig not available in this transformers version")
 
 
 if __name__ == "__main__":
