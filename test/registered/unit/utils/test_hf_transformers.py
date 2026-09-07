@@ -690,5 +690,64 @@ class TestIsTorchFxAvailableCompat(unittest.TestCase):
         self.assertTrue(_iu.is_torch_fx_available())
 
 
+# ---------------------------------------------------------------------------
+# AutoConfig registration
+# ---------------------------------------------------------------------------
+
+
+# `inkling_mm_model` predates the invariant: SGLang's `InklingMMConfig` is
+# registered straight into `CONFIG_MAPPING._extra_content` by
+# `sglang.srt.configs.inkling`, and transformers named its native class
+# `InklingConfig`. Renaming either side is a wider change than this guard.
+_KNOWN_NAME_MISMATCHES = {"inkling_mm_model"}
+
+
+class TestAutoConfigRegistration(unittest.TestCase):
+    """`AutoConfig` must keep resolving to a class the Auto* mappings can key on.
+
+    `_LazyAutoMapping` looks its entries up by config class `__name__`, so a
+    SGLang class that shadows a native one under a different name silently
+    disappears from PROCESSOR_MAPPING / TOKENIZER_MAPPING / MODEL_MAPPING.
+    """
+
+    def test_shadowing_entries_keep_the_native_class_name(self):
+        from transformers.models.auto.configuration_auto import (
+            CONFIG_MAPPING,
+            CONFIG_MAPPING_NAMES,
+        )
+
+        from sglang.srt.utils.hf_transformers.common import _CONFIG_REGISTRY
+
+        for model_type, cls in _CONFIG_REGISTRY.items():
+            native_name = CONFIG_MAPPING_NAMES.get(model_type)
+            if native_name is None or CONFIG_MAPPING[model_type] is not cls:
+                continue
+            if model_type in _KNOWN_NAME_MISMATCHES:
+                continue
+            with self.subTest(model_type=model_type):
+                self.assertEqual(
+                    cls.__name__,
+                    native_name,
+                    f"{cls.__name__} shadows the native {native_name} for "
+                    f"'{model_type}'; the Auto* mappings key on __name__ and "
+                    f"would stop resolving this model type",
+                )
+
+    def test_autoconfig_only_registrations_win_over_native(self):
+        """zaya / cosmos3 have no `_CONFIG_REGISTRY` re-parse to fall back on."""
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+        from sglang.srt.configs.cosmos3 import Cosmos3Config, Cosmos3EdgeConfig
+        from sglang.srt.configs.zaya import ZayaConfig
+
+        for model_type, expected in (
+            ("zaya", ZayaConfig),
+            ("cosmos3_omni", Cosmos3Config),
+            ("cosmos3_edge", Cosmos3EdgeConfig),
+        ):
+            with self.subTest(model_type=model_type):
+                self.assertIs(CONFIG_MAPPING[model_type], expected)
+
+
 if __name__ == "__main__":
     unittest.main()

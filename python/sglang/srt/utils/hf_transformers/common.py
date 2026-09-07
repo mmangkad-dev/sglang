@@ -228,21 +228,31 @@ try:
 except ImportError:
     pass
 
-# `exist_ok=True`: transformers ships native configs for a growing number of
-# these model types (zaya, glm5_next, kimi_k25, ... since v5.13). SGLang's
-# classes carry runtime-specific fields, so they must stay the resolved config.
-# The remaining ValueError is the model_type/class mismatch check, a real bug.
+# Registered without `exist_ok`, so a model type transformers already ships
+# natively keeps the native class in `CONFIG_MAPPING`. `get_config` re-parses
+# every registry entry through the class below anyway, so SGLang still gets its
+# own config; overriding here would only change what `AutoConfig` hands back.
+# That override is actively harmful: `_LazyAutoMapping` keys on the config
+# class `__name__`, so an entry whose name differs from the native one (the
+# `deepseek_v32` / `gemma4_unified` aliases above) drops out of
+# PROCESSOR_MAPPING / TOKENIZER_MAPPING / MODEL_MAPPING.
 for name, cls in _CONFIG_REGISTRY.items():
     try:
-        AutoConfig.register(name, cls, exist_ok=True)
+        AutoConfig.register(name, cls)
     except ValueError as e:
-        logger.warning("Failed to register config %s: %s", name, e)
+        err = str(e).lower()
+        if "already registered" not in err and "already used" not in err:
+            logger.warning("Failed to register config %s: %s", name, e)
 
 # Cosmos3 (understanding tower) reuses the Qwen3-VL config schema. Register it
 # with AutoConfig only (not `_CONFIG_REGISTRY`), so the nested `text_config` is
 # flattened onto the top-level config in `get_config` — the same path the base
 # Qwen3-VL config relies on. Adding it to `_CONFIG_REGISTRY` would trigger a
 # `from_pretrained` reload that drops that flattening.
+#
+# `exist_ok=True` because there is no registry re-parse to fall back on here:
+# transformers ships a native `cosmos3_edge` since v5.16, and without the
+# override `AutoConfig` would return that class instead of SGLang's.
 try:
     AutoConfig.register(Cosmos3Config.model_type, Cosmos3Config, exist_ok=True)
 except ValueError as e:
