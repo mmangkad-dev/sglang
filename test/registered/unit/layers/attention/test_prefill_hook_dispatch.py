@@ -1,15 +1,21 @@
-"""Every _run_prefill_kernel override must bind the chunked-prefix arguments.
+"""Contracts the chunked-prefix prefill call site depends on.
 
 An override left on a stale signature raises TypeError at dispatch, before any
 kernel runs, and only on batches that carry an empty row, so it survives both
-the helper tests and an ordinary prefill.
+the helper tests and an ordinary prefill. Host length mirrors have to sum to the
+rows actually handed to the kernel, which TP/DP padding otherwise breaks.
 """
 
 import ast
 import inspect
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import torch
+
+from sglang.srt.layers.attention import trtllm_mla_backend
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -67,6 +73,92 @@ class TestPrefillHookDispatch(CustomTestCase):
                 inspect.signature(cls._run_prefill_kernel).bind(
                     object.__new__(cls), **_HOOK_CALL
                 )
+
+
+class _RecordingKernel:
+    """Stands in for the wrapper, enforcing the length precondition it checks."""
+
+    def __init__(self):
+        self.query_rows = None
+
+    def __call__(self, **kwargs):
+        for name, packed in (("q_seq_lens_cpu", "query"), ("kv_seq_lens_cpu", "key")):
+            if kwargs.get(name) is not None:
+                total = int(kwargs[name].sum())
+                if total != kwargs[packed].shape[0]:
+                    raise ValueError(
+                        f"{name} sums to {total}, but expected "
+                        f"{kwargs[packed].shape[0]} tokens"
+                    )
+        self.query_rows = kwargs["query"].shape[0]
+        out = kwargs["out"]
+        if not kwargs["return_lse"]:
+            return out
+        lse = kwargs.get("lse")
+        if lse is None:
+            lse = torch.zeros(out.shape[0], out.shape[1], dtype=torch.float32)
+        return out, lse
+
+
+class TestPaddedQueryBuffer(CustomTestCase):
+    """A padded query buffer must still reach the kernel with mirrors attached.
+
+    Passing the real extend lengths against a padded buffer makes the wrapper
+    reject the call outright instead of attending the rows that do exist.
+    """
+
+    def _run(self, *, padded_rows, q_lens, kv_lens):
+        backend = object.__new__(TRTLLMMLABackend)
+        backend.data_type = torch.bfloat16
+        backend.workspace_buffer = None
+        kernel = _RecordingKernel()
+        fake = types.SimpleNamespace(
+            prefill=types.SimpleNamespace(trtllm_ragged_attention_deepseek=kernel)
+        )
+        num_kv = int(kv_lens.sum())
+        with mock.patch.object(trtllm_mla_backend, "flashinfer", fake, create=True):
+            out, lse = backend._run_prefill_kernel(
+                q=torch.zeros(padded_rows, 2, 4),
+                k=torch.zeros(num_kv, 2, 4),
+                v=torch.zeros(num_kv, 2, 4),
+                layer=types.SimpleNamespace(scaling=1.0),
+                batch_size=q_lens.numel(),
+                cum_seq_lens_q=None,
+                max_q_len=int(q_lens.max()),
+                seq_lens_kv=None,
+                cum_seq_lens_kv=None,
+                max_kv_len=max(int(kv_lens.max()), 1),
+                is_causal=False,
+                return_lse=True,
+                out_buffer=torch.zeros(padded_rows, 2, 4),
+                q_seq_lens_cpu=q_lens,
+                kv_seq_lens_cpu=kv_lens,
+                all_rows_active=False,
+                o_sf_scale=-1.0,
+            )
+        return kernel, out, lse
+
+    def test_padded_buffer_is_trimmed_to_the_mirrored_rows(self):
+        q_lens = torch.tensor([7, 8], dtype=torch.int32)
+        kernel, out, lse = self._run(
+            padded_rows=16,
+            q_lens=q_lens,
+            kv_lens=torch.tensor([4, 0], dtype=torch.int32),
+        )
+        self.assertEqual(kernel.query_rows, 15)
+        # Callers size their buffers by the padded query and index them that way.
+        self.assertEqual(out.shape[0], 16)
+        self.assertEqual(lse.shape[0], 16)
+
+    def test_unpadded_buffer_is_passed_through(self):
+        q_lens = torch.tensor([7, 8], dtype=torch.int32)
+        kernel, out, _ = self._run(
+            padded_rows=15,
+            q_lens=q_lens,
+            kv_lens=torch.tensor([4, 3], dtype=torch.int32),
+        )
+        self.assertEqual(kernel.query_rows, 15)
+        self.assertEqual(out.shape[0], 15)
 
 
 if __name__ == "__main__":

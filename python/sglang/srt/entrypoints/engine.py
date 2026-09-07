@@ -1667,6 +1667,10 @@ _FLASHINFER_BACKED_ATTENTION = frozenset(
         "trtllm_mla",
         "cutedsl_mla",
         "tokenspeed_mla",
+        # Sparse paths run through TileLang/aiter,
+        # but their one-shot MHA prefill reaches FlashInfer on SM100+.
+        "dsa",
+        "nsa",
     }
 )
 

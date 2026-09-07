@@ -1122,15 +1122,30 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
         # Without this the wrapper reads the row lengths back with .item(),
         # stalling the host once per call; flashinfer-ai/flashinfer#4928.
-        row_check_kwargs = (
-            {"skip_all_rows_active_check": True}
-            if all_rows_active
-            else {
+        padded_out = padded_lse = None
+        if all_rows_active:
+            row_check_kwargs = {"skip_all_rows_active_check": True}
+        else:
+            row_check_kwargs = {
                 "q_seq_lens_cpu": q_seq_lens_cpu,
                 "kv_seq_lens_cpu": kv_seq_lens_cpu,
             }
-        )
-        return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+            # The mirrors must sum to the packed rows,
+            # but TP/DP padding can leave the buffers longer than that span.
+            num_q_tokens = int(q_seq_lens_cpu.sum())
+            num_kv_tokens = int(kv_seq_lens_cpu.sum())
+            if num_q_tokens != q.shape[0] or num_kv_tokens != k.shape[0]:
+                padded_out, out_buffer = out_buffer, out_buffer[:num_q_tokens]
+                q, k, v = q[:num_q_tokens], k[:num_kv_tokens], v[:num_kv_tokens]
+                if return_lse:
+                    padded_lse = torch.empty(
+                        padded_out.shape[0],
+                        padded_out.shape[1],
+                        dtype=torch.float32,
+                        device=padded_out.device,
+                    )
+                    row_check_kwargs["lse"] = padded_lse[:num_q_tokens]
+        result = flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=q,
             key=k,
             value=v,
@@ -1152,6 +1167,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
             **row_check_kwargs,
         )
+        if padded_out is None:
+            return result
+        # Callers size their buffers by the padded query,
+        # and rows past the cumsum span keep the tail the kernel leaves anyway.
+        return (padded_out, padded_lse) if return_lse else padded_out
 
     def _set_kv_and_concat_q_fused(
         self,
