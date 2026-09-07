@@ -81,7 +81,11 @@ class TestPrefillHookDispatch(CustomTestCase):
 
 
 class _RecordingKernel:
-    """Stands in for the wrapper, enforcing the length precondition it checks."""
+    """Stands in for the wrapper, enforcing the contracts it checks."""
+
+    # Written into every covered row so callers can prove the buffer they got
+    # back is the storage the kernel filled, not same-shaped scratch.
+    SENTINEL = 7.0
 
     def __init__(self):
         self.query_rows = None
@@ -95,13 +99,24 @@ class _RecordingKernel:
                         f"{name} sums to {total}, but expected "
                         f"{kwargs[packed].shape[0]} tokens"
                     )
-        self.query_rows = kwargs["query"].shape[0]
-        out = kwargs["out"]
+        query = kwargs["query"]
+        self.query_rows = query.shape[0]
+        out = kwargs.get("out")
+        if out is None:
+            out = torch.empty(
+                query.shape[0], *kwargs["value"].shape[1:], dtype=query.dtype
+            )
+        elif out.shape[0] != query.shape[0]:
+            raise ValueError(
+                f"out must have shape ({query.shape[0]}, ...), got {tuple(out.shape)}"
+            )
+        out.fill_(self.SENTINEL)
         if not kwargs["return_lse"]:
             return out
         lse = kwargs.get("lse")
         if lse is None:
             lse = torch.zeros(out.shape[0], out.shape[1], dtype=torch.float32)
+        lse.fill_(self.SENTINEL)
         return out, lse
 
 
@@ -154,6 +169,8 @@ class TestPaddedQueryBuffer(CustomTestCase):
         # Callers size their buffers by the padded query and index them that way.
         self.assertEqual(out.shape[0], 16)
         self.assertEqual(lse.shape[0], 16)
+        self.assertTrue(bool((out[:15] == _RecordingKernel.SENTINEL).all()))
+        self.assertTrue(bool((lse[:15] == _RecordingKernel.SENTINEL).all()))
 
     def test_unpadded_buffer_is_passed_through(self):
         q_lens = torch.tensor([7, 8], dtype=torch.int32)
@@ -228,6 +245,7 @@ class TestDsaPaddedQueryBuffer(CustomTestCase):
         )
         self.assertEqual(kernel.query_rows, 7)
         self.assertEqual(out.shape[0], 8)
+        self.assertTrue(bool((out[:7] == _RecordingKernel.SENTINEL).all()))
 
     def test_unpadded_buffer_is_passed_through(self):
         kernel, out = self._run(
@@ -237,6 +255,7 @@ class TestDsaPaddedQueryBuffer(CustomTestCase):
         )
         self.assertEqual(kernel.query_rows, 7)
         self.assertEqual(out.shape[0], 7)
+        self.assertTrue(bool((out == _RecordingKernel.SENTINEL).all()))
 
 
 if __name__ == "__main__":
