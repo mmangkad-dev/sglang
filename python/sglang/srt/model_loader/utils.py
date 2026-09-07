@@ -4,10 +4,9 @@
 
 """Utilities for selecting and loading models."""
 
-import concurrent.futures
 import contextlib
 import logging
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type
+from typing import Tuple, Type
 
 import torch
 import transformers
@@ -289,66 +288,6 @@ def should_deepgemm_weight_requant_ue8m0(
     ):
         return False
     return True
-
-
-def should_async_load(weight: torch.Tensor) -> bool:
-    """Return True if we should load the given weight asynchronously.
-
-    For host (CPU) tensors, using a threadpool can overlap H2D copies
-    and improve throughput. For device tensors, threading often adds overhead
-    (e.g., GIL contention) without benefit, so we do it synchronously.
-
-    RunAI-streamed tensors are zero-copy views into a reused CPU buffer. They
-    must be consumed synchronously before the streamer fills its next batch.
-    """
-    if getattr(weight, "_sglang_runai_streamer_tensor", False):
-        return False
-
-    device = getattr(weight, "device", None)
-    if device is None:
-        return False
-    return device.type == "cpu"
-
-
-def maybe_executor_submit(
-    *,
-    executor: concurrent.futures.ThreadPoolExecutor,
-    futures: List[concurrent.futures.Future],
-    use_async: bool,
-    func: Callable[..., Any],
-    func_args: Iterable[Any] = (),
-    func_kwargs: Optional[Dict[str, Any]] = None,
-) -> None:
-    """Submit a task to the executor if async loading is enabled.
-
-    Parameters (keyword-only):
-    - executor: ThreadPoolExecutor used to submit background tasks
-    - futures: a list collecting the submitted Future objects
-    - use_async: whether to submit to executor or run inline
-    - func: the callable to run
-    - func_args: positional args for the callable (defaults to empty tuple)
-    - func_kwargs: keyword args for the callable (defaults to empty dict)
-    """
-    if func_kwargs is None:
-        func_kwargs = {}
-    if use_async:
-        # CRITICAL: Capture current CUDA device and restore it in worker thread.
-        # torch.cuda.current_device() is thread-local and is NOT correctly passed to threads.
-        # This may result in errors in case the `func` relies on torch current device to be already correctly specified.
-        # See details in https://github.com/pytorch/pytorch/issues/56588.
-        current_device = (
-            torch.cuda.current_device() if torch.cuda.is_available() else None
-        )
-
-        def device_aware_wrapper(*args, **kwargs):
-            # Set CUDA device in worker thread to match parent thread
-            if current_device is not None:
-                torch.cuda.set_device(current_device)
-            return func(*args, **kwargs)
-
-        futures.append(executor.submit(device_aware_wrapper, *func_args, **func_kwargs))
-    else:
-        func(*func_args, **func_kwargs)
 
 
 def resolve_language_model(model: nn.Module) -> nn.Module:

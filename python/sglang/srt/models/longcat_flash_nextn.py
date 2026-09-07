@@ -30,7 +30,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import concurrent.futures
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -542,142 +541,134 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
             "model.mtp.layers.0.transformer_layer.mlp.up_proj.weight_scale_inv": "layers.0.mlp.up_proj.weight_scale_inv",
             "model.mtp.norm.weight": "layers.0.final_layernorm.weight",
         }
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = []
-            params_dict = dict(self.named_parameters())
-            weight_names = []
-            for name, loaded_weight in weights:
-                if ".mtp." not in name:
-                    continue
-                if name in weight_names_mapping:
-                    name = weight_names_mapping[name]
-                if name.startswith("layers.0"):
-                    name = "model." + name
-                if (
-                    name.startswith("enorm")
-                    or name.startswith("hnorm")
-                    or name.startswith("eh_proj")
-                ):
-                    name = nextn_layer_prefix + "." + name
-                if not name.startswith(nextn_layer_prefix):
-                    continue
+        params_dict = dict(self.named_parameters())
+        weight_names = []
+        for name, loaded_weight in weights:
+            if ".mtp." not in name:
+                continue
+            if name in weight_names_mapping:
+                name = weight_names_mapping[name]
+            if name.startswith("layers.0"):
+                name = "model." + name
+            if (
+                name.startswith("enorm")
+                or name.startswith("hnorm")
+                or name.startswith("eh_proj")
+            ):
+                name = nextn_layer_prefix + "." + name
+            if not name.startswith(nextn_layer_prefix):
+                continue
 
-                # Use shared head and embed weights from target model
-                if "shared_head.head" in name or "embed_tokens" in name:
-                    continue
+            # Use shared head and embed weights from target model
+            if "shared_head.head" in name or "embed_tokens" in name:
+                continue
 
-                is_decoder = True
-                # For nextn specific weights
-                for weight_name in nextn_spec_weight_names:
-                    if weight_name in name:
-                        name = name.replace(nextn_layer_prefix, "model")
-                        is_decoder = False
-                        break
-                # For decoder layer weights
-                if is_decoder:
-                    name = name.replace(nextn_layer_prefix, "model.decoder")
-
-                weight_names.append(name)
-                if "rotary_emb.inv_freq" in name:
-                    continue
-                for param_name, weight_name, shard_id in stacked_params_mapping:
-                    # Skip non-stacked layers and experts (experts handled below).
-                    if weight_name not in name:
-                        continue
-                    # We have mlp.experts[0].gate_proj in the checkpoint.
-                    # Since we handle the experts below in expert_params_mapping,
-                    # we need to skip here BEFORE we update the name, otherwise
-                    # name will be updated to mlp.experts[0].gate_up_proj, which
-                    # will then be updated below in expert_params_mapping
-                    # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                    if ("mlp.experts." in name) and name not in params_dict:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    futures.append(
-                        executor.submit(weight_loader, param, loaded_weight, shard_id)
-                    )
+            is_decoder = True
+            # For nextn specific weights
+            for weight_name in nextn_spec_weight_names:
+                if weight_name in name:
+                    name = name.replace(nextn_layer_prefix, "model")
+                    is_decoder = False
                     break
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    if fuse_qkv_a_proj and (
-                        "q_a_proj" in name or "kv_a_proj_with_mqa" in name
+            # For decoder layer weights
+            if is_decoder:
+                name = name.replace(nextn_layer_prefix, "model.decoder")
+
+            weight_names.append(name)
+            if "rotary_emb.inv_freq" in name:
+                continue
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                # Skip non-stacked layers and experts (experts handled below).
+                if weight_name not in name:
+                    continue
+                # We have mlp.experts[0].gate_proj in the checkpoint.
+                # Since we handle the experts below in expert_params_mapping,
+                # we need to skip here BEFORE we update the name, otherwise
+                # name will be updated to mlp.experts[0].gate_up_proj, which
+                # will then be updated below in expert_params_mapping
+                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                if ("mlp.experts." in name) and name not in params_dict:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if fuse_qkv_a_proj and (
+                    "q_a_proj" in name or "kv_a_proj_with_mqa" in name
+                ):
+                    cached_a_proj[name] = loaded_weight
+                    q_a_proj_name = (
+                        name
+                        if "q_a_proj" in name
+                        else name.replace("kv_a_proj_with_mqa", "q_a_proj")
+                    )
+                    kv_a_proj_name = (
+                        name
+                        if "kv_a_proj_with_mqa" in name
+                        else name.replace("q_a_proj", "kv_a_proj_with_mqa")
+                    )
+
+                    # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
+                    if (
+                        q_a_proj_name in cached_a_proj
+                        and kv_a_proj_name in cached_a_proj
                     ):
-                        cached_a_proj[name] = loaded_weight
-                        q_a_proj_name = (
-                            name
-                            if "q_a_proj" in name
-                            else name.replace("kv_a_proj_with_mqa", "q_a_proj")
-                        )
-                        kv_a_proj_name = (
-                            name
-                            if "kv_a_proj_with_mqa" in name
-                            else name.replace("q_a_proj", "kv_a_proj_with_mqa")
-                        )
-
-                        # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
-                        if (
-                            q_a_proj_name in cached_a_proj
-                            and kv_a_proj_name in cached_a_proj
+                        q_a_proj_weight = cached_a_proj[q_a_proj_name]
+                        kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+                        cat_dim = 0
+                        if self.quant_config is not None and (
+                            self.quant_config.get_name() == "awq"
+                            or self.quant_config.get_name() == "awq_marlin"
+                            or self.quant_config.get_name() == "moe_wna16"
                         ):
-                            q_a_proj_weight = cached_a_proj[q_a_proj_name]
-                            kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                            cat_dim = 0
-                            if self.quant_config is not None and (
-                                self.quant_config.get_name() == "awq"
-                                or self.quant_config.get_name() == "awq_marlin"
-                                or self.quant_config.get_name() == "moe_wna16"
-                            ):
-                                cat_dim = 1
-                            fused_weight = torch.cat(
-                                [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
+                            cat_dim = 1
+                        fused_weight = torch.cat(
+                            [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
+                        )
+                        param_name = (
+                            name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
+                            if "q_a_proj" in name
+                            else name.replace(
+                                "kv_a_proj_with_mqa",
+                                "fused_qkv_a_proj_with_mqa",
                             )
-                            param_name = (
-                                name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
-                                if "q_a_proj" in name
-                                else name.replace(
-                                    "kv_a_proj_with_mqa",
-                                    "fused_qkv_a_proj_with_mqa",
-                                )
-                            )
-                            param = params_dict[param_name]
+                        )
+                        param = params_dict[param_name]
 
-                            weight_loader = getattr(
-                                param, "weight_loader", default_weight_loader
-                            )
-                            futures.append(
-                                executor.submit(weight_loader, param, fused_weight)
-                            )
-                            cached_a_proj.pop(q_a_proj_name)
-                            cached_a_proj.pop(kv_a_proj_name)
-                    else:
-                        if (
-                            "k_scale" in name or "v_scale" in name
-                        ) and name not in params_dict:
-                            # modelopt attn kv scale is named differently
-                            for scale in ["k_scale", "v_scale"]:
-                                if scale in name:
-                                    name = name.replace(f"{scale[0]}_proj", "attn_mqa")
-                                    break
-                        if name not in params_dict:
-                            # modelopt ckpt contains not needed weights for MTP module:
-                            # model.decoder.self_attn.attn_mqa.v_scale and
-                            # model.decoder.self_attn.attn_mqa.k_scale
-                            logger.warning(f"{name} not found in params_dict.")
-                            continue
-                        param = params_dict[name]
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
-                        futures.append(
-                            executor.submit(weight_loader, param, loaded_weight)
-                        )
+                        weight_loader(param, fused_weight)
+                        cached_a_proj.pop(q_a_proj_name)
+                        cached_a_proj.pop(kv_a_proj_name)
+                else:
+                    if (
+                        "k_scale" in name or "v_scale" in name
+                    ) and name not in params_dict:
+                        # modelopt attn kv scale is named differently
+                        for scale in ["k_scale", "v_scale"]:
+                            if scale in name:
+                                name = name.replace(f"{scale[0]}_proj", "attn_mqa")
+                                break
+                    if name not in params_dict:
+                        # modelopt ckpt contains not needed weights for MTP module:
+                        # model.decoder.self_attn.attn_mqa.v_scale and
+                        # model.decoder.self_attn.attn_mqa.k_scale
+                        logger.warning(f"{name} not found in params_dict.")
+                        continue
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
         self.post_load_weights()
 
 

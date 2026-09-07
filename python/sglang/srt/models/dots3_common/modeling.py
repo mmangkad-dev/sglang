@@ -16,7 +16,6 @@
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference implementation for dots.note.omni."""
 
-import concurrent.futures
 import logging
 import math
 from dataclasses import dataclass
@@ -735,16 +734,14 @@ class Dots3AttentionMLA(nn.Module):
         self.num_heads = attn_config.num_attention_heads
         assert self.num_heads % attn_tp_size == 0
         self.num_local_heads = self.num_heads // attn_tp_size
-        assert attn_config.num_attention_heads == attn_config.num_key_value_heads, (
-            "Dots3 Only supports equal number of query and key value heads."
-        )
+        assert (
+            attn_config.num_attention_heads == attn_config.num_key_value_heads
+        ), "Dots3 Only supports equal number of query and key value heads."
         self.attention_gate_type = attn_config.attention_gate_type
         assert self.attention_gate_type in {
             "headwise",
             "elementwise",
-        }, (
-            f"Unsupported attention_gate_type: {self.attention_gate_type}. Expected 'headwise' or 'elementwise'."
-        )
+        }, f"Unsupported attention_gate_type: {self.attention_gate_type}. Expected 'headwise' or 'elementwise'."
         self.g_proj_local_dim = self.num_local_heads * (
             1 if self.attention_gate_type == "headwise" else self.v_head_dim
         )
@@ -834,9 +831,9 @@ class Dots3AttentionMLA(nn.Module):
 
         # Optional NSA (Native Sparse Attention) indexer.
         if self.use_nsa:
-            assert self.q_lora_rank is not None, (
-                "Dots3 NSA requires q_lora_rank to be set in the config."
-            )
+            assert (
+                self.q_lora_rank is not None
+            ), "Dots3 NSA requires q_lora_rank to be set in the config."
             self.indexer = Indexer(
                 hidden_size=self.hidden_size,
                 index_n_heads=config.index_n_heads,
@@ -1075,9 +1072,9 @@ class Dots3AttentionMLA(nn.Module):
         zero_allocator: BumpAllocator,
     ):
         if hidden_states.shape[0] == 0:
-            assert not self.o_proj.reduce_results, (
-                "short-circuiting allreduce will lead to hangs"
-            )
+            assert (
+                not self.o_proj.reduce_results
+            ), "short-circuiting allreduce will lead to hangs"
             return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
@@ -1855,9 +1852,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         # for quark model load
         # Always fuse q_a_proj/kv_a_proj_with_mqa/g_proj when loading Dots3.
         self.fuse_qkv_a_g_proj = True
-        assert config.q_lora_rank is not None, (
-            "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
-        )
+        assert (
+            config.q_lora_rank is not None
+        ), "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
         if self.fuse_qkv_a_g_proj:
             self.packed_modules_mapping["fused_qkv_a_g_proj_with_mqa"] = [
                 "q_a_proj",
@@ -2041,16 +2038,12 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 assert (
                     self.quant_config is not None
                     and self.quant_config.weight_block_size is not None
-                ), (
-                    "Dots3 MLA kv_b_proj only supports FP8 block quantization with weight_block_size=(128, 128)."
-                )
+                ), "Dots3 MLA kv_b_proj only supports FP8 block quantization with weight_block_size=(128, 128)."
                 weight_block_size = tuple(self.quant_config.weight_block_size)
                 assert weight_block_size == (
                     128,
                     128,
-                ), (
-                    f"Dots3 MLA kv_b_proj only supports FP8 block_size=(128, 128), got {weight_block_size}."
-                )
+                ), f"Dots3 MLA kv_b_proj only supports FP8 block_size=(128, 128), got {weight_block_size}."
                 block_scale = self_attn.kv_b_proj.weight_scale_inv
 
                 if not (
@@ -2068,9 +2061,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                         torch.bfloat16,
                     )
             else:
-                assert w.dtype == torch.bfloat16, (
-                    f"Dots3 MLA kv_b_proj only supports BF16 or FP8(128x128), got dtype={w.dtype}."
-                )
+                assert (
+                    w.dtype == torch.bfloat16
+                ), f"Dots3 MLA kv_b_proj only supports BF16 or FP8(128x128), got dtype={w.dtype}."
 
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
@@ -2213,9 +2206,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
 
         # Always fuse q_a_proj/kv_a_proj_with_mqa/g_proj when loading Dots3.
         fuse_qkv_a_g_proj = True
-        assert self.config.q_lora_rank is not None, (
-            "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
-        )
+        assert (
+            self.config.q_lora_rank is not None
+        ), "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
         cached_a_proj = {} if fuse_qkv_a_g_proj else None
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
@@ -2223,9 +2216,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         def shard_g_proj_for_attention_tp(
             weight: torch.Tensor, cat_dim: int, is_scale: bool
         ):
-            assert weight.ndim > cat_dim, (
-                f"weight.ndim={weight.ndim}, cat_dim={cat_dim}"
-            )
+            assert (
+                weight.ndim > cat_dim
+            ), f"weight.ndim={weight.ndim}, cat_dim={cat_dim}"
             dim_size = weight.shape[cat_dim]
             if not is_scale:
                 assert dim_size % attn_tp_size == 0, (
@@ -2297,7 +2290,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                     f"target_dim={target_dim}, fused_dim={fused_dim}."
                 )
             weight_loader = _get_param_weight_loader(param)
-            futures.append(executor.submit(weight_loader, param, fused_weight))
+            weight_loader(param, fused_weight)
             cached_a_proj.pop(q_a_proj_name)
             cached_a_proj.pop(kv_a_proj_name)
             cached_a_proj.pop(g_proj_name)
@@ -2324,242 +2317,221 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = []
-            params_dict = dict(self.named_parameters())
-            pending_indexer_wk = {}
-            weight_names = []
-            for name, loaded_weight in weights:
-                layer_id = get_layer_id(name)
-                if (
-                    layer_id is not None
-                    and not is_nextn
-                    and (
-                        layer_id < self.model.start_layer
-                        or layer_id >= self.model.end_layer
-                    )
-                ):
-                    continue
-                if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
-                    name = name.replace(
-                        "mlp.shared_experts",
-                        f"mlp.experts.{self.config.n_routed_experts}",
-                    )
+        params_dict = dict(self.named_parameters())
+        pending_indexer_wk = {}
+        weight_names = []
+        for name, loaded_weight in weights:
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and not is_nextn
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
+            if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+                name = name.replace(
+                    "mlp.shared_experts",
+                    f"mlp.experts.{self.config.n_routed_experts}",
+                )
 
-                weight_names.append(name)
+            weight_names.append(name)
 
-                if not is_nextn:
-                    num_nextn_layers = self.config.num_nextn_predict_layers
-                    if num_nextn_layers > 0 and name.startswith("model.layers"):
-                        name_list = name.split(".")
-                        if (
-                            len(name_list) >= 3
-                            and int(name_list[2]) >= self.config.num_hidden_layers
-                        ):
-                            continue
-                    # The NextN draft model owns model.mtp.* weights.
-                    if num_nextn_layers > 0 and name.startswith("model.mtp."):
+            if not is_nextn:
+                num_nextn_layers = self.config.num_nextn_predict_layers
+                if num_nextn_layers > 0 and name.startswith("model.layers"):
+                    name_list = name.split(".")
+                    if (
+                        len(name_list) >= 3
+                        and int(name_list[2]) >= self.config.num_hidden_layers
+                    ):
                         continue
+                # The NextN draft model owns model.mtp.* weights.
+                if num_nextn_layers > 0 and name.startswith("model.mtp."):
+                    continue
+            else:
+                # Remap the MTP-specific embedding into the draft model.
+                if name == "model.mtp.embed_tokens.weight":
+                    name = "model.embed_tokens.weight"
+                elif name == "model.embed_tokens.weight":
+                    # The target model owns the main embedding.
+                    continue
                 else:
-                    # Remap the MTP-specific embedding into the draft model.
-                    if name == "model.mtp.embed_tokens.weight":
-                        name = "model.embed_tokens.weight"
-                    elif name == "model.embed_tokens.weight":
-                        # The target model owns the main embedding.
+                    head_idx, matched_prefix = _match_nextn_prefix(name)
+                    if matched_prefix is None:
                         continue
-                    else:
-                        head_idx, matched_prefix = _match_nextn_prefix(name)
-                        if matched_prefix is None:
+                    # Remap an MTP head into the draft model's shared head.
+                    if "shared_head.head" in name:
+                        name = name.replace(matched_prefix, "model.shared_head.head")
+                        param = params_dict.get(name)
+                        if param is None:
                             continue
-                        # Remap an MTP head into the draft model's shared head.
-                        if "shared_head.head" in name:
+                        weight_loader = _get_param_weight_loader(param)
+                        weight_loader(param, loaded_weight)
+                        continue
+
+                    is_decoder = True
+                    # nextn-specific adapters (enorm/hnorm/eh_proj/shared_head.norm)
+                    for weight_name in nextn_spec_weight_names:
+                        if weight_name in name:
                             name = name.replace(
-                                matched_prefix, "model.shared_head.head"
+                                matched_prefix, f"model.heads.{head_idx}"
                             )
-                            param = params_dict.get(name)
-                            if param is None:
-                                continue
-                            weight_loader = _get_param_weight_loader(param)
-                            futures.append(
-                                executor.submit(weight_loader, param, loaded_weight)
-                            )
-                            continue
+                            is_decoder = False
+                            break
+                    # MTP transformer block weights — go under
+                    # model.heads.{k}.decoder.* (with shared block for "block"/"full"
+                    # sharing the duplicate writes converge on the same parameter).
+                    if is_decoder:
+                        name = name.replace(
+                            matched_prefix, f"model.heads.{head_idx}.decoder"
+                        )
 
-                        is_decoder = True
-                        # nextn-specific adapters (enorm/hnorm/eh_proj/shared_head.norm)
-                        for weight_name in nextn_spec_weight_names:
-                            if weight_name in name:
-                                name = name.replace(
-                                    matched_prefix, f"model.heads.{head_idx}"
-                                )
-                                is_decoder = False
-                                break
-                        # MTP transformer block weights — go under
-                        # model.heads.{k}.decoder.* (with shared block for "block"/"full"
-                        # sharing the duplicate writes converge on the same parameter).
-                        if is_decoder:
-                            name = name.replace(
-                                matched_prefix, f"model.heads.{head_idx}.decoder"
-                            )
+            if "rotary_emb.inv_freq" in name:
+                continue
 
-                if "rotary_emb.inv_freq" in name:
+            if (
+                ".indexer.wk." in name or ".indexer.weights_proj." in name
+            ) and _load_fused_indexer_wk(
+                name,
+                loaded_weight,
+                params_dict,
+                pending_indexer_wk,
+                self.quant_config,
+            ):
+                continue
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                # Skip non-stacked layers and experts (experts handled below).
+                if weight_name not in name:
                     continue
-
-                if (
-                    ".indexer.wk." in name or ".indexer.weights_proj." in name
-                ) and _load_fused_indexer_wk(
-                    name,
-                    loaded_weight,
-                    params_dict,
-                    pending_indexer_wk,
-                    self.quant_config,
-                ):
+                # We have mlp.experts[0].gate_proj in the checkpoint.
+                # Since we handle the experts below in expert_params_mapping,
+                # we need to skip here BEFORE we update the name, otherwise
+                # name will be updated to mlp.experts[0].gate_up_proj, which
+                # will then be updated below in expert_params_mapping
+                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                if ("mlp.experts." in name) and name not in params_dict:
                     continue
-                for param_name, weight_name, shard_id in stacked_params_mapping:
-                    # Skip non-stacked layers and experts (experts handled below).
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
-                    # We have mlp.experts[0].gate_proj in the checkpoint.
-                    # Since we handle the experts below in expert_params_mapping,
-                    # we need to skip here BEFORE we update the name, otherwise
-                    # name will be updated to mlp.experts[0].gate_up_proj, which
-                    # will then be updated below in expert_params_mapping
-                    # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                    if ("mlp.experts." in name) and name not in params_dict:
-                        continue
                     name = name.replace(weight_name, param_name)
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    futures.append(
-                        executor.submit(weight_loader, param, loaded_weight, shard_id)
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
                     )
                     break
                 else:
-                    for mapping in expert_params_mapping:
-                        param_name, weight_name, expert_id, shard_id = mapping
-                        if weight_name not in name:
-                            continue
-                        name = name.replace(weight_name, param_name)
-                        param = params_dict[name]
-                        weight_loader = param.weight_loader
-                        futures.append(
-                            executor.submit(
-                                weight_loader,
-                                param,
-                                loaded_weight,
-                                name,
-                                shard_id=shard_id,
-                                expert_id=expert_id,
-                            )
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    # Skip loading embed_tokens if not first rank in pipeline parallelism
+                    if ".embed_tokens." in name and not self.pp_group.is_first_rank:
+                        continue
+                    # Skip loading norm if not last rank in pipeline parallelism
+                    if ".norm." in name and not self.pp_group.is_last_rank:
+                        continue
+                    if (
+                        fuse_qkv_a_g_proj
+                        and ".self_attn." in name
+                        and (
+                            "q_a_proj" in name
+                            or "kv_a_proj_with_mqa" in name
+                            or "g_proj" in name
                         )
-                        break
-                    else:
-                        # Skip loading extra bias for GPTQ models.
-                        if name.endswith(".bias") and name not in params_dict:
-                            continue
-                        # Skip loading embed_tokens if not first rank in pipeline parallelism
-                        if ".embed_tokens." in name and not self.pp_group.is_first_rank:
-                            continue
-                        # Skip loading norm if not last rank in pipeline parallelism
-                        if ".norm." in name and not self.pp_group.is_last_rank:
-                            continue
-                        if (
-                            fuse_qkv_a_g_proj
-                            and ".self_attn." in name
-                            and (
-                                "q_a_proj" in name
-                                or "kv_a_proj_with_mqa" in name
-                                or "g_proj" in name
+                    ):
+                        cached_a_proj[name] = loaded_weight
+                        if "q_a_proj" in name:
+                            q_a_proj_name = name
+                            kv_a_proj_name = name.replace(
+                                "q_a_proj", "kv_a_proj_with_mqa"
                             )
-                        ):
-                            cached_a_proj[name] = loaded_weight
-                            if "q_a_proj" in name:
-                                q_a_proj_name = name
-                                kv_a_proj_name = name.replace(
-                                    "q_a_proj", "kv_a_proj_with_mqa"
-                                )
-                                g_proj_name = name.replace("q_a_proj", "g_proj")
-                                param_name = name.replace(
-                                    "q_a_proj", "fused_qkv_a_g_proj_with_mqa"
-                                )
-                            elif "kv_a_proj_with_mqa" in name:
-                                q_a_proj_name = name.replace(
-                                    "kv_a_proj_with_mqa", "q_a_proj"
-                                )
-                                kv_a_proj_name = name
-                                g_proj_name = name.replace(
-                                    "kv_a_proj_with_mqa", "g_proj"
-                                )
-                                param_name = name.replace(
-                                    "kv_a_proj_with_mqa", "fused_qkv_a_g_proj_with_mqa"
-                                )
-                            else:
-                                q_a_proj_name = name.replace("g_proj", "q_a_proj")
-                                kv_a_proj_name = name.replace(
-                                    "g_proj", "kv_a_proj_with_mqa"
-                                )
-                                g_proj_name = name
-                                param_name = name.replace(
-                                    "g_proj", "fused_qkv_a_g_proj_with_mqa"
-                                )
-
-                            cat_dim = 0
-                            if self.quant_config is not None and (
-                                self.quant_config.get_name() == "awq"
-                                or self.quant_config.get_name() == "awq_marlin"
-                                or self.quant_config.get_name() == "moe_wna16"
-                            ):
-                                cat_dim = 1
-                            _try_load_fused_qkv(
-                                q_a_proj_name,
-                                kv_a_proj_name,
-                                g_proj_name,
-                                param_name,
-                                cat_dim,
+                            g_proj_name = name.replace("q_a_proj", "g_proj")
+                            param_name = name.replace(
+                                "q_a_proj", "fused_qkv_a_g_proj_with_mqa"
+                            )
+                        elif "kv_a_proj_with_mqa" in name:
+                            q_a_proj_name = name.replace(
+                                "kv_a_proj_with_mqa", "q_a_proj"
+                            )
+                            kv_a_proj_name = name
+                            g_proj_name = name.replace("kv_a_proj_with_mqa", "g_proj")
+                            param_name = name.replace(
+                                "kv_a_proj_with_mqa", "fused_qkv_a_g_proj_with_mqa"
                             )
                         else:
-                            if (
-                                "k_scale" in name or "v_scale" in name
-                            ) and name not in params_dict:
-                                # modelopt attn kv scale is named differently
-                                for scale in ["k_scale", "v_scale"]:
-                                    if scale in name:
-                                        name = name.replace(
-                                            f"{scale[0]}_proj", "attn_mqa"
-                                        )
-                                        break
-                            if name not in params_dict:
-                                # modelopt ckpt contains not needed weights for MTP module:
-                                # model.decoder.self_attn.attn_mqa.v_scale and
-                                # model.decoder.self_attn.attn_mqa.k_scale
-                                logger.warning(f"{name} not found in params_dict.")
-                                continue
-                            param = params_dict[name]
-                            weight_loader = _get_param_weight_loader(param)
-                            futures.append(
-                                executor.submit(weight_loader, param, loaded_weight)
+                            q_a_proj_name = name.replace("g_proj", "q_a_proj")
+                            kv_a_proj_name = name.replace(
+                                "g_proj", "kv_a_proj_with_mqa"
+                            )
+                            g_proj_name = name
+                            param_name = name.replace(
+                                "g_proj", "fused_qkv_a_g_proj_with_mqa"
                             )
 
-            if fuse_qkv_a_g_proj and cached_a_proj:
-                unresolved = sorted(cached_a_proj.keys())
-                preview = ", ".join(unresolved[:6])
-                extra = f" (+{len(unresolved) - 6} more)" if len(unresolved) > 6 else ""
-                raise ValueError(
-                    "Unresolved fused q/kv/g projection weights while loading "
-                    "fused_qkv_a_g_proj_with_mqa. Missing counterparts or unexpected "
-                    f"names: {preview}{extra}"
-                )
-            if pending_indexer_wk:
-                unresolved = ", ".join(sorted(pending_indexer_wk.keys())[:6])
-                raise ValueError(
-                    "Incomplete native DSA Indexer wk weights: " + unresolved
-                )
+                        cat_dim = 0
+                        if self.quant_config is not None and (
+                            self.quant_config.get_name() == "awq"
+                            or self.quant_config.get_name() == "awq_marlin"
+                            or self.quant_config.get_name() == "moe_wna16"
+                        ):
+                            cat_dim = 1
+                        _try_load_fused_qkv(
+                            q_a_proj_name,
+                            kv_a_proj_name,
+                            g_proj_name,
+                            param_name,
+                            cat_dim,
+                        )
+                    else:
+                        if (
+                            "k_scale" in name or "v_scale" in name
+                        ) and name not in params_dict:
+                            # modelopt attn kv scale is named differently
+                            for scale in ["k_scale", "v_scale"]:
+                                if scale in name:
+                                    name = name.replace(f"{scale[0]}_proj", "attn_mqa")
+                                    break
+                        if name not in params_dict:
+                            # modelopt ckpt contains not needed weights for MTP module:
+                            # model.decoder.self_attn.attn_mqa.v_scale and
+                            # model.decoder.self_attn.attn_mqa.k_scale
+                            logger.warning(f"{name} not found in params_dict.")
+                            continue
+                        param = params_dict[name]
+                        weight_loader = _get_param_weight_loader(param)
+                        weight_loader(param, loaded_weight)
+
+        if fuse_qkv_a_g_proj and cached_a_proj:
+            unresolved = sorted(cached_a_proj.keys())
+            preview = ", ".join(unresolved[:6])
+            extra = f" (+{len(unresolved) - 6} more)" if len(unresolved) > 6 else ""
+            raise ValueError(
+                "Unresolved fused q/kv/g projection weights while loading "
+                "fused_qkv_a_g_proj_with_mqa. Missing counterparts or unexpected "
+                f"names: {preview}{extra}"
+            )
+        if pending_indexer_wk:
+            unresolved = ", ".join(sorted(pending_indexer_wk.keys())[:6])
+            raise ValueError("Incomplete native DSA Indexer wk weights: " + unresolved)
             # Wait for all tasks to complete and raise any exceptions.
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 

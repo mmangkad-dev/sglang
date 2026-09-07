@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import concurrent.futures
 import functools
 import logging
 import time
@@ -128,7 +127,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
-from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import (
     RUNAI_STREAMER_TENSOR_ATTR,
     default_weight_loader,
@@ -610,9 +608,9 @@ def deepseek_v4_attention_with_output(
     finally:
         forward_batch.out_cache_loc = original_out_cache_loc
 
-    assert output[:real_num_tokens].numel() == ret.numel(), (
-        f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
-    )
+    assert (
+        output[:real_num_tokens].numel() == ret.numel()
+    ), f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
 
     output[:real_num_tokens].view(ret.shape).copy_(ret)
     return
@@ -752,9 +750,9 @@ class MqaAttentionBase(nn.Module):
             **({} if quantize_wo_a else {"params_dtype": torch.bfloat16}),
         )
         if quantize_wo_a:
-            assert hasattr(self.wo_a, "weight_scale_inv"), (
-                "FP8 quant_config must create weight_scale_inv"
-            )
+            assert hasattr(
+                self.wo_a, "weight_scale_inv"
+            ), "FP8 quant_config must create weight_scale_inv"
         if self.use_npu_arch35_mxfp8_wo_a:
             # Read by the NPU arch35 MXFP8 weight processor to batch the
             # weight/scale per attention group for npu_transpose_quant_batchmatmul.
@@ -3579,261 +3577,214 @@ class DeepseekV4ForCausalLM(nn.Module):
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = []
-            weight_names = []
-            for name, loaded_weight in weights:
+        weight_names = []
+        for name, loaded_weight in weights:
+            if (
+                _FP8_WO_A_GEMM
+                and name.endswith(".wo_a.weight")
+                and loaded_weight.dtype != torch.float8_e4m3fn
+            ):
+                raise ValueError(
+                    f"SGLANG_OPT_FP8_WO_A_GEMM is enabled but {name} has "
+                    f"dtype {loaded_weight.dtype}, expected "
+                    "torch.float8_e4m3fn. This checkpoint does not provide "
+                    "a supported fp8-quantized wo_a; rerun with "
+                    "SGLANG_OPT_FP8_WO_A_GEMM=0."
+                )
+            try:
+
+                name = self.remap_weight_name_to_dpsk_hf_format(
+                    name,
+                    is_nextn=is_nextn,
+                    num_hidden_layers=self.config.num_hidden_layers,
+                )
+
+                layer_id = get_layer_id(name)
                 if (
-                    _FP8_WO_A_GEMM
-                    and name.endswith(".wo_a.weight")
-                    and loaded_weight.dtype != torch.float8_e4m3fn
+                    layer_id is not None
+                    and hasattr(self.model, "start_layer")
+                    and (
+                        layer_id < self.model.start_layer
+                        or layer_id >= self.model.end_layer
+                    )
                 ):
-                    raise ValueError(
-                        f"SGLANG_OPT_FP8_WO_A_GEMM is enabled but {name} has "
-                        f"dtype {loaded_weight.dtype}, expected "
-                        "torch.float8_e4m3fn. This checkpoint does not provide "
-                        "a supported fp8-quantized wo_a; rerun with "
-                        "SGLANG_OPT_FP8_WO_A_GEMM=0."
-                    )
-                try:
-                    use_async_loading = should_async_load(loaded_weight)
-
-                    name = self.remap_weight_name_to_dpsk_hf_format(
-                        name,
-                        is_nextn=is_nextn,
-                        num_hidden_layers=self.config.num_hidden_layers,
+                    continue
+                if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+                    name = name.replace(
+                        "mlp.shared_experts",
+                        f"mlp.experts.{self.config.n_routed_experts}",
                     )
 
-                    layer_id = get_layer_id(name)
-                    if (
-                        layer_id is not None
-                        and hasattr(self.model, "start_layer")
-                        and (
-                            layer_id < self.model.start_layer
-                            or layer_id >= self.model.end_layer
-                        )
-                    ):
-                        continue
-                    if (
-                        self.num_fused_shared_experts > 0
-                        and "mlp.shared_experts" in name
-                    ):
-                        name = name.replace(
-                            "mlp.shared_experts",
-                            f"mlp.experts.{self.config.n_routed_experts}",
-                        )
+                weight_names.append(name)
 
-                    weight_names.append(name)
-
-                    if not is_nextn:
-                        if hasattr(self.config, "num_nextn_predict_layers"):
-                            num_nextn_layers = self.config.num_nextn_predict_layers
-                            if num_nextn_layers > 0 and name.startswith("model.layers"):
-                                name_list = name.split(".")
-                                if (
-                                    len(name_list) >= 3
-                                    and int(name_list[2])
-                                    >= self.config.num_hidden_layers
-                                ):
-                                    continue
-
-                            if name.startswith("mtp"):
+                if not is_nextn:
+                    if hasattr(self.config, "num_nextn_predict_layers"):
+                        num_nextn_layers = self.config.num_nextn_predict_layers
+                        if num_nextn_layers > 0 and name.startswith("model.layers"):
+                            name_list = name.split(".")
+                            if (
+                                len(name_list) >= 3
+                                and int(name_list[2]) >= self.config.num_hidden_layers
+                            ):
                                 continue
-                    else:
-                        if "shared_head.head" in name or "embed_tokens" in name:
+
+                        if name.startswith("mtp"):
                             continue
-
-                        if not name.startswith(nextn_layer_prefix):
-                            continue
-
-                        in_decoder = True
-                        for weight_name in nextn_spec_weight_names_out_of_layer:
-                            if weight_name in name:
-                                in_decoder = False
-                                name = name.replace(nextn_layer_prefix, "model")
-                                break
-
-                        if in_decoder:
-                            name = name.replace(nextn_layer_prefix, "model.decoder")
-
-                    if "rotary_emb.inv_freq" in name:
+                else:
+                    if "shared_head.head" in name or "embed_tokens" in name:
                         continue
-                    for param_name, weight_name, shard_id in stacked_params_mapping:
+
+                    if not name.startswith(nextn_layer_prefix):
+                        continue
+
+                    in_decoder = True
+                    for weight_name in nextn_spec_weight_names_out_of_layer:
+                        if weight_name in name:
+                            in_decoder = False
+                            name = name.replace(nextn_layer_prefix, "model")
+                            break
+
+                    if in_decoder:
+                        name = name.replace(nextn_layer_prefix, "model.decoder")
+
+                if "rotary_emb.inv_freq" in name:
+                    continue
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    if _is_npu:
+                        name = name.replace("weight_packed", "weight")
+                    if ("mlp.experts." in name) and name not in params_dict:
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    if name not in params_dict and name.startswith("mtp"):
+                        break
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    loaded_params.add(name)
+                    break
+                else:
+                    skip_unmaterialized_expert_param = False
+                    for mapping in expert_params_mapping:
+                        param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue
                         if _is_npu:
                             name = name.replace("weight_packed", "weight")
-                        if ("mlp.experts." in name) and name not in params_dict:
+                        resolved_name = name.replace(weight_name, param_name)
+                        if resolved_name not in params_dict:
+                            skip_unmaterialized_expert_param = True
                             continue
-                        name = name.replace(weight_name, param_name)
-                        if name.endswith(".bias") and name not in params_dict:
-                            continue
-                        if name not in params_dict and name.startswith("mtp"):
-                            break
-                        param = params_dict[name]
+                        param = params_dict[resolved_name]
                         weight_loader = param.weight_loader
-                        maybe_executor_submit(
-                            executor=executor,
-                            futures=futures,
-                            use_async=use_async_loading,
-                            func=weight_loader,
-                            func_args=(param, loaded_weight, shard_id),
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            resolved_name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
                         )
-                        loaded_params.add(name)
+                        loaded_params.add(resolved_name)
                         break
                     else:
-                        skip_unmaterialized_expert_param = False
-                        for mapping in expert_params_mapping:
-                            param_name, weight_name, expert_id, shard_id = mapping
-                            if weight_name not in name:
-                                continue
-                            if _is_npu:
-                                name = name.replace("weight_packed", "weight")
-                            resolved_name = name.replace(weight_name, param_name)
-                            if resolved_name not in params_dict:
-                                skip_unmaterialized_expert_param = True
-                                continue
-                            param = params_dict[resolved_name]
-                            weight_loader = param.weight_loader
-                            maybe_executor_submit(
-                                executor=executor,
-                                futures=futures,
-                                use_async=use_async_loading,
-                                func=weight_loader,
-                                func_args=(
-                                    param,
-                                    loaded_weight,
-                                    resolved_name,
-                                ),
-                                func_kwargs={
-                                    "shard_id": shard_id,
-                                    "expert_id": expert_id,
-                                },
-                            )
-                            loaded_params.add(resolved_name)
-                            break
-                        else:
-                            if skip_unmaterialized_expert_param:
-                                continue
-                            if name.endswith(".bias") and name not in params_dict:
-                                continue
-                            if (
-                                ".embed_tokens." in name
-                                and not self.pp_group.is_first_rank
-                            ):
-                                continue
-                            if (
-                                name == "model.norm.weight"
-                                and not self.pp_group.is_last_rank
-                            ):
-                                continue
-                            if (
-                                name.startswith("model.hc_head_")
-                                or name == "lm_head.weight"
-                            ) and not self.pp_group.is_last_rank:
-                                continue
-                            elif COMPRESSOR_PART in name and ".wkv_gate." not in name:
-                                is_kv = name.endswith(".wkv.weight")
-                                is_wgate = name.endswith(".wgate.weight")
-                                assert is_kv != is_wgate
-                                key = name.rsplit(".", 2)[0]
-                                assert key.endswith(".compressor")
-                                if key not in cache_compressor_weight:
-                                    cache_compressor_weight[key] = (
-                                        is_kv,
-                                        _clone_if_runai_streamed_tensor(loaded_weight),
-                                    )
-                                else:
-                                    assert key in cache_compressor_weight
-                                    cached_is_kv, cached_weight = (
-                                        cache_compressor_weight[key]
-                                    )
-                                    assert cached_is_kv != is_kv
-                                    kv = loaded_weight if is_kv else cached_weight
-                                    wgate = loaded_weight if is_wgate else cached_weight
-                                    fused_weight = torch.cat([kv, wgate], dim=0)
-                                    param_name = key + ".wkv_gate.weight"
-                                    param = params_dict[param_name]
-                                    weight_loader = auto_weight_loader(param)
-                                    maybe_executor_submit(
-                                        executor=executor,
-                                        futures=futures,
-                                        use_async=use_async_loading,
-                                        func=weight_loader,
-                                        func_args=(param, fused_weight),
-                                    )
-                                    loaded_params.add(param_name)
-                                    cache_compressor_weight.pop(key)
-                            elif fuse_wqa_wkv and (
-                                name.endswith(".wq_a.weight")
-                                or name.endswith(".wq_a.weight_scale_inv")
-                                or name.endswith(".wkv.weight")
-                                or name.endswith(".wkv.weight_scale_inv")
-                                or name.endswith(".wq_a.qweight")
-                                or name.endswith(".wkv.qweight")
-                                or name.endswith(".wq_a.qweight_type")
-                                or name.endswith(".wkv.qweight_type")
-                            ):
-                                is_q = ".wq_a." in name
-                                param_name = name.replace(
-                                    ".wq_a." if is_q else ".wkv.", ".wqkv_a."
+                        if skip_unmaterialized_expert_param:
+                            continue
+                        if name.endswith(".bias") and name not in params_dict:
+                            continue
+                        if ".embed_tokens." in name and not self.pp_group.is_first_rank:
+                            continue
+                        if (
+                            name == "model.norm.weight"
+                            and not self.pp_group.is_last_rank
+                        ):
+                            continue
+                        if (
+                            name.startswith("model.hc_head_")
+                            or name == "lm_head.weight"
+                        ) and not self.pp_group.is_last_rank:
+                            continue
+                        elif COMPRESSOR_PART in name and ".wkv_gate." not in name:
+                            is_kv = name.endswith(".wkv.weight")
+                            is_wgate = name.endswith(".wgate.weight")
+                            assert is_kv != is_wgate
+                            key = name.rsplit(".", 2)[0]
+                            assert key.endswith(".compressor")
+                            if key not in cache_compressor_weight:
+                                cache_compressor_weight[key] = (
+                                    is_kv,
+                                    _clone_if_runai_streamed_tensor(loaded_weight),
                                 )
-                                bucket = cache_wqkv_a_weight.setdefault(param_name, {})
-                                shard_key = "q" if is_q else "kv"
-                                assert shard_key not in bucket, (
-                                    f"duplicate shard {shard_key} for {param_name}"
-                                )
-                                bucket[shard_key] = _clone_if_runai_streamed_tensor(
-                                    loaded_weight
-                                )
-                                if len(bucket) == 2:
-                                    fused_weight = _fuse_deepseek_v4_wqkv_a_pair(
-                                        param_name, bucket
-                                    )
-                                    param = params_dict[param_name]
-                                    weight_loader = auto_weight_loader(param)
-                                    maybe_executor_submit(
-                                        executor=executor,
-                                        futures=futures,
-                                        use_async=use_async_loading,
-                                        func=weight_loader,
-                                        func_args=(param, fused_weight),
-                                    )
-                                    loaded_params.add(param_name)
-                                    cache_wqkv_a_weight.pop(param_name)
                             else:
-                                if (
-                                    "k_scale" in name or "v_scale" in name
-                                ) and name not in params_dict:
-                                    for scale in ["k_scale", "v_scale"]:
-                                        if scale in name:
-                                            name = name.replace(
-                                                f"{scale[0]}_proj", "attn_mqa"
-                                            )
-                                            break
-                                if name not in params_dict:
-                                    if not name.startswith("mtp"):
-                                        logger.warning(
-                                            f"{name} not found in params_dict."
-                                        )
-                                    continue
-                                param = params_dict[name]
-
+                                assert key in cache_compressor_weight
+                                cached_is_kv, cached_weight = cache_compressor_weight[
+                                    key
+                                ]
+                                assert cached_is_kv != is_kv
+                                kv = loaded_weight if is_kv else cached_weight
+                                wgate = loaded_weight if is_wgate else cached_weight
+                                fused_weight = torch.cat([kv, wgate], dim=0)
+                                param_name = key + ".wkv_gate.weight"
+                                param = params_dict[param_name]
                                 weight_loader = auto_weight_loader(param)
-                                maybe_executor_submit(
-                                    executor=executor,
-                                    futures=futures,
-                                    use_async=use_async_loading,
-                                    func=weight_loader,
-                                    func_args=(param, loaded_weight),
+                                weight_loader(param, fused_weight)
+                                loaded_params.add(param_name)
+                                cache_compressor_weight.pop(key)
+                        elif fuse_wqa_wkv and (
+                            name.endswith(".wq_a.weight")
+                            or name.endswith(".wq_a.weight_scale_inv")
+                            or name.endswith(".wkv.weight")
+                            or name.endswith(".wkv.weight_scale_inv")
+                            or name.endswith(".wq_a.qweight")
+                            or name.endswith(".wkv.qweight")
+                            or name.endswith(".wq_a.qweight_type")
+                            or name.endswith(".wkv.qweight_type")
+                        ):
+                            is_q = ".wq_a." in name
+                            param_name = name.replace(
+                                ".wq_a." if is_q else ".wkv.", ".wqkv_a."
+                            )
+                            bucket = cache_wqkv_a_weight.setdefault(param_name, {})
+                            shard_key = "q" if is_q else "kv"
+                            assert (
+                                shard_key not in bucket
+                            ), f"duplicate shard {shard_key} for {param_name}"
+                            bucket[shard_key] = _clone_if_runai_streamed_tensor(
+                                loaded_weight
+                            )
+                            if len(bucket) == 2:
+                                fused_weight = _fuse_deepseek_v4_wqkv_a_pair(
+                                    param_name, bucket
                                 )
-                                loaded_params.add(name)
-                except Exception as e:
-                    e.add_note(f"{name=} {loaded_weight.shape=}")
-                    raise
+                                param = params_dict[param_name]
+                                weight_loader = auto_weight_loader(param)
+                                weight_loader(param, fused_weight)
+                                loaded_params.add(param_name)
+                                cache_wqkv_a_weight.pop(param_name)
+                        else:
+                            if (
+                                "k_scale" in name or "v_scale" in name
+                            ) and name not in params_dict:
+                                for scale in ["k_scale", "v_scale"]:
+                                    if scale in name:
+                                        name = name.replace(
+                                            f"{scale[0]}_proj", "attn_mqa"
+                                        )
+                                        break
+                            if name not in params_dict:
+                                if not name.startswith("mtp"):
+                                    logger.warning(f"{name} not found in params_dict.")
+                                continue
+                            param = params_dict[name]
 
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
+                            weight_loader = auto_weight_loader(param)
+                            weight_loader(param, loaded_weight)
+                            loaded_params.add(name)
+            except Exception as e:
+                e.add_note(f"{name=} {loaded_weight.shape=}")
+                raise
 
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
@@ -3897,9 +3848,9 @@ EntryClass = [DeepseekV4ForCausalLM]
 def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     from einops import rearrange
 
-    assert weight.dtype == torch.float8_e4m3fn, (
-        f"expected fp8_e4m3fn, got {weight.dtype}"
-    )
+    assert (
+        weight.dtype == torch.float8_e4m3fn
+    ), f"expected fp8_e4m3fn, got {weight.dtype}"
     assert scale.dtype in (
         torch.float8_e8m0fnu,
         torch.float32,

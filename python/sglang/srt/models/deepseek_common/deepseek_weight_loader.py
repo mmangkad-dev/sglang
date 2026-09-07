@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import concurrent.futures
 import logging
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -41,8 +40,6 @@ from sglang.srt.layers.quantization.int8_utils import (
 )
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.model_loader.utils import (
-    maybe_executor_submit,
-    should_async_load,
     should_deepgemm_weight_requant_ue8m0,
 )
 from sglang.srt.model_loader.weight_utils import (
@@ -262,251 +259,215 @@ class DeepseekV2WeightLoaderMixin:
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = []
-            params_dict = dict(self.named_parameters())
-            indexer_present_prefixes = {
-                n.rsplit(".indexer.", 1)[0] for n in params_dict if ".indexer." in n
-            }
-            weight_names = []
+        params_dict = dict(self.named_parameters())
+        indexer_present_prefixes = {
+            n.rsplit(".indexer.", 1)[0] for n in params_dict if ".indexer." in n
+        }
+        weight_names = []
 
-            for name, loaded_weight in weights:
-                use_async_loading = should_async_load(loaded_weight)
-                layer_id = get_layer_id(name)
-                if (
-                    layer_id is not None
-                    and hasattr(self.model, "start_layer")
-                    and (
-                        layer_id < self.model.start_layer
-                        or layer_id >= self.model.end_layer
-                    )
+        for name, loaded_weight in weights:
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
+            if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+                name = name.replace(
+                    "mlp.shared_experts",
+                    f"mlp.experts.{self.config.n_routed_experts}",
+                )
+
+            weight_names.append(name)
+
+            match nextn_conf:
+                case NextNEnabledConfig(
+                    nextn_layer_prefix=layer_prefix,
+                    nextn_spec_weight_names=spec_weight_names,
                 ):
+                    if not name.startswith(layer_prefix):
+                        continue
+
+                    # Use shared head and embed weights from target model
+                    if "shared_head.head" in name or "embed_tokens" in name:
+                        continue
+
+                    # Transform name: NextN-specific → "model.*", decoder → "model.decoder.*"
+                    if any(s in name for s in spec_weight_names):
+                        name = name.replace(layer_prefix, "model")
+                    else:
+                        name = name.replace(layer_prefix, "model.decoder")
+                case NextNDisabledConfig():
+                    if hasattr(self.config, "num_nextn_predict_layers"):
+                        num_nextn_layers = self.config.num_nextn_predict_layers
+                        if num_nextn_layers > 0 and name.startswith("model.layers"):
+                            name_list = name.split(".")
+                            if (
+                                len(name_list) >= 3
+                                and int(name_list[2]) >= self.config.num_hidden_layers
+                            ):
+                                continue
+
+            if _load_fused_expert_tensor(name, loaded_weight, params_dict):
+                continue
+
+            if "rotary_emb.inv_freq" in name:
+                continue
+
+            if ".indexer." in name and (
+                name.rsplit(".indexer.", 1)[0] not in indexer_present_prefixes
+            ):
+                continue
+
+            # CUDA fuses wk + weights_proj into one bf16 wk_weights_proj; the
+            # helper returns True once it has consumed the shard.
+            if (
+                ".indexer.wk." in name or ".indexer.weights_proj." in name
+            ) and _load_fused_indexer_wk(
+                name,
+                loaded_weight,
+                params_dict,
+                pending_indexer_wk,
+                self.quant_config,
+            ):
+                continue
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                # Skip non-stacked layers and experts (experts handled below).
+                if weight_name not in name:
                     continue
-                if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
-                    name = name.replace(
-                        "mlp.shared_experts",
-                        f"mlp.experts.{self.config.n_routed_experts}",
-                    )
-
-                weight_names.append(name)
-
-                match nextn_conf:
-                    case NextNEnabledConfig(
-                        nextn_layer_prefix=layer_prefix,
-                        nextn_spec_weight_names=spec_weight_names,
-                    ):
-                        if not name.startswith(layer_prefix):
-                            continue
-
-                        # Use shared head and embed weights from target model
-                        if "shared_head.head" in name or "embed_tokens" in name:
-                            continue
-
-                        # Transform name: NextN-specific → "model.*", decoder → "model.decoder.*"
-                        if any(s in name for s in spec_weight_names):
-                            name = name.replace(layer_prefix, "model")
-                        else:
-                            name = name.replace(layer_prefix, "model.decoder")
-                    case NextNDisabledConfig():
-                        if hasattr(self.config, "num_nextn_predict_layers"):
-                            num_nextn_layers = self.config.num_nextn_predict_layers
-                            if num_nextn_layers > 0 and name.startswith("model.layers"):
-                                name_list = name.split(".")
-                                if (
-                                    len(name_list) >= 3
-                                    and int(name_list[2])
-                                    >= self.config.num_hidden_layers
-                                ):
-                                    continue
-
-                if _load_fused_expert_tensor(name, loaded_weight, params_dict):
+                if _is_npu:
+                    name = name.replace("weight_packed", "weight")
+                # We have mlp.experts[0].gate_proj in the checkpoint.
+                # Since we handle the experts below in expert_params_mapping,
+                # we need to skip here BEFORE we update the name, otherwise
+                # name will be updated to mlp.experts[0].gate_up_proj, which
+                # will then be updated below in expert_params_mapping
+                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                if ("mlp.experts." in name) and name not in params_dict:
                     continue
-
-                if "rotary_emb.inv_freq" in name:
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
                     continue
-
-                if ".indexer." in name and (
-                    name.rsplit(".indexer.", 1)[0] not in indexer_present_prefixes
-                ):
-                    continue
-
-                # CUDA fuses wk + weights_proj into one bf16 wk_weights_proj; the
-                # helper returns True once it has consumed the shard.
-                if (
-                    ".indexer.wk." in name or ".indexer.weights_proj." in name
-                ) and _load_fused_indexer_wk(
-                    name,
-                    loaded_weight,
-                    params_dict,
-                    pending_indexer_wk,
-                    self.quant_config,
-                ):
-                    continue
-
-                for param_name, weight_name, shard_id in stacked_params_mapping:
-                    # Skip non-stacked layers and experts (experts handled below).
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
                     if _is_npu:
                         name = name.replace("weight_packed", "weight")
-                    # We have mlp.experts[0].gate_proj in the checkpoint.
-                    # Since we handle the experts below in expert_params_mapping,
-                    # we need to skip here BEFORE we update the name, otherwise
-                    # name will be updated to mlp.experts[0].gate_up_proj, which
-                    # will then be updated below in expert_params_mapping
-                    # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                    if ("mlp.experts." in name) and name not in params_dict:
-                        continue
                     name = name.replace(weight_name, param_name)
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if name not in params_dict:
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    maybe_executor_submit(
-                        executor=executor,
-                        futures=futures,
-                        use_async=use_async_loading,
-                        func=weight_loader,
-                        func_args=(param, loaded_weight, shard_id),
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
                     )
                     break
                 else:
-                    for mapping in expert_params_mapping:
-                        param_name, weight_name, expert_id, shard_id = mapping
-                        if weight_name not in name:
-                            continue
-                        if _is_npu:
-                            name = name.replace("weight_packed", "weight")
-                        name = name.replace(weight_name, param_name)
-                        if name not in params_dict:
-                            continue
-                        param = params_dict[name]
-                        weight_loader = param.weight_loader
-                        maybe_executor_submit(
-                            executor=executor,
-                            futures=futures,
-                            use_async=use_async_loading,
-                            func=weight_loader,
-                            func_args=(
-                                param,
-                                loaded_weight,
-                                name,
-                            ),
-                            func_kwargs={
-                                "shard_id": shard_id,
-                                "expert_id": expert_id,
-                            },
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    # Skip loading embed_tokens if not first rank in pipeline parallelism
+                    if ".embed_tokens." in name and not self.pp_group.is_first_rank:
+                        continue
+                    # Skip loading norm if not last rank in pipeline parallelism
+                    if ".norm." in name and not self.pp_group.is_last_rank:
+                        continue
+                    if fuse_qkv_a_proj and (
+                        "q_a_proj" in name or "kv_a_proj_with_mqa" in name
+                    ):
+                        cached_a_proj[name] = _clone_if_runai_streamed_tensor(
+                            loaded_weight
                         )
-                        break
-                    else:
-                        # Skip loading extra bias for GPTQ models.
-                        if name.endswith(".bias") and name not in params_dict:
-                            continue
-                        # Skip loading embed_tokens if not first rank in pipeline parallelism
-                        if ".embed_tokens." in name and not self.pp_group.is_first_rank:
-                            continue
-                        # Skip loading norm if not last rank in pipeline parallelism
-                        if ".norm." in name and not self.pp_group.is_last_rank:
-                            continue
-                        if fuse_qkv_a_proj and (
-                            "q_a_proj" in name or "kv_a_proj_with_mqa" in name
+                        q_a_proj_name = (
+                            name
+                            if "q_a_proj" in name
+                            else name.replace("kv_a_proj_with_mqa", "q_a_proj")
+                        )
+                        kv_a_proj_name = (
+                            name
+                            if "kv_a_proj_with_mqa" in name
+                            else name.replace("q_a_proj", "kv_a_proj_with_mqa")
+                        )
+
+                        # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
+                        if (
+                            q_a_proj_name in cached_a_proj
+                            and kv_a_proj_name in cached_a_proj
                         ):
-                            cached_a_proj[name] = _clone_if_runai_streamed_tensor(
-                                loaded_weight
-                            )
-                            q_a_proj_name = (
-                                name
+                            q_a_proj_weight = cached_a_proj[q_a_proj_name]
+                            kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+
+                            if q_a_proj_weight.shape == torch.Size(
+                                []
+                            ) and kv_a_proj_weight.shape == torch.Size([]):
+                                fused_weight = q_a_proj_weight
+                            else:
+                                cat_dim = 0
+                                if self.quant_config is not None and (
+                                    self.quant_config.get_name() == "awq"
+                                    or self.quant_config.get_name() == "awq_marlin"
+                                    or self.quant_config.get_name() == "moe_wna16"
+                                ):
+                                    cat_dim = 1
+
+                                fused_weight = torch.cat(
+                                    [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
+                                )
+
+                            param_name = (
+                                name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
                                 if "q_a_proj" in name
-                                else name.replace("kv_a_proj_with_mqa", "q_a_proj")
+                                else name.replace(
+                                    "kv_a_proj_with_mqa",
+                                    "fused_qkv_a_proj_with_mqa",
+                                )
                             )
-                            kv_a_proj_name = (
-                                name
-                                if "kv_a_proj_with_mqa" in name
-                                else name.replace("q_a_proj", "kv_a_proj_with_mqa")
-                            )
+                            param = params_dict[param_name]
 
-                            # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
-                            if (
-                                q_a_proj_name in cached_a_proj
-                                and kv_a_proj_name in cached_a_proj
-                            ):
-                                q_a_proj_weight = cached_a_proj[q_a_proj_name]
-                                kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-
-                                if q_a_proj_weight.shape == torch.Size(
-                                    []
-                                ) and kv_a_proj_weight.shape == torch.Size([]):
-                                    fused_weight = q_a_proj_weight
-                                else:
-                                    cat_dim = 0
-                                    if self.quant_config is not None and (
-                                        self.quant_config.get_name() == "awq"
-                                        or self.quant_config.get_name() == "awq_marlin"
-                                        or self.quant_config.get_name() == "moe_wna16"
-                                    ):
-                                        cat_dim = 1
-
-                                    fused_weight = torch.cat(
-                                        [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
-                                    )
-
-                                param_name = (
-                                    name.replace(
-                                        "q_a_proj", "fused_qkv_a_proj_with_mqa"
-                                    )
-                                    if "q_a_proj" in name
-                                    else name.replace(
-                                        "kv_a_proj_with_mqa",
-                                        "fused_qkv_a_proj_with_mqa",
-                                    )
-                                )
-                                param = params_dict[param_name]
-
-                                weight_loader = getattr(
-                                    param, "weight_loader", default_weight_loader
-                                )
-                                maybe_executor_submit(
-                                    executor=executor,
-                                    futures=futures,
-                                    use_async=use_async_loading,
-                                    func=weight_loader,
-                                    func_args=(param, fused_weight),
-                                )
-                                cached_a_proj.pop(q_a_proj_name)
-                                cached_a_proj.pop(kv_a_proj_name)
-                        else:
-                            if (
-                                "k_scale" in name or "v_scale" in name
-                            ) and name not in params_dict:
-                                # modelopt attn kv scale is named differently
-                                for scale in ["k_scale", "v_scale"]:
-                                    if scale in name:
-                                        name = name.replace(
-                                            f"{scale[0]}_proj", "attn_mqa"
-                                        )
-                                        break
-                            if name not in params_dict:
-                                # modelopt ckpt contains not needed weights for MTP module:
-                                # model.decoder.self_attn.attn_mqa.v_scale and
-                                # model.decoder.self_attn.attn_mqa.k_scale
-                                logger.warning(f"{name} not found in params_dict.")
-                                continue
-                            param = params_dict[name]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
-                            maybe_executor_submit(
-                                executor=executor,
-                                futures=futures,
-                                use_async=use_async_loading,
-                                func=weight_loader,
-                                func_args=(param, loaded_weight),
-                            )
+                            weight_loader(param, fused_weight)
+                            cached_a_proj.pop(q_a_proj_name)
+                            cached_a_proj.pop(kv_a_proj_name)
+                    else:
+                        if (
+                            "k_scale" in name or "v_scale" in name
+                        ) and name not in params_dict:
+                            # modelopt attn kv scale is named differently
+                            for scale in ["k_scale", "v_scale"]:
+                                if scale in name:
+                                    name = name.replace(f"{scale[0]}_proj", "attn_mqa")
+                                    break
+                        if name not in params_dict:
+                            # modelopt ckpt contains not needed weights for MTP module:
+                            # model.decoder.self_attn.attn_mqa.v_scale and
+                            # model.decoder.self_attn.attn_mqa.k_scale
+                            logger.warning(f"{name} not found in params_dict.")
+                            continue
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
 
             # Wait for all tasks to complete and raise any exceptions.
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
