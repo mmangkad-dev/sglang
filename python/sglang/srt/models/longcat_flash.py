@@ -1101,8 +1101,6 @@ class LongcatFlashForCausalLM(nn.Module):
                         )
                         weight_loader(param, loaded_weight)
 
-            # Wait for all tasks to complete and raise any exceptions.
-
         self.post_load_weights(weight_names=weight_names)
 
     def get_embed_and_head(self):

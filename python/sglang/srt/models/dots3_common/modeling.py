@@ -2531,7 +2531,6 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         if pending_indexer_wk:
             unresolved = ", ".join(sorted(pending_indexer_wk.keys())[:6])
             raise ValueError("Incomplete native DSA Indexer wk weights: " + unresolved)
-            # Wait for all tasks to complete and raise any exceptions.
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 

@@ -467,8 +467,6 @@ class DeepseekV2WeightLoaderMixin:
                         )
                         weight_loader(param, loaded_weight)
 
-            # Wait for all tasks to complete and raise any exceptions.
-
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
     def _initialize_nextn_conf(self, is_nextn: bool) -> NextNConfig:
