@@ -86,6 +86,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     grow_multi_ctas_kv_counter_buffer_if_needed,
     make_persistent_multi_ctas_kv_counter_buffer,
+    trim_ragged_rows_to_mirrors,
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_v2_active
@@ -3149,7 +3150,26 @@ class DeepseekSparseAttnBackend(
                 }
             else:
                 row_check_kwargs = {}
-            return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+            out = padded_out = None
+            if "q_seq_lens_cpu" in row_check_kwargs:
+                out = torch.empty(
+                    q.shape[0],
+                    layer.tp_q_head_num,
+                    layer.v_head_dim,
+                    dtype=q.dtype,
+                    device=q.device,
+                )
+                q, k, v, trimmed_out, trimmed = trim_ragged_rows_to_mirrors(
+                    q=q,
+                    k=k,
+                    v=v,
+                    out=out,
+                    q_seq_lens_cpu=metadata.mha_q_seq_lens_cpu,
+                    kv_seq_lens_cpu=metadata.mha_kv_seq_lens_cpu,
+                )
+                if trimmed:
+                    padded_out, out = out, trimmed_out
+            result = flashinfer.prefill.trtllm_ragged_attention_deepseek(
                 query=q,
                 key=k,
                 value=v,
@@ -3167,9 +3187,12 @@ class DeepseekSparseAttnBackend(
                 enable_pdl=False,
                 is_causal=causal,
                 return_lse=False,
+                out=out,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
                 **row_check_kwargs,
             )
+            # Callers index the output by the padded query rows.
+            return result if padded_out is None else padded_out
 
         # Use FA3 for SM90 (Hopper/H200)
         return flash_attn_varlen_func(

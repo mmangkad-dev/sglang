@@ -171,6 +171,30 @@ class TRTLLMMLAPrefillMetadata:
     fallback_to_flashinfer_impl: bool = False
 
 
+def trim_ragged_rows_to_mirrors(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    q_seq_lens_cpu: torch.Tensor,
+    kv_seq_lens_cpu: torch.Tensor,
+):
+    # The ragged wrapper requires the host mirrors to sum to the packed rows,
+    # but TP/DP padding can leave the buffers longer than that span.
+    num_q_tokens = int(q_seq_lens_cpu.sum())
+    num_kv_tokens = int(kv_seq_lens_cpu.sum())
+    if num_q_tokens == q.shape[0] and num_kv_tokens == k.shape[0]:
+        return q, k, v, out, False
+    return (
+        q[:num_q_tokens],
+        k[:num_kv_tokens],
+        v[:num_kv_tokens],
+        out[:num_q_tokens],
+        True,
+    )
+
+
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
 # Arm PDL on the trtllm-gen decode launch so its prolog overlaps the tail of
@@ -1130,13 +1154,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 "q_seq_lens_cpu": q_seq_lens_cpu,
                 "kv_seq_lens_cpu": kv_seq_lens_cpu,
             }
-            # The mirrors must sum to the packed rows,
-            # but TP/DP padding can leave the buffers longer than that span.
-            num_q_tokens = int(q_seq_lens_cpu.sum())
-            num_kv_tokens = int(kv_seq_lens_cpu.sum())
-            if num_q_tokens != q.shape[0] or num_kv_tokens != k.shape[0]:
-                padded_out, out_buffer = out_buffer, out_buffer[:num_q_tokens]
-                q, k, v = q[:num_q_tokens], k[:num_kv_tokens], v[:num_kv_tokens]
+            q, k, v, trimmed_out, trimmed = trim_ragged_rows_to_mirrors(
+                q=q,
+                k=k,
+                v=v,
+                out=out_buffer,
+                q_seq_lens_cpu=q_seq_lens_cpu,
+                kv_seq_lens_cpu=kv_seq_lens_cpu,
+            )
+            if trimmed:
+                padded_out, out_buffer = out_buffer, trimmed_out
                 if return_lse:
                     padded_lse = torch.empty(
                         padded_out.shape[0],
@@ -1144,7 +1171,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                         dtype=torch.float32,
                         device=padded_out.device,
                     )
-                    row_check_kwargs["lse"] = padded_lse[:num_q_tokens]
+                    row_check_kwargs["lse"] = padded_lse[: out_buffer.shape[0]]
         result = flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=q,
             key=k,

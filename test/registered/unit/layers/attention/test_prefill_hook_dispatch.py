@@ -8,6 +8,7 @@ rows actually handed to the kernel, which TP/DP padding otherwise breaks.
 
 import ast
 import inspect
+import sys
 import types
 import unittest
 from pathlib import Path
@@ -16,6 +17,10 @@ from unittest import mock
 import torch
 
 from sglang.srt.layers.attention import trtllm_mla_backend
+from sglang.srt.layers.attention.dsa_backend import (
+    DeepseekSparseAttnBackend,
+    DSAMetadata,
+)
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -159,6 +164,79 @@ class TestPaddedQueryBuffer(CustomTestCase):
         )
         self.assertEqual(kernel.query_rows, 15)
         self.assertEqual(out.shape[0], 15)
+
+
+class TestDsaPaddedQueryBuffer(CustomTestCase):
+    """DSA one-shot MHA must trim a padded query before mirroring its lengths.
+
+    A TBO split can leave an empty query row while attention-TP padding grows
+    the buffer, and the unsliced lengths then fail the wrapper's sum check.
+    """
+
+    def _run(self, *, padded_rows, q_lens, kv_lens):
+        backend = object.__new__(DeepseekSparseAttnBackend)
+        backend.device_sm_major = 10
+        backend.workspace_buffer = None
+        backend.use_mha = True
+        kernel = _RecordingKernel()
+        stub = types.ModuleType("flashinfer")
+        stub.prefill = types.SimpleNamespace(trtllm_ragged_attention_deepseek=kernel)
+        heads, head_dim, v_head_dim = 2, 4, 4
+        layer = types.SimpleNamespace(
+            tp_q_head_num=heads,
+            tp_k_head_num=heads,
+            tp_v_head_num=heads,
+            head_dim=head_dim,
+            v_head_dim=v_head_dim,
+            scaling=1.0,
+        )
+        num_kv = int(kv_lens.sum())
+        metadata = DSAMetadata(
+            page_size=64,
+            cache_seqlens_int32=None,
+            max_seq_len_q=int(q_lens.max()),
+            max_seq_len_k=int(kv_lens.max()),
+            cu_seqlens_q=torch.zeros(q_lens.numel() + 1, dtype=torch.int32),
+            cu_seqlens_k=torch.zeros(kv_lens.numel() + 1, dtype=torch.int32),
+            page_table_1=None,
+            real_page_table=None,
+            dsa_cache_seqlens_int32=None,
+            dsa_cu_seqlens_q=None,
+            dsa_cu_seqlens_k=None,
+            dsa_extend_seq_lens_list=q_lens.tolist(),
+            dsa_seqlens_expanded=None,
+            mha_q_seq_lens_cpu=q_lens,
+            mha_kv_seq_lens_cpu=kv_lens,
+            mha_all_rows_active=False,
+        )
+        with mock.patch.dict(sys.modules, {"flashinfer": stub}):
+            out = backend._forward_standard_mha(
+                torch.zeros(padded_rows * heads * head_dim),
+                torch.zeros(num_kv * heads * head_dim),
+                torch.zeros(num_kv * heads * v_head_dim),
+                layer,
+                types.SimpleNamespace(batch_size=q_lens.numel()),
+                metadata,
+            )
+        return kernel, out
+
+    def test_padded_buffer_is_trimmed_and_returned_padded(self):
+        kernel, out = self._run(
+            padded_rows=8,
+            q_lens=torch.tensor([7, 0], dtype=torch.int32),
+            kv_lens=torch.tensor([11, 4], dtype=torch.int32),
+        )
+        self.assertEqual(kernel.query_rows, 7)
+        self.assertEqual(out.shape[0], 8)
+
+    def test_unpadded_buffer_is_passed_through(self):
+        kernel, out = self._run(
+            padded_rows=7,
+            q_lens=torch.tensor([7, 0], dtype=torch.int32),
+            kv_lens=torch.tensor([11, 4], dtype=torch.int32),
+        )
+        self.assertEqual(kernel.query_rows, 7)
+        self.assertEqual(out.shape[0], 7)
 
 
 if __name__ == "__main__":
