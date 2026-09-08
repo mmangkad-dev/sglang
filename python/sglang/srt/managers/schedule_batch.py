@@ -92,7 +92,7 @@ from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, _is_fake_transfer
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -1273,13 +1273,14 @@ class Req(ReqDllmMixin):
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
-        # A fake-bootstrap request's KV is only real on the prefill side, where
-        # a normal forward computes it. On the decode side the fake transfer
-        # writes nothing and no forward covers the input positions, so a radix
-        # insert would publish uninitialized slots to the tree.
+        # A fake-transfer request's KV is real only on the prefill side,
+        # where a normal forward computes it.
+        # On decode, matched or restored positions hold real KV,
+        # but the rest were never written,
+        # so a radix insert would publish the uninitialized slots.
+        # Prefill inserts stay enabled for isolated-prefill stress traffic.
         self.skip_radix_cache_insert = (
-            bootstrap_host == FAKE_BOOTSTRAP_HOST
-            and get_disagg().disaggregation_mode == "decode"
+            disagg_mode == DisaggregationMode.DECODE and _is_fake_transfer(self)
         )
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 

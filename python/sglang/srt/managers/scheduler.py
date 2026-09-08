@@ -3324,6 +3324,7 @@ class Scheduler(
             time_stats=recv_req.time_stats,
             return_pooled_hidden_states=recv_req.return_pooled_hidden_states,
             multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+            disagg_mode=self.disaggregation_mode,
         )
         req.tokenizer = self.tokenizer
         self._maybe_namespace_elastic_radix_cache(req)
