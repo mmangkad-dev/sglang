@@ -971,7 +971,6 @@ class Req(ReqDllmMixin):
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
-        disable_radix_cache: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -1274,8 +1273,13 @@ class Req(ReqDllmMixin):
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.
         self.pd_rebootstrap_forced_output_id: Optional[int] = None
+        # A fake-bootstrap request's KV is only real on the prefill side, where
+        # a normal forward computes it. On the decode side the fake transfer
+        # writes nothing and no forward covers the input positions, so a radix
+        # insert would publish uninitialized slots to the tree.
         self.skip_radix_cache_insert = (
-            bootstrap_host == FAKE_BOOTSTRAP_HOST and disable_radix_cache
+            bootstrap_host == FAKE_BOOTSTRAP_HOST
+            and get_disagg().disaggregation_mode == "decode"
         )
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
