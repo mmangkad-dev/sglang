@@ -25,9 +25,8 @@ def _make_req(**kwargs) -> Req:
 
 class TestFakeTransferRadixInsertSkip(unittest.TestCase):
     """A decode-side fake-transfer request must never be radix-inserted:
-    its non-matched KV positions were never written. Prefill-side
-    fake-transfer requests and real-transfer decode requests stay
-    insertable."""
+    its non-matched input positions were never written.
+    Prefill-side fake-transfer and real-transfer decode requests stay insertable."""
 
     def test_decode_fake_bootstrap_request_skips_radix_insert(self):
         req = _make_req(
