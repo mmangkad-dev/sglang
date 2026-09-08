@@ -195,7 +195,7 @@ def _poll_with_failure_injection(pollers) -> List[int]:
     return [int(poller.poll()) for poller in pollers]
 
 
-def _is_fake_transfer(req: Req) -> bool:
+def is_fake_transfer(req: Req) -> bool:
     return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
         req.bootstrap_host is None
         and get_disagg().disaggregation_transfer_backend == "fake"
@@ -211,7 +211,7 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
     for i, poll_val in enumerate(polls):
         if poll_val == int(KVPoll.Success):
             decode_req = decode_reqs[i]
-            if _is_fake_transfer(decode_req.req):
+            if is_fake_transfer(decode_req.req):
                 continue
             actual_room = metadata_buffers.bootstrap_room[
                 decode_req.metadata_buffer_index, 0
