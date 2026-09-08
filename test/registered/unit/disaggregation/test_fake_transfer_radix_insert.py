@@ -6,6 +6,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -23,7 +24,7 @@ def _make_req(**kwargs) -> Req:
     )
 
 
-class TestFakeTransferRadixInsertSkip(unittest.TestCase):
+class TestFakeTransferRadixInsertSkip(CustomTestCase):
     """A decode-side fake-transfer request must never be radix-inserted:
     its non-matched input positions were never written.
     Prefill-side fake-transfer and real-transfer decode requests stay insertable."""
