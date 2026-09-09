@@ -18,6 +18,9 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
+from sglang.srt.layers.quantization.fp8_postload import (
+    process_fp8_linear_after_loading,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_fp8_ptpc_linear,
@@ -27,15 +30,12 @@ from sglang.srt.layers.quantization.fp8_utils import (
     requant_block_scale_ue8m0_for_deepgemm,
     validate_fp8_block_shape,
 )
-from sglang.srt.layers.quantization.utils import requantize_with_max_scale
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-if _use_aiter:
-    from aiter.ops.shuffle import shuffle_weight
 
 
 strategy_to_parameter_type = {
@@ -144,49 +144,12 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
 
     def process_weights_after_loading(self, layer) -> None:
         if self.strategy == QuantizationStrategy.TENSOR:
-            max_w_scale, weight = requantize_with_max_scale(
-                weight=layer.weight,
-                weight_scale=layer.weight_scale,
-                logical_widths=layer.logical_widths,
-            )
-
-            if is_fp8_fnuz():
-                input_scale = getattr(layer, "input_scale", None)
-
-                weight, max_w_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=weight, weight_scale=max_w_scale, input_scale=input_scale
-                )
-                if input_scale is not None:
-                    layer.input_scale = Parameter(input_scale, requires_grad=False)
-            layer.weight = Parameter(weight.t(), requires_grad=False)
-            layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+            process_fp8_linear_after_loading(layer, granularity="tensor")
 
         elif self.strategy == QuantizationStrategy.CHANNEL:
-            weight = layer.weight
-
-            if is_fp8_fnuz():
-                input_scale = getattr(layer, "input_scale", None)
-
-                weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=weight,
-                    weight_scale=layer.weight_scale,
-                    input_scale=input_scale,
-                )
-                if input_scale is not None:
-                    layer.input_scale = Parameter(input_scale, requires_grad=False)
-            else:
-                weight_scale = layer.weight_scale.data
-
-            if _use_aiter:
-                # keep the weight as (N, K)
-                layer.weight = Parameter(
-                    shuffle_weight(weight, (16, 16)), requires_grad=False
-                )
-            else:
-                layer.weight = Parameter(weight.t(), requires_grad=False)
-
-            # required by torch.compile to be torch.nn.Parameter
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+            process_fp8_linear_after_loading(
+                layer, granularity="channel", aiter_shuffle=_use_aiter
+            )
 
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False

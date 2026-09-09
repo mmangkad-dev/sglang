@@ -7,7 +7,6 @@ from torch.nn.parameter import Parameter
 
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
-    is_fp8_fnuz,
     per_token_group_quant_fp8,
 )
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
@@ -19,11 +18,13 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp8_postload import (
+    process_fp8_linear_after_loading,
+)
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
     input_to_float8,
-    normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.utils import set_weight_attrs
 
@@ -32,8 +33,6 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
-
-_is_fp8_fnuz = is_fp8_fnuz()
 
 
 class W8A8Fp8Config(QuantizationConfig):
@@ -106,18 +105,10 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        weight = layer.weight
-
         if self.quantization_config.is_checkpoint_fp8_serialized:
-            weight_scale = layer.weight_scale.detach()
-            # If checkpoint offline quantized with w8a8_fp8, load the weight and weight_scale directly.
-            if _is_fp8_fnuz:
-                weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=weight, weight_scale=weight_scale
-                )
-
-            layer.weight = Parameter(weight.t(), requires_grad=False)
-            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+            # If checkpoint offline quantized with w8a8_fp8, load the weight and
+            # weight_scale directly. The scales are already per output channel.
+            process_fp8_linear_after_loading(layer, granularity="channel")
         else:
             # If checkpoint not offline quantized, quantize the weights with per-channel quantization.
             if self.cutlass_fp8_supported:
