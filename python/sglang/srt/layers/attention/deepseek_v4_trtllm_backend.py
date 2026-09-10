@@ -73,71 +73,113 @@ def _trtllm_query_row_capacity() -> int:
     return max(rows, 1)
 
 
+# FlashInfer's counter allocator is patched once per process. The hook holds no
+# reference to any owner -- it resolves the current one from the resources slot
+# on each call -- so an engine rebuild drops its owner and buffers without
+# leaving a retained closure or stacking a second layer of dispatch.
+_ALLOCATOR_HOOK = None
+_FLASHINFER_COUNTER_ALLOCATOR = None
+
+
+def _flashinfer_counter_allocator():
+    """FlashInfer's own allocator, memoized before any interception."""
+    global _FLASHINFER_COUNTER_ALLOCATOR
+    if _FLASHINFER_COUNTER_ALLOCATOR is None:
+        import flashinfer.mla._core as fi_core
+
+        _FLASHINFER_COUNTER_ALLOCATOR = (
+            fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer
+        )
+    return _FLASHINFER_COUNTER_ALLOCATOR
+
+
+def _install_counter_allocator_hook() -> None:
+    """Route DSv4 counter allocations to the current owner, once per process.
+
+    Idempotent by identity, not by a flag: a caller that restores FlashInfer's
+    attribute (a test tearing down its patch) gets the hook reinstalled rather
+    than silently losing it to a stale "already installed" bool. Only ever one
+    dispatch object exists, so reinstalling cannot stack a second layer.
+    """
+    global _ALLOCATOR_HOOK
+    import flashinfer.mla._core as fi_core
+
+    if fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer is _ALLOCATOR_HOOK:
+        return
+    original = _flashinfer_counter_allocator()
+
+    if _ALLOCATOR_HOOK is None:
+
+        def dispatch(batch_size, num_qo_heads, sm_count, device):
+            owner = get_resources().trtllm_dsv4_kv_counter
+            if owner is None or not owner.launch_in_flight:
+                # Not a DSv4 launch (or no engine owns one): leave FlashInfer's
+                # per-caller allocation alone so concurrent MLA callers in the
+                # process keep their own counters.
+                return original(batch_size, num_qo_heads, sm_count, device)
+            return owner.buffer_for(
+                num_qo_heads=num_qo_heads, sm_count=sm_count, device=device
+            )
+
+        _ALLOCATOR_HOOK = dispatch
+
+    fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer = _ALLOCATOR_HOOK
+
+
 class TrtllmKvCounterOwner:
-    """Owns the trtllm-gen sparse-MLA multi-CTA KV counter buffer.
+    """Owns the trtllm-gen sparse-MLA multi-CTA KV counter buffers.
 
-    FlashInfer sizes that private buffer from the ``batch_size`` it is handed,
-    which for decode is exactly the query-row count. Varlen prefill is the
-    outlier: ``trtllm_batch_decode_sparse_mla_dsv4`` passes the *request*
-    count as ``batch_size`` while the VarSeq launcher reshapes
+    FlashInfer sizes that private buffer from the ``batch_size`` it is handed
+    and allocates a fresh one per call. Two things make that unsuitable here.
+    Varlen prefill is under-sized: ``trtllm_batch_decode_sparse_mla_dsv4``
+    passes the *request* count while the VarSeq launcher reshapes
     ``sparse_indices`` to one row per query token and indexes the counters by
-    query row -- so a prefill chunk needs ``sum_q`` rows, not ``len(reqs)``.
+    query row, so a chunk needs ``sum_q`` rows. And a fresh zeroed buffer per
+    call is wasted work on the decode path -- the kernel resets the counters
+    itself, and inside a captured graph the memset replays every step.
 
-    Until FlashInfer accepts a caller-owned buffer, we intercept its
-    allocator, but only for the launches that actually need more rows than
-    ``batch_size``: the backend brackets those with ``launch_rows()``, and
-    every other caller -- DSv4 decode, and any unrelated MLA wrapper in the
-    process -- keeps FlashInfer's own per-caller allocation. Buffer, row
-    bound, and interception live on one ``get_resources()`` slot, so
-    ``reset_context()`` drops them together and a second engine in the same
-    process cannot inherit a buffer sized for the first.
+    So every DSv4 launch is bracketed by ``dsv4_launch()`` and served one
+    persistent buffer per counter geometry, sized by the configured row bound;
+    unrelated MLA callers keep FlashInfer's own allocation. Buffers and the
+    bound live on a ``get_resources()`` slot, so ``reset_context()`` drops them
+    with the engine that sized them.
     """
 
     def __init__(self) -> None:
         # Capacity in query rows: sum_q for prefill, requests x draft tokens
         # for decode.
         self.capacity_rows: int = 0
-        self._buf: Optional[torch.Tensor] = None
-        self._buf_rows: int = 0
-        # Remembered from the first allocation so reserve() can regrow without
-        # waiting for another launch to supply the counter geometry.
-        self._buf_device: Optional[torch.device] = None
-        self._num_qo_heads: int = 0
-        self._sm_count: int = 0
-        self._installed: bool = False
-        # FlashInfer's own allocator, captured before the interception so
-        # _allocate() cannot recurse back into the patched name.
-        self._original_allocator = None
-        # Row count of the launch currently being issued, or None outside one.
-        self._launch_rows: Optional[int] = None
+        # (device, num_qo_heads, sm_count) -> buffer, each sized for
+        # _allocated_rows. Keyed because a draft runner may launch a different
+        # head count than its target, and rekeying must not thrash one slot.
+        self._buffers: dict = {}
+        self._allocated_rows: int = 0
+        self._launch_depth: int = 0
 
     # --- capacity ---------------------------------------------------------
 
     def reserve(self, capacity_rows: int) -> None:
-        """Raise the row bound, regrowing an already-allocated buffer to match."""
+        """Raise the row bound, regrowing already-allocated buffers to match."""
         if capacity_rows > self.capacity_rows:
             self.capacity_rows = capacity_rows
-            if self._buf is not None and self._buf_rows < self.capacity_rows:
+            if self._buffers and self._allocated_rows < self.capacity_rows:
                 # A later runner (a draft backend, a second engine) raised the
-                # bound after the buffer existed. Regrow now, while we are
+                # bound after the buffers existed. Regrow now, while we are
                 # outside graph capture, so no launch can pass check() against
                 # a bound the allocation does not cover.
-                self._allocate(
-                    device=self._buf_device,
-                    num_qo_heads=self._num_qo_heads,
-                    sm_count=self._sm_count,
-                )
-        self._install()
+                for key in list(self._buffers):
+                    self._allocate(*key)
+        _install_counter_allocator_hook()
 
     def check(self, num_rows: int) -> None:
-        """Reject a launch the counter buffer cannot cover.
+        """Reject a launch the counter buffers cannot cover.
 
         A plain exception, not an assert: an over-capacity launch scribbles
-        past the buffer, so this must fire even under ``python -O``. Once a
-        buffer exists, the bound that matters is the one it was sized for --
+        past the buffer, so this must fire even under ``python -O``. Once
+        buffers exist, the bound that matters is the one they were sized for --
         not the one that was merely requested.
         """
-        bound = self._buf_rows if self._buf is not None else self.capacity_rows
+        bound = self._allocated_rows if self._buffers else self.capacity_rows
         if num_rows > bound:
             raise RuntimeError(
                 f"trtllm-gen launch with {num_rows} query rows exceeds the "
@@ -147,22 +189,28 @@ class TrtllmKvCounterOwner:
                 "lower --chunked-prefill-size."
             )
 
-    @contextmanager
-    def launch_rows(self, num_rows: int):
-        """Bracket a launch whose counter rows exceed its ``batch_size``.
+    # --- launches ---------------------------------------------------------
 
-        Only inside this scope does the interception hand out our buffer, so
-        concurrent unrelated MLA callers keep their own.
+    @property
+    def launch_in_flight(self) -> bool:
+        return self._launch_depth > 0
+
+    @contextmanager
+    def dsv4_launch(self, num_rows: int):
+        """Bracket a DSv4 launch so the hook serves it a persistent buffer.
+
+        Every DSv4 launch is bracketed, decode included: whether the launch
+        exceeds FlashInfer's own sizing decides the *capacity* it needs, not
+        whether it may reuse a buffer.
         """
         self.check(num_rows)
-        previous = self._launch_rows
-        self._launch_rows = num_rows
+        self._launch_depth += 1
         try:
             yield
         finally:
-            self._launch_rows = previous
+            self._launch_depth -= 1
 
-    # --- buffer -----------------------------------------------------------
+    # --- buffers ----------------------------------------------------------
 
     def _allocate(
         self, device: torch.device, num_qo_heads: int, sm_count: int
@@ -177,68 +225,27 @@ class TrtllmKvCounterOwner:
         # The kernel resets the counters to zero at the end of every launch, so
         # a zero-initialized buffer stays reusable across launches without
         # re-zeroing (FlashInfer documents this on the original allocator).
-        self._buf = self._flashinfer_allocator()(rows, num_qo_heads, sm_count, device)
-        self._buf_rows = rows
-        self._buf_device = device
-        self._num_qo_heads = num_qo_heads
-        self._sm_count = sm_count
+        buf = _flashinfer_counter_allocator()(rows, num_qo_heads, sm_count, device)
+        self._buffers[(device, num_qo_heads, sm_count)] = buf
+        self._allocated_rows = rows
         logger.info(
-            "trtllm-gen multi-CTA counters: %d bytes for %d query rows on %s "
-            "(flashinfer sizes varlen prefill by request count; the DSv4 "
-            "VarSeq launcher indexes by query row).",
-            self._buf.numel(),
+            "trtllm-gen multi-CTA counters: %d bytes for %d query rows, "
+            "%d heads on %s; reused across DSv4 launches.",
+            buf.numel(),
             rows,
+            num_qo_heads,
             device,
         )
-        return self._buf
+        return buf
 
-    def _buffer_for(
-        self, num_qo_heads: int, sm_count: int, device: torch.device
+    def buffer_for(
+        self, *, num_qo_heads: int, sm_count: int, device: torch.device
     ) -> torch.Tensor:
-        """Get-or-grow the buffer for one launch's counter geometry."""
-        if (
-            self._buf is None
-            or self._buf_device != device
-            or self._num_qo_heads != num_qo_heads
-            or self._sm_count != sm_count
-            or self._buf_rows < self.capacity_rows
-        ):
-            return self._allocate(
-                device=device, num_qo_heads=num_qo_heads, sm_count=sm_count
-            )
-        return self._buf
-
-    # --- interception -----------------------------------------------------
-
-    def _flashinfer_allocator(self):
-        """FlashInfer's unpatched allocator."""
-        if self._original_allocator is None:
-            import flashinfer.mla._core as fi_core
-
-            self._original_allocator = (
-                fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer
-            )
-        return self._original_allocator
-
-    def _install(self) -> None:
-        if self._installed:
-            return
-        import flashinfer.mla._core as fi_core
-
-        original = self._flashinfer_allocator()
-
-        def patched(batch_size, num_qo_heads, sm_count, device):
-            rows = self._launch_rows
-            if rows is None or rows <= batch_size:
-                # Not one of our under-sized launches: FlashInfer's own sizing
-                # covers it, so leave its per-caller allocation alone.
-                return original(batch_size, num_qo_heads, sm_count, device)
-            return self._buffer_for(
-                num_qo_heads=num_qo_heads, sm_count=sm_count, device=device
-            )
-
-        fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer = patched
-        self._installed = True
+        """Get-or-grow the persistent buffer for one launch's counter geometry."""
+        buf = self._buffers.get((device, num_qo_heads, sm_count))
+        if buf is None or self._allocated_rows < self.capacity_rows:
+            return self._allocate(device, num_qo_heads, sm_count)
+        return buf
 
 
 def get_trtllm_kv_counter_owner() -> TrtllmKvCounterOwner:
@@ -454,23 +461,24 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             seq_lens = seq_lens[:bs]
         assert attn_sink.dtype == torch.float32
         assert self.trtllm_workspace_buffer is not None
-        # Decode passes one query row per request, so flashinfer's own
-        # counter sizing already covers it; only the bound is checked.
-        self.trtllm_kv_counters.check(bs)
 
-        out = trtllm_batch_decode_sparse_mla_dsv4(
-            query=q_fp8,
-            swa_kv_cache=swa_kv_cache,
-            workspace_buffer=self.trtllm_workspace_buffer,
-            sparse_indices=sparse_indices,
-            compressed_kv_cache=compressed_kv_cache,
-            sparse_topk_lens=sparse_topk_lens,
-            seq_lens=seq_lens,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
-            sinks=attn_sink,
-            kv_layout="HND",
-        )
+        # Bracketed like prefill: decode needs no extra rows, but it must still
+        # reuse the persistent counters rather than take a fresh zeroed buffer
+        # per layer (whose memset would replay inside the captured graph).
+        with self.trtllm_kv_counters.dsv4_launch(bs):
+            out = trtllm_batch_decode_sparse_mla_dsv4(
+                query=q_fp8,
+                swa_kv_cache=swa_kv_cache,
+                workspace_buffer=self.trtllm_workspace_buffer,
+                sparse_indices=sparse_indices,
+                compressed_kv_cache=compressed_kv_cache,
+                sparse_topk_lens=sparse_topk_lens,
+                seq_lens=seq_lens,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                sinks=attn_sink,
+                kv_layout="HND",
+            )
         if out_pad_tail is not None:
             out_pad_tail[:bs] = out.view(bs, num_heads, 512)
             return out_pad_tail
@@ -606,9 +614,8 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             )
             out_arg = out_padded[:sum_q]
 
-        # Varlen prefill is the one launch whose counter rows (sum_q) exceed
-        # the batch_size flashinfer sizes from, so it needs our buffer.
-        with self.trtllm_kv_counters.launch_rows(sum_q):
+        # sum_q rows, above the request count flashinfer would size from.
+        with self.trtllm_kv_counters.dsv4_launch(sum_q):
             out = trtllm_batch_decode_sparse_mla_dsv4(
                 query=q_fp8,
                 swa_kv_cache=swa_kv_cache,

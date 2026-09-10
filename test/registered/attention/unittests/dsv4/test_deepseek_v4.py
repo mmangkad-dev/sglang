@@ -648,12 +648,12 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertGreaterEqual(_trtllm_query_row_capacity(), 8192 * 4)
 
     def test_trtllm_counter_check_rejects_launch_past_the_allocation(self):
-        """A raised bound must not license launches the buffer cannot cover.
+        """A raised bound must not license launches the buffers cannot cover.
 
-        reserve() regrows an existing buffer, so check() is answered by what
-        was allocated. Were it answered by the requested capacity, a second
-        engine in the same process could raise the bound and wave through
-        launches that overrun the first engine's buffer.
+        reserve() regrows existing buffers, so check() is answered by what was
+        allocated. Were it answered by the requested capacity, a second engine
+        in the same process could raise the bound and wave through launches
+        that overrun the first engine's buffers.
         """
         from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
             TrtllmKvCounterOwner,
@@ -665,31 +665,136 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "exceeds the persistent"):
             owner.check(65)
 
-        # Stand in for an allocation that only covers 64 rows, then raise the
+        # Stand in for allocations that only cover 64 rows, then raise the
         # bound the way a later backend construction would.
-        owner._buf = torch.empty(1, dtype=torch.uint8)
-        owner._buf_rows = 64
+        owner._buffers[("cpu", 64, 1)] = torch.empty(1, dtype=torch.uint8)
+        owner._allocated_rows = 64
         owner.capacity_rows = 4096
         with self.assertRaisesRegex(RuntimeError, "capacity of 64 rows"):
             owner.check(65)
 
-    def test_trtllm_counter_owner_lives_on_the_resources_slot(self):
-        """reset_context() must drop the buffer with the engine that sized it."""
+    def _restore_flashinfer_counter_allocator(self):
+        """Undo the process-wide allocator hook so later tests see it clean."""
+        import flashinfer.mla._core as fi_core
+
+        from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
+
+        pristine = trtllm._flashinfer_counter_allocator()
+        self.addCleanup(
+            setattr,
+            fi_core,
+            "_get_trtllm_gen_multi_ctas_kv_counter_buffer",
+            pristine,
+        )
+
+    def test_trtllm_counter_hook_does_not_retain_owners_across_resets(self):
+        """The allocator hook must not keep a dead engine's owner alive.
+
+        BUG REGRESSION. A hook closing over its owner meant reset_context()
+        left that closure installed; the next owner then captured it as its
+        "original allocator", so every rebuild retained another owner (and its
+        counter buffers) and added another layer of dispatch.
+        """
+        import gc
+        import weakref
+
+        import flashinfer.mla._core as fi_core
+
         from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
             get_trtllm_kv_counter_owner,
         )
-        from sglang.srt.runtime_context import get_resources, reset_context
+        from sglang.srt.runtime_context import reset_context
+
+        self._restore_flashinfer_counter_allocator()
+        self.addCleanup(reset_context)
+
+        from sglang.srt.runtime_context import get_resources
 
         owner = get_trtllm_kv_counter_owner()
-        owner.capacity_rows = 12345
         self.assertIs(get_trtllm_kv_counter_owner(), owner)
         self.assertIs(get_resources().trtllm_dsv4_kv_counter, owner)
+        owner.reserve(64)  # installs the hook
+        owner.buffer_for(num_qo_heads=8, sm_count=1, device=torch.device("cuda:0"))
+        hook = fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer
+        buffer_ref = weakref.ref(next(iter(owner._buffers.values())))
+        owner_ref = weakref.ref(owner)
+        del owner
 
+        reset_context()
+        gc.collect()
+        self.assertIsNone(owner_ref(), "the allocator hook retained the owner")
+        self.assertIsNone(buffer_ref(), "the counter buffer outlived its owner")
+
+        fresh = get_trtllm_kv_counter_owner()
+        self.assertEqual(fresh.capacity_rows, 0, "the new owner inherited a bound")
+        fresh.reserve(128)
+        self.assertIs(
+            fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer,
+            hook,
+            "a second dispatch layer was installed on rebuild",
+        )
+
+    def test_trtllm_counters_are_reused_by_every_dsv4_launch(self):
+        """Decode must reuse the persistent counters, not take a fresh buffer.
+
+        BUG REGRESSION. Serving the buffer only to launches whose rows exceed
+        their batch_size excluded decode, verify and draft-extend, so each of
+        those took a freshly zeroed buffer per layer -- and the memset replayed
+        on every captured-graph decode step. Reuse is not conditional on
+        needing extra rows; only capacity is.
+        """
+        import flashinfer.mla._core as fi_core
+
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            get_trtllm_kv_counter_owner,
+        )
+        from sglang.srt.runtime_context import reset_context
+
+        self._restore_flashinfer_counter_allocator()
         self.addCleanup(reset_context)
         reset_context()
-        fresh = get_trtllm_kv_counter_owner()
-        self.assertIsNot(fresh, owner)
-        self.assertEqual(fresh.capacity_rows, 0)
+
+        device = torch.device("cuda:0")
+        owner = get_trtllm_kv_counter_owner()
+        owner.reserve(4096)
+        hook = fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer
+
+        # rows == batch_size is the decode shape: still one persistent buffer.
+        with owner.dsv4_launch(8):
+            first = hook(8, 8, 1, device)
+            second = hook(8, 8, 1, device)
+        self.assertEqual(first.data_ptr(), second.data_ptr())
+
+        # rows > batch_size is the varlen-prefill shape: the same buffer.
+        with owner.dsv4_launch(4096):
+            prefill = hook(8, 8, 1, device)
+        self.assertEqual(first.data_ptr(), prefill.data_ptr())
+
+        # Outside a DSv4 launch, an unrelated MLA caller keeps its own buffer.
+        outside = hook(8, 8, 1, device)
+        self.assertNotEqual(first.data_ptr(), outside.data_ptr())
+
+    def test_trtllm_counter_buffers_are_keyed_by_counter_geometry(self):
+        """A draft runner's head count must not evict the target's buffer."""
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            get_trtllm_kv_counter_owner,
+        )
+        from sglang.srt.runtime_context import reset_context
+
+        self._restore_flashinfer_counter_allocator()
+        self.addCleanup(reset_context)
+        reset_context()
+
+        device = torch.device("cuda:0")
+        owner = get_trtllm_kv_counter_owner()
+        owner.reserve(256)
+        wide = owner.buffer_for(num_qo_heads=64, sm_count=1, device=device)
+        narrow = owner.buffer_for(num_qo_heads=8, sm_count=1, device=device)
+        self.assertNotEqual(wide.data_ptr(), narrow.data_ptr())
+        self.assertEqual(
+            wide.data_ptr(),
+            owner.buffer_for(num_qo_heads=64, sm_count=1, device=device).data_ptr(),
+        )
 
     def test_sparse_prefill_workspace_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
