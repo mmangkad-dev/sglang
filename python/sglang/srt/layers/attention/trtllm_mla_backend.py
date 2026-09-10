@@ -1233,9 +1233,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         full-head metadata can overflow the trtllm-gen workspace (and on
         multi-node GB300 has also produced NVLink errors). Real requests
         and CUDA-graph capture must not take this path.
-
-        ``q`` is token-major, so its leading dim is the row count the
-        caller expects back.
         """
         output = torch.zeros(
             (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
@@ -1484,16 +1481,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
             )
 
-        # Same early return as forward_decode: target verify reaches that same
-        # DCP decode kernel, and its autotune sweep is sized independently of
-        # the batch in hand, so it profiles the replicated full-head Q well
-        # past anything servable.
+        # Verify reaches the DCP decode kernel forward_decode already skips;
+        # its autotune sweep is sized independently of the batch in hand.
         if (
             forward_batch.forward_mode.is_target_verify()
             and get_parallel().dcp_enabled
             and get_in_autotune_dummy_run()
         ):
-            return self._dummy_dcp_decode_for_autotune(q, layer)
+            return self._dummy_dcp_decode_for_autotune(q=q, layer=layer)
 
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
