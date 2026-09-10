@@ -1225,10 +1225,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
     def _dummy_dcp_decode_for_autotune(
-        self,
-        q: torch.Tensor,
-        layer: RadixAttention,
-        num_tokens: Optional[int] = None,
+        self, q: torch.Tensor, layer: RadixAttention
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Skip decode during FlashInfer MoE autotune dummy forwards.
 
@@ -1237,18 +1234,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         multi-node GB300 has also produced NVLink errors). Real requests
         and CUDA-graph capture must not take this path.
 
-        ``num_tokens`` is required where ``q`` is request-major
-        ``[bs, draft_token_num, ...]``; token-major callers leave it None.
+        ``q`` is token-major, so its leading dim is the row count the
+        caller expects back.
         """
-        if num_tokens is None:
-            num_tokens = q.shape[0]
         output = torch.zeros(
-            (num_tokens, layer.tp_q_head_num * layer.v_head_dim),
+            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
             dtype=self.q_data_type,
             device=q.device,
         )
         lse = torch.zeros(
-            (num_tokens, layer.tp_q_head_num),
+            (q.shape[0], layer.tp_q_head_num),
             dtype=torch.float32,
             device=q.device,
         )
@@ -1489,6 +1484,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
             )
 
+        # Same early return as forward_decode: target verify reaches that same
+        # DCP decode kernel, and its autotune sweep is sized independently of
+        # the batch in hand, so it profiles the replicated full-head Q well
+        # past anything servable.
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and get_parallel().dcp_enabled
+            and get_in_autotune_dummy_run()
+        ):
+            return self._dummy_dcp_decode_for_autotune(q, layer)
+
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
         if (
@@ -1662,14 +1668,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch.forward_mode.is_target_verify()
                 and get_parallel().dcp_enabled
             ):
-                # Same skip as forward_decode: verify reaches that same DCP
-                # kernel, and its autotune sweep is sized independently of the
-                # batch in hand, so it profiles the replicated full-head Q well
-                # past anything servable.
-                if get_in_autotune_dummy_run():
-                    return self._dummy_dcp_decode_for_autotune(
-                        q, layer, num_tokens=bs * draft_token_num
-                    )
                 raw_out, lse = self._run_decode_kernel(
                     query=q,
                     kv_cache=kv_cache,

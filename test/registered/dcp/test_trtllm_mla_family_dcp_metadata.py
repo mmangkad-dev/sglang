@@ -549,20 +549,23 @@ class TestDcpDecodeLayout(CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "forward_extend allocates on CUDA")
-class TestDcpTargetVerifySkipsAutotuneDecode(CustomTestCase):
+class _DcpVerifyAutotuneSkipTests:
     """Target verify must skip the DCP decode kernel during autotune.
 
     Verify reaches the same kernel ``forward_decode`` already skips, so the
-    autotune dummy pass must not run it there either.
+    autotune dummy pass must not run it there either. Asserted on the
+    subclasses that serve DCP verify: the base ``_run_decode_kernel``
+    refuses it, so only their overrides ever reach the kernel.
     """
 
+    backend_cls = None
     BS = 2
     HEADS = 16
     HEAD_DIM = 576
     V_HEAD_DIM = 512
 
     def _make_backend(self):
-        backend = object.__new__(TRTLLMMLABackend)
+        backend = object.__new__(self.backend_cls)
         backend.data_type = torch.bfloat16
         backend.q_data_type = torch.bfloat16
         backend.kv_cache_dim = self.HEAD_DIM
@@ -675,6 +678,16 @@ class TestDcpTargetVerifySkipsAutotuneDecode(CustomTestCase):
             tuple(output.shape),
             (self.BS * NUM_DRAFT_TOKENS, self.HEADS * self.V_HEAD_DIM),
         )
+
+
+class TestCuteDslMLADcpVerifyAutotuneSkip(_DcpVerifyAutotuneSkipTests, CustomTestCase):
+    backend_cls = CuteDslMLABackend
+
+
+class TestTokenspeedMLADcpVerifyAutotuneSkip(
+    _DcpVerifyAutotuneSkipTests, CustomTestCase
+):
+    backend_cls = TokenspeedMLABackend
 
 
 if __name__ == "__main__":
