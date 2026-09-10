@@ -1225,7 +1225,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
     def _dummy_dcp_decode_for_autotune(
-        self, q: torch.Tensor, layer: RadixAttention
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        num_tokens: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Skip decode during FlashInfer MoE autotune dummy forwards.
 
@@ -1233,14 +1236,19 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         full-head metadata can overflow the trtllm-gen workspace (and on
         multi-node GB300 has also produced NVLink errors). Real requests
         and CUDA-graph capture must not take this path.
+
+        ``num_tokens`` is required where ``q`` is request-major
+        ``[bs, draft_token_num, ...]``; token-major callers leave it None.
         """
+        if num_tokens is None:
+            num_tokens = q.shape[0]
         output = torch.zeros(
-            (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+            (num_tokens, layer.tp_q_head_num * layer.v_head_dim),
             dtype=self.q_data_type,
             device=q.device,
         )
         lse = torch.zeros(
-            (q.shape[0], layer.tp_q_head_num),
+            (num_tokens, layer.tp_q_head_num),
             dtype=torch.float32,
             device=q.device,
         )
@@ -1654,6 +1662,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_batch.forward_mode.is_target_verify()
                 and get_parallel().dcp_enabled
             ):
+                # Same skip as forward_decode: verify reaches that same DCP
+                # kernel, and its autotune sweep is sized independently of the
+                # batch in hand, so it profiles the replicated full-head Q well
+                # past anything servable.
+                if get_in_autotune_dummy_run():
+                    return self._dummy_dcp_decode_for_autotune(
+                        q, layer, num_tokens=bs * draft_token_num
+                    )
                 raw_out, lse = self._run_decode_kernel(
                     query=q,
                     kv_cache=kv_cache,

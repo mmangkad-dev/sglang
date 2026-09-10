@@ -548,5 +548,134 @@ class TestDcpDecodeLayout(CustomTestCase):
                 self.assertEqual(grew[(global_len - 1) % n], 1)
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "forward_extend allocates on CUDA")
+class TestDcpTargetVerifySkipsAutotuneDecode(CustomTestCase):
+    """Target verify must skip the DCP decode kernel during autotune.
+
+    Verify reaches the same kernel ``forward_decode`` already skips, so the
+    autotune dummy pass must not run it there either.
+    """
+
+    BS = 2
+    HEADS = 16
+    HEAD_DIM = 576
+    V_HEAD_DIM = 512
+
+    def _make_backend(self):
+        backend = object.__new__(TRTLLMMLABackend)
+        backend.data_type = torch.bfloat16
+        backend.q_data_type = torch.bfloat16
+        backend.kv_cache_dim = self.HEAD_DIM
+        backend.page_size = 64
+        backend.forward_prefill_metadata = None
+        backend._decode_kernel_loc = None
+        backend.num_draft_tokens = NUM_DRAFT_TOKENS
+        backend.dense_q_indptr_verify = torch.arange(
+            0,
+            (self.BS + 1) * NUM_DRAFT_TOKENS,
+            NUM_DRAFT_TOKENS,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _layer_id: torch.zeros(
+                (4 * backend.page_size, self.HEAD_DIM),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+        )
+        return backend
+
+    def _call(self, *, in_autotune):
+        backend = self._make_backend()
+        num_tokens = self.BS * NUM_DRAFT_TOKENS
+        metadata = TRTLLMMLADecodeMetadata(
+            block_kv_indices=torch.zeros(
+                (self.BS, 4), dtype=torch.int32, device="cuda"
+            ),
+            seq_lens_k=torch.ones(self.BS, dtype=torch.int32, device="cuda"),
+            global_seq_lens_k=torch.ones(self.BS, dtype=torch.int32, device="cuda"),
+            max_seq_len_k=64,
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=self.BS,
+            decode_trtllm_mla_metadata=metadata,
+            spec_info=SimpleNamespace(
+                draft_token_num=NUM_DRAFT_TOKENS, ragged_verify_layout=None
+            ),
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=self.HEADS,
+            head_dim=self.HEAD_DIM,
+            v_head_dim=self.V_HEAD_DIM,
+            scaling=1.0,
+            k_scale_float=None,
+        )
+        parallel = SimpleNamespace(
+            dcp_enabled=True, dcp_size=DCP_SIZE, dcp_rank=DCP_RANK
+        )
+        calls = []
+
+        def fake_kernel(**kwargs):
+            calls.append(kwargs)
+            return (
+                torch.zeros(
+                    (self.BS, NUM_DRAFT_TOKENS, self.HEADS, self.V_HEAD_DIM),
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                ),
+                torch.zeros(
+                    (self.BS, NUM_DRAFT_TOKENS, self.HEADS),
+                    dtype=torch.float32,
+                    device="cuda",
+                ),
+            )
+
+        with (
+            patch.object(backend_module, "get_parallel", return_value=parallel),
+            patch.object(
+                backend_module, "get_in_autotune_dummy_run", return_value=in_autotune
+            ),
+            patch.object(backend, "_run_decode_kernel", side_effect=fake_kernel),
+            patch.object(backend_module, "fixup_zero_kv_rows", lambda *a, **k: None),
+        ):
+            output, lse = backend.forward_extend(
+                q=torch.zeros(
+                    (num_tokens, self.HEADS, self.HEAD_DIM),
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                ),
+                k=None,
+                v=None,
+                layer=layer,
+                forward_batch=forward_batch,
+                save_kv_cache=False,
+            )
+        return calls, output, lse
+
+    def test_autotune_dummy_pass_does_not_run_the_decode_kernel(self):
+        calls, output, lse = self._call(in_autotune=True)
+        self.assertEqual(calls, [])
+        # The caller reshapes this result, so the dummy must be token-major
+        # over bs * draft_token_num -- not the request-major q it is built from.
+        self.assertEqual(
+            tuple(output.shape),
+            (self.BS * NUM_DRAFT_TOKENS, self.HEADS * self.V_HEAD_DIM),
+        )
+        self.assertEqual(tuple(lse.shape), (self.BS * NUM_DRAFT_TOKENS, self.HEADS))
+
+    def test_real_verify_still_runs_the_decode_kernel(self):
+        # The skip must key on the autotune pass only; a real target verify
+        # under DCP still has to reach the kernel.
+        calls, output, lse = self._call(in_autotune=False)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            tuple(output.shape),
+            (self.BS * NUM_DRAFT_TOKENS, self.HEADS * self.V_HEAD_DIM),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
