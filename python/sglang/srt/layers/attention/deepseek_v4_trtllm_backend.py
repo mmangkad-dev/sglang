@@ -159,17 +159,38 @@ class TrtllmKvCounterOwner:
     # --- capacity ---------------------------------------------------------
 
     def reserve(self, capacity_rows: int) -> None:
-        """Raise the row bound, regrowing already-allocated buffers to match."""
-        if capacity_rows > self.capacity_rows:
-            self.capacity_rows = capacity_rows
-            if self._buffers and self._allocated_rows < self.capacity_rows:
-                # A later runner (a draft backend, a second engine) raised the
-                # bound after the buffers existed. Regrow now, while we are
-                # outside graph capture, so no launch can pass check() against
-                # a bound the allocation does not cover.
-                for key in list(self._buffers):
-                    self._allocate(*key)
+        """Raise the row bound, regrowing already-allocated buffers to match.
+
+        Growth is all-or-nothing. ``_allocated_rows`` is one bound shared by
+        every geometry, so publishing it (or the new capacity) before all the
+        replacements exist would let ``check()`` admit a launch that some
+        geometry's buffer is still too small for -- and, because the capacity
+        had already advanced, a retry would decline to re-attempt the growth.
+        Both the buffers and the bound are therefore swapped in only once every
+        allocation has succeeded; a failure leaves the previous consistent pair
+        in place for the retry. Peak footprint during the swap is both
+        generations of buffers, a few MiB.
+        """
         _install_counter_allocator_hook()
+        if capacity_rows <= self.capacity_rows:
+            return
+        if self._buffers and self._allocated_rows < capacity_rows:
+            # A later runner (a draft backend, a second engine) raised the
+            # bound after the buffers existed. Regrow now, while we are outside
+            # graph capture, so no launch can pass check() against a bound the
+            # allocation does not cover.
+            grown = {
+                key: self._new_buffer(
+                    rows=capacity_rows,
+                    device=key[0],
+                    num_qo_heads=key[1],
+                    sm_count=key[2],
+                )
+                for key in self._buffers
+            }
+            self._buffers = grown
+            self._allocated_rows = capacity_rows
+        self.capacity_rows = capacity_rows
 
     def check(self, num_rows: int) -> None:
         """Reject a launch the counter buffers cannot cover.
@@ -212,22 +233,29 @@ class TrtllmKvCounterOwner:
 
     # --- buffers ----------------------------------------------------------
 
-    def _allocate(
-        self, device: torch.device, num_qo_heads: int, sm_count: int
+    def _new_buffer(
+        self,
+        *,
+        rows: int,
+        device: torch.device,
+        num_qo_heads: int,
+        sm_count: int,
     ) -> torch.Tensor:
+        """Allocate one counter buffer, publishing no owner state.
+
+        Kept free of side effects so callers can decide when a set of
+        allocations becomes visible -- see reserve()'s all-or-nothing growth.
+        """
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "the trtllm-gen multi-CTA counter buffer must be created "
                 "outside cuda-graph capture; it is normally allocated during "
                 "eager warmup"
             )
-        rows = max(self.capacity_rows, 1)
         # The kernel resets the counters to zero at the end of every launch, so
         # a zero-initialized buffer stays reusable across launches without
         # re-zeroing (FlashInfer documents this on the original allocator).
         buf = _flashinfer_counter_allocator()(rows, num_qo_heads, sm_count, device)
-        self._buffers[(device, num_qo_heads, sm_count)] = buf
-        self._allocated_rows = rows
         logger.info(
             "trtllm-gen multi-CTA counters: %d bytes for %d query rows, "
             "%d heads on %s; reused across DSv4 launches.",
@@ -241,10 +269,25 @@ class TrtllmKvCounterOwner:
     def buffer_for(
         self, *, num_qo_heads: int, sm_count: int, device: torch.device
     ) -> torch.Tensor:
-        """Get-or-grow the persistent buffer for one launch's counter geometry."""
-        buf = self._buffers.get((device, num_qo_heads, sm_count))
-        if buf is None or self._allocated_rows < self.capacity_rows:
-            return self._allocate(device, num_qo_heads, sm_count)
+        """Get-or-create the persistent buffer for one launch's counter geometry.
+
+        A geometry seen for the first time is allocated at the current bound;
+        raising the bound for geometries already present is reserve()'s job, so
+        every live buffer covers ``_allocated_rows``.
+        """
+        key = (device, num_qo_heads, sm_count)
+        buf = self._buffers.get(key)
+        if buf is not None:
+            return buf
+        rows = max(self.capacity_rows, 1)
+        buf = self._new_buffer(
+            rows=rows,
+            device=device,
+            num_qo_heads=num_qo_heads,
+            sm_count=sm_count,
+        )
+        self._buffers[key] = buf
+        self._allocated_rows = rows
         return buf
 
 

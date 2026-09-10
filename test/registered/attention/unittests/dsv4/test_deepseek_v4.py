@@ -774,6 +774,67 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         outside = hook(8, 8, 1, device)
         self.assertNotEqual(first.data_ptr(), outside.data_ptr())
 
+    def test_trtllm_counter_growth_is_all_or_nothing(self):
+        """A failed resize must not leave a bound no buffer can back.
+
+        BUG REGRESSION. _allocated_rows is one bound shared by every geometry,
+        and it was published per allocation: an OOM while growing the second
+        buffer left the bound raised, so check() admitted launches the second
+        buffer was still half the size for -- and because the capacity had also
+        advanced, a retry declined to re-attempt the growth.
+        """
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            TrtllmKvCounterOwner,
+        )
+
+        class _FlakyOwner(TrtllmKvCounterOwner):
+            """Fails the nth allocation, then allocates normally."""
+
+            def __init__(self, fail_on):
+                super().__init__()
+                self.fail_on = fail_on
+                self.allocations = 0
+
+            def _new_buffer(self, **kwargs):
+                self.allocations += 1
+                if self.allocations == self.fail_on:
+                    raise torch.cuda.OutOfMemoryError("injected")
+                return super()._new_buffer(**kwargs)
+
+        device = torch.device("cuda:0")
+        # Two geometries, then fail the second of the two growth allocations.
+        owner = _FlakyOwner(fail_on=4)
+        owner.reserve(64)
+        owner.buffer_for(num_qo_heads=8, sm_count=1, device=device)
+        owner.buffer_for(num_qo_heads=16, sm_count=1, device=device)
+        before = {k: v.numel() for k, v in owner._buffers.items()}
+
+        with self.assertRaises(torch.cuda.OutOfMemoryError):
+            owner.reserve(128)
+
+        # The owner must still describe what it actually holds.
+        self.assertEqual(owner.capacity_rows, 64)
+        self.assertEqual({k: v.numel() for k, v in owner._buffers.items()}, before)
+        owner.check(64)
+        with self.assertRaisesRegex(RuntimeError, "capacity of 64 rows"):
+            owner.check(128)
+
+        # And the retry must re-attempt the whole growth.
+        owner.fail_on = None
+        owner.reserve(128)
+        owner.check(128)
+        reference = _FlakyOwner(fail_on=None)
+        reference.reserve(128)
+        for (dev, heads, sm), buf in owner._buffers.items():
+            want = reference.buffer_for(
+                num_qo_heads=heads, sm_count=sm, device=dev
+            ).numel()
+            self.assertEqual(
+                buf.numel(),
+                want,
+                f"{heads}-head buffer still undersized after the retry",
+            )
+
     def test_trtllm_counter_buffers_are_keyed_by_counter_geometry(self):
         """A draft runner's head count must not evict the target's buffer."""
         from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
