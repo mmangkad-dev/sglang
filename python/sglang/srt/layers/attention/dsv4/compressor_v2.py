@@ -1,6 +1,15 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Literal, Optional, TypeAlias, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    TypeAlias,
+    Union,
+    cast,
+)
 
 import torch
 
@@ -327,78 +336,22 @@ class CompressorBackendMixin:
         layer_id: int,
     ) -> None:
         """HIP-specific forward path using PyTorch/Triton fallbacks."""
-        from sglang.kernels.ops.attention.deepseek_v4_rope import (
-            fused_norm_rope_inplace_triton,
-        )
         from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 
-        compress_ratio = compressor.ratio
-        head_dim = compressor.head_dim
-        is_indexer = compressor.is_in_indexer
-
-        plan = self._get_paged_compress_metadata(compress_ratio)
-        out_loc = self._get_out_loc(compress_ratio)
-
-        # Step 1: compress_forward (always use JIT for both C4 and C128)
-        coff = 2 if is_overlap_compress(compress_ratio) else 1
-        last_dim = 2 * head_dim * coff
-        kv_score_buffer = state_pool.kv_score_buffer.kv_score
-        kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
-
-        kv_compressed = compress_forward(
-            kv_score_buffer=kv_score_buffer,
+        prepared = prepare_unfused_compress_store(
+            backend=self,
             kv_score_input=kv_score_input,
-            ape=compressor.ape.view(-1, head_dim),
-            plan=plan,
-            compress_ratio=compress_ratio,
-            head_dim=head_dim,
-            is_online=False,
+            state_pool=state_pool,
+            compressor=compressor,
         )
-
-        if kv_compressed.shape[0] == 0:
+        if prepared is None:
             return
+        kv_to_store, out_loc_to_store = prepared
 
-        # For decode: zero out non-boundary tokens to prevent corrupting kvcache loc 0.
-        if plan.is_decode:
-            plan_raw = plan[1].view(torch.int32)
-            seq_lens_plan = plan_raw[:, 0].to(torch.int32)
-            is_boundary = (seq_lens_plan % compress_ratio == 0).unsqueeze(-1)
-            kv_compressed = torch.where(
-                is_boundary, kv_compressed, torch.zeros_like(kv_compressed)
-            )
-
-        # Step 2: norm + rope (Triton fallback for precision parity with V1)
-        positions = _extract_positions_from_plan(plan, compress_ratio)
-        positions_safe = positions.clamp(min=0)
-
-        fused_norm_rope_inplace_triton(
-            kv_compressed,
-            compressor.norm.weight,
-            compressor.norm.variance_epsilon,
-            compressor.freqs_cis,
-            positions=positions_safe,
-        )
-
-        # Step 3: optional Hadamard rotation for indexer
         if compressor.rotate:
-            kv_compressed = rotate_activation(kv_compressed)
+            kv_to_store = rotate_activation(kv_to_store)
 
-        # Step 4: store to kvcache
-        # For decode: store ALL tokens. Non-boundary tokens have out_loc=0 (safe).
-        # For prefill: plan_c already only contains valid entries.
-        if plan.is_decode:
-            kv_to_store = kv_compressed
-            out_loc_to_store = out_loc
-        else:
-            kv_to_store = kv_compressed
-            plan_raw = plan[1].view(torch.int32)
-            ragged_ids = plan_raw[:, 1].to(torch.int32) & 0xFFFF
-            out_loc_to_store = out_loc[ragged_ids.long()]
-
-        if kv_to_store.shape[0] == 0:
-            return
-
-        if is_indexer:
+        if compressor.is_in_indexer:
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,
                 loc=out_loc_to_store,
@@ -414,6 +367,87 @@ class CompressorBackendMixin:
     # NOTE: alias for backward compatibility
     forward_indexer_compressor = forward_unified
     forward_core_compressor = forward_unified
+
+
+def prepare_unfused_compress_store(
+    *,
+    backend,
+    kv_score_input: torch.Tensor,
+    state_pool,
+    compressor: Compressor,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Compress, neutralize rows with no write target, then norm + RoPE.
+
+    The shared body of the two unfused compressor stores (HIP fallbacks and
+    the uniform-FP8 trtllm pool); the fused CUDA epilogue writes the packed
+    FlashMLA layout and does none of this. Returns ``(kv_compressed, out_loc)``
+    ready for a ``set_*_fused`` setter, or ``None`` when the plan produced no
+    rows.
+
+    Rows the plan marks as having no write target -- decode non-boundary
+    tokens, and prefill plan entries the breakable CUDA graph's static shapes
+    pad out -- are zeroed and pointed at the reserved slot 0, which the
+    allocators never hand out (allocator/paged.py:clear). Without that, a
+    padded prefill row's ragged id is garbage and indexes ``out_loc`` out of
+    bounds.
+    """
+    from sglang.kernels.ops.attention.deepseek_v4_rope import (
+        fused_norm_rope_inplace_triton,
+    )
+
+    compress_ratio = compressor.ratio
+    head_dim = compressor.head_dim
+
+    plan = backend._get_paged_compress_metadata(compress_ratio)
+    out_loc = backend._get_out_loc(compress_ratio)
+
+    coff = 2 if is_overlap_compress(compress_ratio) else 1
+    kv_score_buffer = state_pool.kv_score_buffer.kv_score.view(
+        -1, compress_ratio, 2 * head_dim * coff
+    )
+
+    kv_compressed = compress_forward(
+        kv_score_buffer=kv_score_buffer,
+        kv_score_input=kv_score_input,
+        ape=compressor.ape.view(-1, head_dim),
+        plan=plan,
+        compress_ratio=compress_ratio,
+        head_dim=head_dim,
+        is_online=False,
+    )
+    if kv_compressed.shape[0] == 0:
+        return None
+
+    plan_raw = plan[1].view(torch.int32)
+    if plan.is_decode:
+        seq_lens_plan = plan_raw[:, 0].to(torch.int32)
+        is_boundary = (seq_lens_plan % compress_ratio == 0).unsqueeze(-1)
+        kv_compressed = torch.where(
+            is_boundary, kv_compressed, torch.zeros_like(kv_compressed)
+        )
+        # Non-boundary decode rows already carry out_loc 0.
+        out_loc_to_store = out_loc
+    else:
+        valid = plan_raw[:, 0] != -1
+        kv_compressed = torch.where(
+            valid.unsqueeze(-1), kv_compressed, torch.zeros_like(kv_compressed)
+        )
+        ragged_ids = plan_raw[:, 1].to(torch.int32) & 0xFFFF
+        safe_ragged_ids = torch.where(valid, ragged_ids, torch.zeros_like(ragged_ids))
+        mapped_out_loc = out_loc[safe_ragged_ids.long()]
+        out_loc_to_store = torch.where(
+            valid, mapped_out_loc, torch.zeros_like(mapped_out_loc)
+        )
+
+    positions = _extract_positions_from_plan(plan, compress_ratio).clamp(min=0)
+    fused_norm_rope_inplace_triton(
+        kv_compressed,
+        compressor.norm.weight,
+        compressor.norm.variance_epsilon,
+        compressor.freqs_cis,
+        positions=positions,
+    )
+    return kv_compressed, out_loc_to_store
 
 
 def is_overlap_compress(compress_ratio: int) -> bool:

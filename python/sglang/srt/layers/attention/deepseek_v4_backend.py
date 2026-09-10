@@ -199,10 +199,14 @@ class DSV4AttnMetadata:
     trtllm_c4_lens: Optional[torch.Tensor] = None
     trtllm_c128_indices: Optional[torch.Tensor] = None
     trtllm_c128_lens: Optional[torch.Tensor] = None
-    # Lazy eager-prefill caches: qmeta and per-ratio combined tables.
+    # Lazy eager-prefill caches: qmeta and per-ratio combined tables. All are
+    # layer-invariant within one chunk; only the c4 index tail is refilled per
+    # layer (the indexer rewrites c4_sparse_page_indices for every layer).
     trtllm_prefill_qmeta: Optional[tuple] = None
+    trtllm_prefill_swa_indices: Optional[torch.Tensor] = None
     trtllm_prefill_swa_lens: Optional[torch.Tensor] = None
     trtllm_prefill_c4_indices: Optional[torch.Tensor] = None
+    trtllm_prefill_c4_lens: Optional[torch.Tensor] = None
     trtllm_prefill_c128: Optional[tuple] = None
 
     c1_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
@@ -263,8 +267,10 @@ class DSV4AttnMetadata:
                 "c128_flashmla_metadata",
                 # Eager-only lazy caches are assigned, not content-copied.
                 "trtllm_prefill_qmeta",
+                "trtllm_prefill_swa_indices",
                 "trtllm_prefill_swa_lens",
                 "trtllm_prefill_c4_indices",
+                "trtllm_prefill_c4_lens",
                 "trtllm_prefill_c128",
             ],
         )
@@ -301,8 +307,10 @@ class DSV4AttnMetadata:
             "c128_flashmla_metadata",
             # Reset eager-only caches so a replay cannot reuse another shape.
             "trtllm_prefill_qmeta",
+            "trtllm_prefill_swa_indices",
             "trtllm_prefill_swa_lens",
             "trtllm_prefill_c4_indices",
+            "trtllm_prefill_c4_lens",
             "trtllm_prefill_c128",
         ]
         # Keep graph-captured tensor objects alive for fields that captured
@@ -1773,17 +1781,51 @@ class DeepseekV4AttnBackend(
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
             if save_kv_cache:
                 self.store_cache(layer_id, swa_k, forward_batch)
-            swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
-
-            extra_k_cache, extra_indices, extra_topk_lengths = None, None, None
+            extra_indices, extra_topk_lengths = None, None
             if compress_ratio == 4:
-                extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 extra_indices = core_attn_metadata.c4_sparse_page_indices
                 extra_topk_lengths = core_attn_metadata.c4_sparse_topk_lengths
             elif compress_ratio == 128:
-                extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 extra_indices = core_attn_metadata.c128_page_indices
                 extra_topk_lengths = core_attn_metadata.c128_topk_lengths_clamp1
+
+            swa_page_indices = core_attn_metadata.swa_page_indices
+            swa_topk_lengths = core_attn_metadata.swa_topk_lengths
+
+            def match_num_queries(x, value):
+                if x is None or x.shape[0] == q.shape[0]:
+                    return x
+                if x.shape[0] > q.shape[0]:
+                    return x[: q.shape[0]]
+                return _pad_tensor_to_size(x, q.shape[0], value=value)
+
+            swa_page_indices = match_num_queries(swa_page_indices, value=0)
+            swa_topk_lengths = match_num_queries(swa_topk_lengths, value=1)
+            extra_indices = match_num_queries(extra_indices, value=-1)
+            extra_topk_lengths = match_num_queries(extra_topk_lengths, value=1)
+
+            if self.trtllm_attn:
+                # The uniform-FP8 pool is readable only by trtllm-gen, which
+                # builds its own cache views; return before the packed-layout
+                # ones below are constructed.
+                return self._forward_trtllm(
+                    q=q,
+                    layer=layer,
+                    compress_ratio=compress_ratio,
+                    core_attn_metadata=core_attn_metadata,
+                    forward_batch=forward_batch,
+                    attn_sink=attn_sink,
+                    swa_page_indices=swa_page_indices,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                )
+
+            swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
+            extra_k_cache = (
+                token_to_kv_pool.get_extra_key_buffer(layer_id)
+                if compress_ratio in (4, 128)
+                else None
+            )
 
             swa_window_size = token_to_kv_pool.swa_window_size
             assert swa_k_cache.ndim == 2
@@ -1804,34 +1846,6 @@ class DeepseekV4AttnBackend(
                     page_sizes[compress_ratio],
                     1,
                     k_cache_total_dim,
-                )
-            swa_page_indices = core_attn_metadata.swa_page_indices
-            swa_topk_lengths = core_attn_metadata.swa_topk_lengths
-
-            def match_num_queries(x, value):
-                if x is None or x.shape[0] == q.shape[0]:
-                    return x
-                if x.shape[0] > q.shape[0]:
-                    return x[: q.shape[0]]
-                return _pad_tensor_to_size(x, q.shape[0], value=value)
-
-            swa_page_indices = match_num_queries(swa_page_indices, value=0)
-            swa_topk_lengths = match_num_queries(swa_topk_lengths, value=1)
-            extra_indices = match_num_queries(extra_indices, value=-1)
-            extra_topk_lengths = match_num_queries(extra_topk_lengths, value=1)
-
-            if self.trtllm_attn:
-                # The uniform-FP8 pool is readable only by trtllm-gen.
-                return self._forward_trtllm(
-                    q=q,
-                    layer=layer,
-                    compress_ratio=compress_ratio,
-                    core_attn_metadata=core_attn_metadata,
-                    forward_batch=forward_batch,
-                    attn_sink=attn_sink,
-                    swa_page_indices=swa_page_indices,
-                    extra_indices=extra_indices,
-                    extra_topk_lengths=extra_topk_lengths,
                 )
 
             if q.ndim == 3:

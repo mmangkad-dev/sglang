@@ -604,33 +604,92 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             )
         )
 
-    def test_trtllm_semaphore_capacity_covers_configured_query_rows(self):
-        from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
+    def _publish_server_args(self, **fields):
+        from sglang.srt.runtime_context import get_context
 
-        schedule = SimpleNamespace(
+        override = get_context().override_server_args(**fields)
+        override.install()
+        self.addCleanup(override.restore)
+
+    def test_trtllm_counter_capacity_covers_configured_query_rows(self):
+        """The row bound must cover the largest launch each mode can issue.
+
+        Prefill launches sum_q rows (bounded by the prefill token budget);
+        decode launches one row per draft token per running request. A bound
+        below either lets an over-capacity launch write past the counter
+        buffer, which is silent corruption.
+        """
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            _trtllm_query_row_capacity,
+        )
+
+        self._publish_server_args(
             max_prefill_tokens=16384,
             chunked_prefill_size=4096,
             max_running_requests=256,
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=3,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4,
         )
-        spec = SimpleNamespace(
-            speculative_algorithm="EAGLE", speculative_num_draft_tokens=4
-        )
-        model_runner = SimpleNamespace()
-        with (
-            mock.patch.object(trtllm, "get_schedule", return_value=schedule),
-            mock.patch.object(trtllm, "get_spec", return_value=spec),
-            mock.patch.object(trtllm, "max_prefill_buffer_tokens", return_value=4096),
-        ):
-            # Prefill chunk / max_prefill_tokens dominates.
-            self.assertEqual(trtllm._trtllm_query_row_capacity(model_runner), 16384)
-            # Decode rows = requests x draft tokens dominate.
-            schedule.max_running_requests = 8192
-            self.assertEqual(trtllm._trtllm_query_row_capacity(model_runner), 32768)
+        # 256 reqs x 4 draft tokens = 1024 < the 16384-token prefill budget.
+        self.assertGreaterEqual(_trtllm_query_row_capacity(), 16384)
 
-        with mock.patch.object(trtllm, "_trtllm_semaphore_rows", 64):
-            trtllm._check_trtllm_query_rows(64)
-            with self.assertRaisesRegex(RuntimeError, "exceeds the persistent"):
-                trtllm._check_trtllm_query_rows(65)
+        self._publish_server_args(
+            max_prefill_tokens=16384,
+            chunked_prefill_size=4096,
+            max_running_requests=8192,
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=3,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=4,
+        )
+        # Now the decode side dominates: 8192 x 4 rows must still fit.
+        self.assertGreaterEqual(_trtllm_query_row_capacity(), 8192 * 4)
+
+    def test_trtllm_counter_check_rejects_launch_past_the_allocation(self):
+        """A raised bound must not license launches the buffer cannot cover.
+
+        reserve() regrows an existing buffer, so check() is answered by what
+        was allocated. Were it answered by the requested capacity, a second
+        engine in the same process could raise the bound and wave through
+        launches that overrun the first engine's buffer.
+        """
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            TrtllmKvCounterOwner,
+        )
+
+        owner = TrtllmKvCounterOwner()
+        owner.capacity_rows = 64
+        owner.check(64)
+        with self.assertRaisesRegex(RuntimeError, "exceeds the persistent"):
+            owner.check(65)
+
+        # Stand in for an allocation that only covers 64 rows, then raise the
+        # bound the way a later backend construction would.
+        owner._buf = torch.empty(1, dtype=torch.uint8)
+        owner._buf_rows = 64
+        owner.capacity_rows = 4096
+        with self.assertRaisesRegex(RuntimeError, "capacity of 64 rows"):
+            owner.check(65)
+
+    def test_trtllm_counter_owner_lives_on_the_resources_slot(self):
+        """reset_context() must drop the buffer with the engine that sized it."""
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            get_trtllm_kv_counter_owner,
+        )
+        from sglang.srt.runtime_context import get_resources, reset_context
+
+        owner = get_trtllm_kv_counter_owner()
+        owner.capacity_rows = 12345
+        self.assertIs(get_trtllm_kv_counter_owner(), owner)
+        self.assertIs(get_resources().trtllm_dsv4_kv_counter, owner)
+
+        self.addCleanup(reset_context)
+        reset_context()
+        fresh = get_trtllm_kv_counter_owner()
+        self.assertIsNot(fresh, owner)
+        self.assertEqual(fresh.capacity_rows, 0)
 
     def test_sparse_prefill_workspace_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (

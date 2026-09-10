@@ -622,6 +622,12 @@ class Resources(_FlagGroupBase):
     # Persistent reusable CUDA events for non-EP DP TBO, keyed by
     # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
     tbo_event_pool: dict = msgspec.field(default_factory=dict)
+    # DSv4 trtllm-gen sparse-MLA multi-CTA KV counter buffer: the row bound,
+    # the buffer sized for it, and the FlashInfer allocator interception that
+    # hands it over (owning accessor lives in
+    # layers.attention.deepseek_v4_trtllm_backend). One slot so reset_context()
+    # drops the buffer and the bound together.
+    trtllm_dsv4_kv_counter: Any = None
     # State capturers (installed by their subsystems when capture is on).
     indexer_capturer: Any = None
     experts_capturer: Any = None

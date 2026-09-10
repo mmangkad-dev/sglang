@@ -235,12 +235,20 @@ class DeepSeekV4UniformFP8KVPool(DeepSeekV4SingleKVPool):
     ) -> None:
         """Store normed/roped rows as e4m3 with the backend's fixed unit scale.
 
+        A negative ``loc`` marks a row with no write target -- the -1 sentinel
+        the full->SWA translation emits for out-of-window tokens and padded
+        rows, and DSpark's uncommitted draft slots. ``fused_k_norm_rope_flashmla``
+        skips those rows; here they are redirected to the reserved dummy slot 0
+        (the allocators hand out slots from 1, see allocator/paged.py:clear),
+        because plain indexing would wrap -1 to the end of the pool and corrupt
+        a live token. clamp keeps the store sync-free and graph-capturable.
+
         uint8 views work around index_put not supporting FP8 dtypes.
         """
 
         assert cache_k.dim() == 2 and cache_k.shape[1] == self.kv_cache_total_dim
         self.kv_buffer[layer_id].view(torch.uint8).view(-1, self.kv_cache_total_dim)[
-            loc.long()
+            loc.long().clamp(min=0)
         ] = cache_k.to(torch.float8_e4m3fn).view(torch.uint8)
 
 
