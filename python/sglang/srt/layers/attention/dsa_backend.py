@@ -3550,6 +3550,15 @@ class DeepseekSparseAttnBackend(
             batch_size,
         )
 
+        # A grow during capture would bake a temporary's address into the graph.
+        # Unreachable in practice -- the buffer is sized for
+        # max(TRTLLM_MLA_MAX_BATCH_SIZE, max_running_requests) -- so assert rather
+        # than handle it.
+        assert (
+            multi_ctas_kv_counter_buffer is self._multi_ctas_kv_counter_buffer
+            or not torch.cuda.is_current_stream_capturing()
+        ), "multi_ctas_kv_counter_buffer grew during CUDA graph capture"
+
         q = q_all.view(batch_size, 1, num_heads, head_dim)
         kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)

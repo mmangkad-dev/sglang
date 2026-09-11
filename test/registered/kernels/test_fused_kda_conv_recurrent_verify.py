@@ -18,16 +18,22 @@ register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
 
 _DEVICE = "cuda"
 
+# Trailing flag: whether the fused output is bit-identical to the unfused pair
+# for THIS case's inputs. Empirical per case, not implied by the shape -- the
+# same shape diverges at one seed and matches at another (H=8/HV=8 is exact at
+# seeds 1, 20 and 21 but needs rtol 5.5e-3 at seed 9), and larger head counts
+# only raise the odds. A new case starts False and is promoted only once it is
+# measured exact.
 _CASES = [
-    (1, 4, 4, 4, 128, 128, 4, False, None, False, 1),
-    (1, 4, 4, 4, 128, 128, 4, True, None, False, 2),
-    (1, 4, 4, 4, 128, 128, 4, True, 2.0, False, 3),
-    (3, 4, 4, 4, 128, 128, 4, True, None, False, 4),
-    (3, 4, 4, 4, 128, 128, 4, True, None, True, 5),
-    (2, 3, 4, 4, 128, 128, 4, True, None, False, 6),
-    (2, 8, 2, 2, 128, 128, 4, True, 1.5, False, 7),
-    (1, 4, 8, 8, 64, 64, 4, True, None, False, 8),
-    (1, 6, 16, 16, 128, 128, 4, False, None, False, 9),
+    (1, 4, 4, 4, 128, 128, 4, False, None, False, 1, True),
+    (1, 4, 4, 4, 128, 128, 4, True, None, False, 2, True),
+    (1, 4, 4, 4, 128, 128, 4, True, 2.0, False, 3, True),
+    (3, 4, 4, 4, 128, 128, 4, True, None, False, 4, True),
+    (3, 4, 4, 4, 128, 128, 4, True, None, True, 5, True),
+    (2, 3, 4, 4, 128, 128, 4, True, None, False, 6, True),
+    (2, 8, 2, 2, 128, 128, 4, True, 1.5, False, 7, True),
+    (1, 4, 8, 8, 64, 64, 4, True, None, False, 8, True),
+    (1, 6, 16, 16, 128, 128, 4, False, None, False, 9, False),
 ]
 
 
@@ -156,7 +162,7 @@ def _run_fused(inp, B, T, H, HV, K, V, lower_bound, num_warps):
 
 
 def _compare_case(case, num_warps):
-    B, T, H, HV, K, V, W, has_bias, lower_bound, neg_slot, seed = case
+    B, T, H, HV, K, V, W, has_bias, lower_bound, neg_slot, seed, bitexact = case
     inp = _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed)
     o_ref, conv_ref, win_ref, ic_ref = _run_reference(
         inp, B, T, H, HV, K, V, lower_bound
@@ -170,8 +176,13 @@ def _compare_case(case, num_warps):
 
     o_ref_v = o_ref.reshape(B, T, HV, V)[valid_rows]
     o_fus_v = o_fus.reshape(B, T, HV, V)[valid_rows]
-    # Different FP32 reduction orders can cross a BF16 rounding boundary.
-    torch.testing.assert_close(o_ref_v, o_fus_v, atol=1e-7, rtol=8e-3)
+    if bitexact:
+        assert torch.equal(o_ref_v, o_fus_v)
+    else:
+        # rtol is 2 bf16 ulp (bf16 carries 8 mantissa bits, so 1 ulp ~ 3.9e-3).
+        # The covered case needs 7.3e-3, so this is a real bound, not a rubber
+        # stamp -- a third differing ulp fails it.
+        torch.testing.assert_close(o_ref_v, o_fus_v, atol=1e-7, rtol=8e-3)
     assert torch.equal(inp["conv_pool"], conv_fus)
     assert torch.equal(win_ref[valid_rows], win_fus[valid_rows])
     torch.testing.assert_close(
@@ -246,7 +257,9 @@ def test_verify_history_survives_later_cta_waves():
 
     streams, resources = split_device_green_ctx_by_sm_count(torch.device("cuda:0"), [8])
     with torch.cuda.stream(streams[0]):
-        _compare_case((1, 6, 1, 16, 128, 128, 4, False, None, False, 1), num_warps=4)
+        _compare_case(
+            (1, 6, 1, 16, 128, 128, 4, False, None, False, 1, False), num_warps=4
+        )
     streams[0].synchronize()
 
 

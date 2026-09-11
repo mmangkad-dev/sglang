@@ -89,7 +89,7 @@ class MetadataGlueGraph:
         unsupported = [
             type(b).__name__
             for b in self._leaves(attn_backend)
-            if not getattr(b, "supports_metadata_glue", False)
+            if not b.supports_metadata_glue
         ]
         if unsupported:
             logger.info(

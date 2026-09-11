@@ -16,11 +16,15 @@ kernels. Requires ``T >= kernel_width - 1``. Persistent convolution and SSM
 states are read-only; verification writes speculative checkpoints for the
 acceptance path to commit.
 
-Numerics: the conv output is
-rounded to the activation dtype (bf16) before entering the recurrence —
-exactly what the unfused path does through its intermediate tensor — and all
-expressions follow the reference kernels. FP32 reduction order can differ,
-including at BF16 output rounding boundaries.
+Numerics: the conv output is rounded to the activation dtype (bf16) before
+entering the recurrence — exactly what the unfused path does through its
+intermediate tensor — and all expressions mirror the reference kernels. The
+output is usually bit-identical to the unfused pair but is not guaranteed to be:
+the tl.sum reduction can split differently and move the result by up to ~2 bf16
+ulp where it crosses a rounding boundary. Whether it does depends on the data as
+well as the shape -- one seed diverges where another is exact, at head counts as
+low as HV=8. The fp32 intermediate-ssm rollback cache differs by more
+(~4e-3 absolute); it feeds the rollback path, not the model output.
 """
 
 from typing import Optional
@@ -347,8 +351,9 @@ def fused_kda_conv_gating_verify(
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
     use_qk_l2norm_in_kernel: bool = True,
-    # Four warps favor latency; FP32 reduction differences can accumulate in
-    # the intermediate SSM checkpoints and cross BF16 output rounding boundaries.
+    # Four warps favor latency; measured ~1.3x the unfused pair in-graph.
+    # num_warps=1 does not restore bit-exactness at HV=16 -- the divergence is
+    # the reduction split, not the warp count.
     num_warps: int = 4,
 ) -> torch.Tensor:
     """Return [1, seq_len, HV, V] and speculative checkpoints without changing
