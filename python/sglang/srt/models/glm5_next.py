@@ -36,6 +36,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
     ColumnParallelLinear,
+    LinearBase,
     MergedColumnParallelLinear,
     MergedColumnParallelRepeatedLinear,
     QKVParallelLinear,
@@ -74,6 +75,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
+)
+from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+    apply_mhc_post_pre_boundary,
 )
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
@@ -116,6 +120,10 @@ if _use_aiter_gfx95:
     )
 
 logger = logging.getLogger(__name__)
+
+# Matches DeepSeek-V4's _MHC_POST_MULT_VALUE and the post_mult_value=2.0 that
+# Glm5NextDecoderLayer._hc_pre passes to the unfused hc_pre.
+_MHC_POST_MULT_VALUE = 2.0
 
 
 @torch.compile
@@ -303,6 +311,31 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
         )
 
 
+def _fused_qkvbfg_is_unquantized(
+    quant_config: Optional[QuantizationConfig], prefix: str
+) -> bool:
+    """Whether the fused KDA qkv/beta/forget/gate projections stay in bf16.
+
+    GLM-5.3-Flash ships an fp8 checkpoint whose ``modules_to_not_convert`` lists
+    every linear-attention projection, so a non-None quant_config does not imply
+    these layers are quantized. Probe the config the way ``LinearBase`` does --
+    the probe allocates no weights -- and fuse whenever both fused modules
+    resolve to the unquantized method.
+    """
+    if not envs.SGLANG_OPT_GLM5_FUSE_KDA_QKVBFG.get():
+        return False
+    if quant_config is None:
+        return True
+
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    for name in ("fused_qkvbfg_a_proj", "fused_fg_b_proj"):
+        probe = LinearBase(1, 1, quant_config=quant_config, prefix=f"{prefix}.{name}")
+        if not isinstance(probe.quant_method, UnquantizedLinearMethod):
+            return False
+    return True
+
+
 class Glm5NextLinearAttention(nn.Module):
     def __init__(
         self,
@@ -337,7 +370,10 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+        self.do_fuse_qkvbfg = (
+            head_shard_size == self.tp_size
+            and _fused_qkvbfg_is_unquantized(quant_config, prefix)
+        )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -508,6 +544,14 @@ class Glm5NextLinearAttention(nn.Module):
         fused_states = self.fused_qkvbfg_a_proj(hidden_states)
 
         qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
+
+        # Splitting one GEMM output along the last dim leaves every part with a
+        # row stride of the fused width rather than its own. The unfused path
+        # hands the KDA conv/recurrent kernels densely packed buffers, so repack
+        # the two that reach them to keep the layouts those kernels were written
+        # against. The fg parts feed the bmm below, which takes strides.
+        qkv = qkv.contiguous()
+        beta = beta.contiguous()
 
         forget_gate, g_proj_states = self.fused_fg_b_proj(
             fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
@@ -698,6 +742,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
                 hc_post=self.hc_post,
+                hc_ffn_post_pre=self.hc_ffn_post_pre,
             )
             self.layer_communicator = MHCLayerCommunicator(
                 **shared_kwargs,
@@ -742,6 +787,49 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states,
             out_norm_weight,
             out_norm_eps,
+        )
+
+    def hc_ffn_post_pre(
+        self, hidden_states, residual, h_res, h_post, out_norm_weight, out_norm_eps
+    ):
+        """Fuse the attn->MLP mHC boundary: hc_post then the FFN hc_pre.
+
+        The unfused boundary is three launches (post, pre-norm GEMM, pre
+        big-fuse) on a few tokens each, so at decode it is launch-bound.
+        ``apply_mhc_post_pre_boundary`` is the shared dispatcher (aiter ->
+        Triton -> TileLang) already used by DeepSeek-V4; it returns None when no
+        fused kernel is available, in which case the caller keeps the unfused
+        chain.
+        """
+        assert self.config.mhc, "hc_ffn_post_pre is only valid when config.mhc=True"
+        num_tokens, hidden_size = hidden_states.shape
+        hc_mult = self.config.hc_mult
+        fused = apply_mhc_post_pre_boundary(
+            hidden_states,
+            residual.view(num_tokens, hc_mult, hidden_size),
+            h_post.view(num_tokens, hc_mult),
+            h_res.view(num_tokens, hc_mult, hc_mult),
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            hc_mult,
+            self.config.rms_norm_eps,
+            self.config.hc_eps,
+            _MHC_POST_MULT_VALUE,
+            self.config.hc_sinkhorn_iters,
+            out_norm_weight,
+            out_norm_eps,
+            fn_transpose=False,
+        )
+        if fused is None:
+            return None
+        next_residual, layer_input, post, comb, norm_fused = fused
+        return (
+            layer_input,
+            next_residual.reshape(num_tokens, -1),
+            comb.reshape(num_tokens, hc_mult * hc_mult),
+            post.reshape(num_tokens, hc_mult),
+            norm_fused,
         )
 
     def hc_post(self, hidden_states, residual, h_res, h_post):

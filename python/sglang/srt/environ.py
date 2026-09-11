@@ -1280,9 +1280,15 @@ class Envs:
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
     # Capture the per-replay attention-metadata prep (init_forward_metadata_out_graph)
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
-    # Experimental; auto-falls back to eager if the backend's prep is not capturable.
-    SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
-    SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
+    # Auto-falls back to eager if the backend's prep is not capturable, so the
+    # on-by-default cost is a capture attempt per backend. Worth ~8% of decode
+    # throughput on hybrid linear-attention + spec-decode configs (GLM-5.3), where
+    # the per-step host dispatch is a large share of a short forward.
+    SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(True)
+    # Fuse the KDA verify chain (conv1d update + gated delta-rule recurrence)
+    # into one kernel. Self-gated: requires the triton verify backend, topk==1,
+    # and a covered() shape/stride/dtype check, else the unfused chain runs.
+    SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(True)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
@@ -1440,6 +1446,16 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
+    # GLM-5.x KDA: fuse the six linear-attention projections (q/k/v/beta and
+    # the forget/gate low-rank pair) into one merged GEMM plus one batched GEMM.
+    # Only engages when the checkpoint leaves those projections unquantized.
+    # OFF by default: the fused weights are bit-identical for q/k/v/beta and
+    # differ only by sub-ulp bf16 accumulation order on the gate, but that is
+    # enough to tip the trtllm DSA sparse-attention kernel into an illegal
+    # access on adversarial (random-token) prompts -- an out-of-range page
+    # index the DSA path should reject regardless of activations. Re-enable
+    # once that path is hardened; it is worth ~8% of the GLM-5.3 decode step.
+    SGLANG_OPT_GLM5_FUSE_KDA_QKVBFG = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
