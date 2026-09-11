@@ -78,6 +78,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     apply_mhc_post_pre_boundary,
+    is_cross_layer_mhc_fusion_enabled,
 )
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
@@ -316,16 +317,18 @@ def _fused_qkvbfg_is_unquantized(
 ) -> bool:
     """Whether the fused KDA qkv/beta/forget/gate projections stay in bf16.
 
-    GLM-5.3-Flash ships an fp8 checkpoint whose ``modules_to_not_convert`` lists
-    every linear-attention projection, so a non-None quant_config does not imply
-    these layers are quantized. Probe the config the way ``LinearBase`` does --
-    the probe allocates no weights -- and fuse whenever both fused modules
-    resolve to the unquantized method.
+    An unquantized checkpoint fuses unconditionally, as it always has. The env
+    gate governs only the quantized-checkpoint case, which is new: GLM-5.3-Flash
+    ships an fp8 checkpoint whose ``modules_to_not_convert`` lists every
+    linear-attention projection, so a non-None quant_config does not imply these
+    layers are quantized. Probe the config the way ``LinearBase`` does -- the
+    probe allocates no weights -- and fuse whenever both fused modules resolve to
+    the unquantized method.
     """
-    if not envs.SGLANG_OPT_GLM5_FUSE_KDA_QKVBFG.get():
-        return False
     if quant_config is None:
         return True
+    if not envs.SGLANG_OPT_GLM5_FUSE_KDA_QKVBFG.get():
+        return False
 
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
@@ -545,14 +548,6 @@ class Glm5NextLinearAttention(nn.Module):
 
         qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
 
-        # Splitting one GEMM output along the last dim leaves every part with a
-        # row stride of the fused width rather than its own. The unfused path
-        # hands the KDA conv/recurrent kernels densely packed buffers, so repack
-        # the two that reach them to keep the layouts those kernels were written
-        # against. The fg parts feed the bmm below, which takes strides.
-        qkv = qkv.contiguous()
-        beta = beta.contiguous()
-
         forget_gate, g_proj_states = self.fused_fg_b_proj(
             fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
         )
@@ -742,7 +737,14 @@ class Glm5NextDecoderLayer(nn.Module):
                 hc_attn_pre=self.hc_attn_pre,
                 hc_ffn_pre=self.hc_ffn_pre,
                 hc_post=self.hc_post,
-                hc_ffn_post_pre=self.hc_ffn_post_pre,
+                # Resolved once: the capability reads only env and platform,
+                # both frozen after startup. Passing None when nothing can fuse
+                # keeps the dispatch cascade off the per-boundary path.
+                hc_ffn_post_pre=(
+                    self.hc_ffn_post_pre
+                    if is_cross_layer_mhc_fusion_enabled()
+                    else None
+                ),
             )
             self.layer_communicator = MHCLayerCommunicator(
                 **shared_kwargs,
@@ -819,7 +821,10 @@ class Glm5NextDecoderLayer(nn.Module):
             self.config.hc_sinkhorn_iters,
             out_norm_weight,
             out_norm_eps,
-            fn_transpose=False,
+            # DeepSeek-V4 passes True at both of its hc_ffn_fn boundaries; the
+            # Triton tier's parameter is hc_fn_t and this fn has the same
+            # [mix_hc, hc_dim] layout, so this boundary matches those.
+            fn_transpose=True,
         )
         if fused is None:
             return None

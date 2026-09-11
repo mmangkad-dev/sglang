@@ -3541,13 +3541,13 @@ class DeepseekSparseAttnBackend(
         batch_size = page_table_1.shape[0]
         _, num_heads, head_dim = q_all.shape
 
-        self._multi_ctas_kv_counter_buffer = (
-            grow_multi_ctas_kv_counter_buffer_if_needed(
-                self._multi_ctas_kv_counter_buffer,
-                torch.device(self.device),
-                self.num_q_heads,
-                batch_size,
-            )
+        # Decode graphs retain this buffer's address. A larger eager prefill may
+        # need a temporary counter, but must not replace the captured allocation.
+        multi_ctas_kv_counter_buffer = grow_multi_ctas_kv_counter_buffer_if_needed(
+            self._multi_ctas_kv_counter_buffer,
+            torch.device(self.device),
+            self.num_q_heads,
+            batch_size,
         )
 
         q = q_all.view(batch_size, 1, num_heads, head_dim)
@@ -3570,7 +3570,7 @@ class DeepseekSparseAttnBackend(
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             sparse_mla_top_k_lens=sparse_mla_top_k_lens,
-            multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
         )
 
         return out

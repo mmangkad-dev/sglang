@@ -27,6 +27,7 @@ _CASES = [
     (2, 3, 4, 4, 128, 128, 4, True, None, False, 6),
     (2, 8, 2, 2, 128, 128, 4, True, 1.5, False, 7),
     (1, 4, 8, 8, 64, 64, 4, True, None, False, 8),
+    (1, 6, 16, 16, 128, 128, 4, False, None, False, 9),
 ]
 
 
@@ -166,12 +167,12 @@ def _compare_case(case, num_warps):
 
     idx_vals = inp["idx_vals"]
     valid_rows = [i for i, slot in enumerate(idx_vals) if slot >= 0]
-    touched_slots = [slot for slot in idx_vals if slot >= 0]
 
     o_ref_v = o_ref.reshape(B, T, HV, V)[valid_rows]
     o_fus_v = o_fus.reshape(B, T, HV, V)[valid_rows]
-    assert torch.equal(o_ref_v, o_fus_v)
-    assert torch.equal(conv_ref[touched_slots], conv_fus[touched_slots])
+    # Different FP32 reduction orders can cross a BF16 rounding boundary.
+    torch.testing.assert_close(o_ref_v, o_fus_v, atol=1e-7, rtol=8e-3)
+    assert torch.equal(inp["conv_pool"], conv_fus)
     assert torch.equal(win_ref[valid_rows], win_fus[valid_rows])
     torch.testing.assert_close(
         ic_ref[valid_rows], ic_fus[valid_rows], atol=4e-3, rtol=0
@@ -181,6 +182,72 @@ def _compare_case(case, num_warps):
 @pytest.mark.parametrize("case", _CASES)
 def test_matches_unfused_reference(case):
     _compare_case(case, num_warps=4)
+
+
+def test_verify_accepts_merged_projection_views():
+    """QKV and beta retain the merged GEMM's row stride after splitting."""
+    B, T, H, HV, K, V = 1, 6, 16, 16, 128, 128
+    inp = _make_inputs(B, T, H, HV, K, V, 4, False, False, 11)
+    dense = _run_reference(inp, B, T, H, HV, K, V, -5.0)
+    merged = torch.cat(
+        [inp["mixed"], inp["b"], inp["mixed"].new_zeros(T, 2 * K)], dim=-1
+    )
+    inp["mixed"], inp["b"], _ = merged.split([3 * H * K, HV, 2 * K], dim=-1)
+    unfused = _run_reference(inp, B, T, H, HV, K, V, -5.0)
+    fused = _run_fused(inp, B, T, H, HV, K, V, -5.0, 4)
+    for actual in (unfused, fused):
+        # Output, speculative convolution windows, and SSM checkpoints.
+        for i in (0, 2, 3):
+            torch.testing.assert_close(actual[i], dense[i], atol=1e-7, rtol=8e-3)
+
+
+@pytest.mark.parametrize("step", [-1, 0, 2, 5])
+def test_verify_commits_only_the_selected_checkpoint(step):
+    """Rejected steps must not replace persistent history or untouched slots."""
+    from types import SimpleNamespace
+
+    from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+        scatter_mamba_states_after_mtp_verify,
+    )
+
+    B, T, H, HV, K, V = 2, 6, 4, 4, 128, 128
+    inp = _make_inputs(B, T, H, HV, K, V, 4, False, False, 10)
+    _, _, win_ref, ic_ref = _run_reference(inp, B, T, H, HV, K, V, None)
+    _, conv, win, ic = _run_fused(inp, B, T, H, HV, K, V, None, 4)
+    ssm = inp["ssm"].clone()
+    steps = torch.tensor([step, -1], device=_DEVICE, dtype=torch.int32)
+    scatter_mamba_states_after_mtp_verify(
+        SimpleNamespace(
+            temporal=ssm.unsqueeze(0),
+            intermediate_ssm=ic.unsqueeze(0),
+            conv=[conv.unsqueeze(0)],
+            intermediate_conv_window=[win.unsqueeze(0)],
+        ),
+        inp["cache_indices"],
+        steps,
+        None,
+        None,
+    )
+    conv_expected = inp["conv_pool"].clone()
+    ssm_expected = inp["ssm"].clone()
+    if step >= 0:
+        slot = inp["idx_vals"][0]
+        conv_expected[slot] = win_ref[0, step]
+        ssm_expected[slot] = ic_ref[0, step]
+    torch.testing.assert_close(conv, conv_expected, atol=0, rtol=0)
+    torch.testing.assert_close(ssm, ssm_expected, atol=2e-6, rtol=1e-5)
+
+
+def test_verify_history_survives_later_cta_waves():
+    """Verify output must not depend on when CTAs sharing Q/K history start."""
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Requires CUDA green contexts on SM90 or newer")
+    from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
+
+    streams, resources = split_device_green_ctx_by_sm_count(torch.device("cuda:0"), [8])
+    with torch.cuda.stream(streams[0]):
+        _compare_case((1, 6, 1, 16, 128, 128, 4, False, None, False, 1), num_warps=4)
+    streams[0].synchronize()
 
 
 if __name__ == "__main__":
