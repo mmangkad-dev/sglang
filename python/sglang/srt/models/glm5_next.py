@@ -304,6 +304,11 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
         )
 
 
+# The two fused groups the KDA projections collapse into; their constituents
+# come from packed_modules_mapping.
+_FUSED_KDA_PROJECTION_GROUPS = ("fused_qkvbfg_a_proj", "fused_fg_b_proj")
+
+
 def _fused_qkvbfg_is_unquantized(
     quant_config: Optional[QuantizationConfig], prefix: str
 ) -> bool:
@@ -316,12 +321,18 @@ def _fused_qkvbfg_is_unquantized(
 
     # A non-None quant_config does not mean these layers are quantized:
     # GLM-5.3-Flash's fp8 checkpoint lists every linear-attention projection in
-    # modules_to_not_convert. Ask the config what it would resolve these two
-    # fused names to; LinearBase(1, 1, ...) allocates no weights.
-    for name in ("fused_qkvbfg_a_proj", "fused_fg_b_proj"):
-        probe = LinearBase(1, 1, quant_config=quant_config, prefix=f"{prefix}.{name}")
-        if not isinstance(probe.quant_method, UnquantizedLinearMethod):
-            return False
+    # modules_to_not_convert. Probe the projections the checkpoint actually
+    # names, not the fused groups: is_layer_skipped raises on a group whose
+    # shards disagree, and a mixed group is a reason to stay unfused, not to
+    # fail. LinearBase(1, 1, ...) allocates no weights.
+    mapping = Glm5NextForConditionalGeneration.packed_modules_mapping
+    for group in _FUSED_KDA_PROJECTION_GROUPS:
+        for name in mapping[group]:
+            probe = LinearBase(
+                1, 1, quant_config=quant_config, prefix=f"{prefix}.{name}"
+            )
+            if not isinstance(probe.quant_method, UnquantizedLinearMethod):
+                return False
     return True
 
 
@@ -383,13 +394,14 @@ class Glm5NextLinearAttention(nn.Module):
                 self.num_heads // head_shard_size,
                 2 * self.head_dim,
             ]
-            fused_dtype = (
-                getattr(config, "dtype", None)
-                or getattr(config, "torch_dtype", None)
-                or torch.get_default_dtype()
-            )
             self.fused_fg_b_proj = ColumnParallelBatchedLinear(
-                2, self.head_dim, projection_size, dtype=fused_dtype
+                2,
+                self.head_dim,
+                projection_size,
+                # The merged projection above feeds this one, and it resolves its
+                # dtype at runtime; the checkpoint's declared dtype is stale when
+                # the loader overrides it.
+                dtype=self.fused_qkvbfg_a_proj.params_dtype,
             )
         else:
             self.qkv_proj = QKVParallelLinear(
