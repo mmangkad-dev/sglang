@@ -36,6 +36,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
     ColumnParallelLinear,
+    LinearBase,
     MergedColumnParallelLinear,
     MergedColumnParallelRepeatedLinear,
     QKVParallelLinear,
@@ -303,6 +304,27 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
         )
 
 
+def _fused_qkvbfg_is_unquantized(
+    quant_config: Optional[QuantizationConfig], prefix: str
+) -> bool:
+    if quant_config is None:
+        return True
+    if not envs.SGLANG_OPT_GLM5_NEXT_FUSE_KDA_QKVBFG.get():
+        return False
+
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    # A non-None quant_config does not mean these layers are quantized:
+    # GLM-5.3-Flash's fp8 checkpoint lists every linear-attention projection in
+    # modules_to_not_convert. Ask the config what it would resolve these two
+    # fused names to; LinearBase(1, 1, ...) allocates no weights.
+    for name in ("fused_qkvbfg_a_proj", "fused_fg_b_proj"):
+        probe = LinearBase(1, 1, quant_config=quant_config, prefix=f"{prefix}.{name}")
+        if not isinstance(probe.quant_method, UnquantizedLinearMethod):
+            return False
+    return True
+
+
 class Glm5NextLinearAttention(nn.Module):
     def __init__(
         self,
@@ -337,7 +359,9 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+        self.do_fuse_qkvbfg = head_shard_size == self.tp_size and (
+            _fused_qkvbfg_is_unquantized(quant_config=quant_config, prefix=prefix)
+        )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
