@@ -949,6 +949,11 @@ class Glm5NextModel(nn.Module):
             hidden_size=config.hidden_size,
             top_k=config.num_experts_per_tok,
             rms_epsilon=config.rms_norm_eps,
+            # A TP1-replicated shared expert is added after the MoE's own
+            # all-reduce, so that reduction cannot move to postprocess_layer.
+            requires_local_reduction=lambda layer: (
+                isinstance(layer.mlp, Glm5NextMoE) and layer.mlp._shared_expert_tp1
+            ),
             label="GLM-5-Next",
         )
 

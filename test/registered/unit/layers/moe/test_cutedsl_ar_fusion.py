@@ -565,6 +565,173 @@ def test_decode_max_m_scales_by_the_draft_token_count():
     assert resolve_decode_max_m(max_running_requests=64) == 384
 
 
+def _bare_communicator(*, attn_ok=True, mlp_ok=True, owes_local_reduction=False):
+    """A CuteDSLBareAllReduceMHCLayerCommunicator with its static eligibility
+    already resolved, so a case varies only what it means to vary."""
+    from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+        CuteDSLBareAllReduceMHCLayerCommunicator,
+    )
+
+    comm = CuteDSLBareAllReduceMHCLayerCommunicator.__new__(
+        CuteDSLBareAllReduceMHCLayerCommunicator
+    )
+    comm._attn_output_eligible = attn_ok
+    comm._mlp_output_eligible = mlp_ok
+    comm._mlp_allreduce_deferred = False
+    comm.owes_local_reduction = owes_local_reduction
+    comm.post_attention_layernorm = object()
+    reduced = []
+    comm.fusion_service = SimpleNamespace(
+        supports=lambda m: True,
+        all_reduce=lambda x: reduced.append(x) or (x * 2),
+    )
+    comm._reduced = reduced
+    return comm
+
+
+def _decode_batch(m=8):
+    return SimpleNamespace(
+        forward_mode=ForwardMode.DECODE, input_ids=torch.zeros(m, dtype=torch.int32)
+    )
+
+
+def _no_scattered_input():
+    return patch(
+        "sglang.srt.layers.moe.cutedsl_ar_fusion.get_attn_tp_context",
+        return_value=SimpleNamespace(input_scattered=False),
+    )
+
+
+def test_bare_communicator_reduces_the_attention_output_then_combines_with_mhc():
+    """The attention boundary: the collective replaces the ordinary all-reduce,
+    and mHC still owns the combination. Dropping either would leave the
+    guard-only tests green."""
+    comm = _bare_communicator()
+    combined = []
+    comm.mhc = SimpleNamespace(
+        attn_to_mlp=lambda h, r, out_norm: combined.append((h, r, out_norm)) or (h, r)
+    )
+    hidden, residual = torch.ones(8, 8), torch.zeros(8, 8)
+
+    with _no_scattered_input():
+        out_hidden, _ = comm.prepare_mlp(hidden, residual, _decode_batch())
+
+    assert len(comm._reduced) == 1 and comm._reduced[0] is hidden
+    assert torch.equal(out_hidden, hidden * 2)
+    # mHC combined the reduced value, and against its own norm.
+    assert len(combined) == 1
+    assert combined[0][2] is comm.post_attention_layernorm
+
+
+def test_bare_communicator_falls_back_when_the_forward_is_ineligible():
+    """EXTEND is excluded, so the ordinary mHC path must run untouched."""
+    from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
+
+    comm = _bare_communicator()
+    extend = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND, input_ids=torch.zeros(8, dtype=torch.int32)
+    )
+
+    with (
+        _no_scattered_input(),
+        patch.object(
+            MHCLayerCommunicator, "prepare_mlp", return_value=("fallback", None)
+        ) as ordinary,
+    ):
+        out, _ = comm.prepare_mlp(torch.ones(8, 8), torch.zeros(8, 8), extend)
+
+    assert out == "fallback" and ordinary.called
+    assert comm._reduced == []
+
+
+def test_bare_communicator_reduces_the_mlp_output_it_deferred():
+    """The MLP boundary is two halves: should_defer_mlp_allreduce suppresses the
+    MoE's reduction, postprocess_layer performs it. Keeping only the first
+    silently drops the reduction."""
+    from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
+
+    comm = _bare_communicator()
+    hidden = torch.ones(8, 8)
+
+    with _no_scattered_input():
+        assert comm.should_defer_mlp_allreduce(_decode_batch()) is True
+        with patch.object(
+            MHCLayerCommunicator,
+            "postprocess_layer",
+            side_effect=lambda h, r, fb: (h, r),
+        ):
+            out, _ = comm.postprocess_layer(hidden, None, _decode_batch())
+
+    assert len(comm._reduced) == 1
+    assert torch.equal(out, hidden * 2)
+    # The verdict is consumed, so the next forward re-decides.
+    assert comm._mlp_allreduce_deferred is False
+
+
+def test_bare_communicator_does_not_reduce_an_mlp_output_it_never_deferred():
+    """postprocess_layer must not reduce when the MoE already did."""
+    from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
+
+    comm = _bare_communicator(mlp_ok=False)
+
+    with _no_scattered_input():
+        assert comm.should_defer_mlp_allreduce(_decode_batch()) is False
+        with patch.object(
+            MHCLayerCommunicator,
+            "postprocess_layer",
+            side_effect=lambda h, r, fb: (h, r),
+        ):
+            comm.postprocess_layer(torch.ones(8, 8), None, _decode_batch())
+
+    assert comm._reduced == []
+
+
+def test_a_replicated_shared_expert_producer_keeps_its_mlp_reduction():
+    """A TP1 shared expert is added after the MoE's own all-reduce, so deferring
+    that reduction to postprocess_layer would scale it by tp_size. The attention
+    boundary is unaffected and stays eligible."""
+    comm = _bare_communicator(owes_local_reduction=True)
+    comm.mhc = SimpleNamespace(attn_to_mlp=lambda h, r, out_norm: (h, r))
+
+    with _no_scattered_input():
+        assert comm.should_defer_mlp_allreduce(_decode_batch()) is False
+        assert comm._mlp_allreduce_deferred is False
+        comm.prepare_mlp(torch.ones(8, 8), torch.zeros(8, 8), _decode_batch())
+
+    # The attention-output reduction still ran.
+    assert len(comm._reduced) == 1
+
+
+def test_install_records_which_bare_producers_owe_a_local_reduction():
+    """install must carry the model's predicate onto the layer, or a replicated
+    shared expert silently keeps the unsafe deferral."""
+    from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+        CuteDSLBareAllReduceMHCLayerCommunicator,
+        install_cutedsl_bare_all_reduce,
+    )
+
+    layers = [
+        SimpleNamespace(
+            layer_communicator=CuteDSLBareAllReduceMHCLayerCommunicator.__new__(
+                CuteDSLBareAllReduceMHCLayerCommunicator
+            ),
+            replicated=replicated,
+        )
+        for replicated in (True, False)
+    ]
+    install_cutedsl_bare_all_reduce(
+        layers,
+        hidden_size=8,
+        top_k=2,
+        rms_epsilon=1e-6,
+        requires_local_reduction=lambda layer: layer.replicated,
+        label="test",
+    )
+
+    assert layers[0].layer_communicator.owes_local_reduction is True
+    assert layers[1].layer_communicator.owes_local_reduction is False
+
+
 if __name__ == "__main__":
     import sys
 

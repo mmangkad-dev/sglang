@@ -578,6 +578,11 @@ class CuteDSLBareAllReduceMHCLayerCommunicator(MHCLayerCommunicator):
 
     fusion_service: CuteDSLBareAllReduceService | None = None
 
+    # This layer's MoE adds a replicated contribution after its own reduction,
+    # so moving that reduction to postprocess_layer would scale it by tp_size.
+    # Only the MLP boundary is affected; the attention one still fuses.
+    owes_local_reduction: bool = False
+
     def _post_init_communicate(self):
         super()._post_init_communicate()
         # Everything but the forward mode, M, and the scattered-input flag is
@@ -639,6 +644,9 @@ class CuteDSLBareAllReduceMHCLayerCommunicator(MHCLayerCommunicator):
         return super().prepare_mlp(hidden_states, residual, forward_batch, cache=cache)
 
     def should_defer_mlp_allreduce(self, forward_batch: ForwardBatch) -> bool:
+        if self.owes_local_reduction:
+            self._mlp_allreduce_deferred = False
+            return False
         m = int(forward_batch.input_ids.shape[0])
         self._mlp_allreduce_deferred = self._mlp_output_eligible and (
             self._forward_eligible(forward_batch, m)
@@ -662,9 +670,19 @@ class CuteDSLBareAllReduceMHCLayerCommunicator(MHCLayerCommunicator):
 
 
 def install_cutedsl_bare_all_reduce(
-    layers, *, hidden_size: int, top_k: int, rms_epsilon: float, label: str
+    layers,
+    *,
+    hidden_size: int,
+    top_k: int,
+    rms_epsilon: float,
+    requires_local_reduction=lambda layer: False,
+    label: str,
 ) -> CuteDSLBareAllReduceService | None:
-    """Give every bare-collective layer one shared workspace handle, or None."""
+    """Give every bare-collective layer one shared workspace handle, or None.
+
+    Pass ``requires_local_reduction`` for a layer whose MoE adds a replicated
+    output after its own all-reduce.
+    """
     handles = [
         layer
         for layer in layers
@@ -679,6 +697,9 @@ def install_cutedsl_bare_all_reduce(
     )
     for layer in handles:
         layer.layer_communicator.fusion_service = service
+        layer.layer_communicator.owes_local_reduction = bool(
+            requires_local_reduction(layer)
+        )
     logger.info(
         "Installed one %s FlashInfer MNNVL CuTe DSL bare-collective handle for "
         "%d of %d layers",
