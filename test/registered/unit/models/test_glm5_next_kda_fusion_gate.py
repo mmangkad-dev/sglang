@@ -13,10 +13,10 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.models.glm5_next import (
     Glm5NextForConditionalGeneration,
@@ -164,9 +164,16 @@ def test_eligible_layer_builds_unquantized(gloo_world):
             "weight_block_size": [128, 128],
         }
     )
-    assert not is_layer_skipped(
-        f"{_PREFIX}.fused_qkvbfg_a_proj", quant_config.ignored_layers
-    ), "this quantizer must not recognize the fused name, or the case is moot"
+    # Ask the quantizer the way construction would. Checking is_layer_skipped
+    # directly would keep passing if this config ever gained the packed mapping,
+    # leaving the case covering nothing.
+    probe = LinearBase(
+        1, 1, quant_config=quant_config, prefix=f"{_PREFIX}.fused_qkvbfg_a_proj"
+    )
+    assert not isinstance(probe.quant_method, UnquantizedLinearMethod), (
+        "this quantizer must not resolve the fused name to an unquantized "
+        "method, or the case is moot"
+    )
 
     config = SimpleNamespace(
         dtype=torch.bfloat16,
