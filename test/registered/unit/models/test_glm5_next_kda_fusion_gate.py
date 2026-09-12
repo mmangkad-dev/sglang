@@ -1,17 +1,9 @@
-import os
-import socket
 import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from sglang.srt.distributed.parallel_state import (
-    destroy_distributed_environment,
-    destroy_model_parallel,
-    init_distributed_environment,
-    initialize_model_parallel,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
@@ -101,28 +93,7 @@ def test_fp8_checkpoint_that_skips_kda_fuses_only_when_gated():
         assert not _fused_qkvbfg_is_unquantized(quant_config=config, prefix=_PREFIX)
 
 
-@pytest.fixture(scope="module")
-def gloo_world():
-    """a one-rank cpu process group, so the column-parallel projections can build"""
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    init_distributed_environment(
-        world_size=1,
-        rank=0,
-        local_rank=0,
-        distributed_init_method=f"tcp://127.0.0.1:{port}",
-        backend="gloo",
-    )
-    initialize_model_parallel(tensor_model_parallel_size=1, backend="gloo")
-    yield
-    destroy_model_parallel()
-    destroy_distributed_environment()
-
-
-def test_fused_projections_share_the_runtime_dtype(gloo_world):
+def test_fused_projections_share_the_runtime_dtype():
     """Both fused projections follow the runtime dtype, not the checkpoint's;
     a mismatch raises 'expected scalar type Half but found BFloat16'."""
     config = SimpleNamespace(
@@ -150,7 +121,7 @@ def test_fused_projections_share_the_runtime_dtype(gloo_world):
     assert layer.fused_fg_b_proj.weight.dtype == torch.float16
 
 
-def test_eligible_layer_builds_unquantized(gloo_world):
+def test_eligible_layer_builds_unquantized():
     """An eligible layer builds its fused projection unquantized, whatever the
     quantizer would have resolved the fused name to on its own."""
     quant_config = BlockInt8Config.from_config(
