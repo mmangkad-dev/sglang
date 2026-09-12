@@ -319,17 +319,18 @@ def _fused_qkvbfg_is_unquantized(
 
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
-    # A non-None quant_config does not mean these layers are quantized:
     # GLM-5.3-Flash's fp8 checkpoint lists every linear-attention projection in
-    # modules_to_not_convert. Probe the projections the checkpoint actually
-    # names, not the fused groups: is_layer_skipped raises on a group whose
-    # shards disagree, and a mixed group is a reason to stay unfused, not to
-    # fail. LinearBase(1, 1, ...) allocates no weights.
+    # modules_to_not_convert, so a non-None config does not mean these are quantized.
     mapping = Glm5NextForConditionalGeneration.packed_modules_mapping
+    # Probe the names the checkpoint uses, not the fused groups: is_layer_skipped
+    # raises on a group whose shards disagree.
     for group in _FUSED_KDA_PROJECTION_GROUPS:
         for name in mapping[group]:
             probe = LinearBase(
-                1, 1, quant_config=quant_config, prefix=f"{prefix}.{name}"
+                input_size=1,
+                output_size=1,
+                quant_config=quant_config,
+                prefix=f"{prefix}.{name}",
             )
             if not isinstance(probe.quant_method, UnquantizedLinearMethod):
                 return False
@@ -386,10 +387,8 @@ class Glm5NextLinearAttention(nn.Module):
                 self.hidden_size,
                 self.qkvb_sizes,
                 self.fg_sizes,
-                # The constituents are unquantized or this branch is not taken.
-                # Passing the config would let it resolve the fused name on its
-                # own, and not every quantizer maps that back to the names the
-                # checkpoint lists.
+                # The constituents are unquantized or this branch is unreachable.
+                # Not every quantizer maps the fused name back to those names.
                 quant_config=None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
             )
@@ -399,12 +398,11 @@ class Glm5NextLinearAttention(nn.Module):
                 2 * self.head_dim,
             ]
             self.fused_fg_b_proj = ColumnParallelBatchedLinear(
-                2,
-                self.head_dim,
-                projection_size,
-                # The merged projection above feeds this one, and it resolves its
-                # dtype at runtime; the checkpoint's declared dtype is stale when
-                # the loader overrides it.
+                batch=2,
+                input_size=self.head_dim,
+                output_size=projection_size,
+                # Follow the projection feeding this one: the loader can override
+                # the dtype the checkpoint declares.
                 dtype=self.fused_qkvbfg_a_proj.params_dtype,
             )
         else:

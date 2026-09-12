@@ -29,7 +29,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _PREFIX = "model.layers.0.linear_attn"
-# The six projections fused_qkvbfg_a_proj and fused_fg_b_proj are built from.
+# Every projection the two fused groups are built from.
 _KDA_PROJECTIONS = [
     f"{_PREFIX}.{name}"
     for name in (
@@ -65,8 +65,7 @@ def test_unquantized_checkpoint_fuses_without_the_env_gate():
 
 @pytest.mark.parametrize("gate", [False, True])
 def test_quantized_kda_projections_never_fuse(gate):
-    """Fusing genuinely quantized projections would feed the merged GEMM weights
-    in the wrong format, so the gate alone must not be enough to enable it."""
+    """Genuinely quantized projections must not fuse, gate set or not."""
     with envs.SGLANG_OPT_GLM5_NEXT_FUSE_KDA_QKVBFG.override(gate):
         assert not _fused_qkvbfg_is_unquantized(
             quant_config=_fp8_config([]), prefix=_PREFIX
@@ -81,9 +80,11 @@ def test_quantized_kda_projections_never_fuse(gate):
     ],
 )
 def test_mixed_precision_group_declines_instead_of_raising(quantized):
-    """A fused group whose projections disagree on precision must fall back to
-    the unfused path. Probing the fused name raises there instead."""
-    skipped = [p for p in _KDA_PROJECTIONS if p.rsplit(".", 1)[1] not in quantized]
+    """A group whose projections disagree on precision falls back to the
+    unfused path rather than failing to initialize."""
+    skipped = [
+        p for p in _KDA_PROJECTIONS if p.rsplit(".", maxsplit=1)[1] not in quantized
+    ]
     with envs.SGLANG_OPT_GLM5_NEXT_FUSE_KDA_QKVBFG.override(True):
         assert not _fused_qkvbfg_is_unquantized(
             quant_config=_fp8_config(skipped), prefix=_PREFIX
@@ -91,9 +92,8 @@ def test_mixed_precision_group_declines_instead_of_raising(quantized):
 
 
 def test_fp8_checkpoint_that_skips_kda_fuses_only_when_gated():
-    """GLM-5.3-Flash ships fp8 with every linear-attention projection in
-    modules_to_not_convert, so a non-None quant_config does not imply these
-    layers are quantized."""
+    """An fp8 checkpoint that excludes the KDA projections fuses, but only
+    when the gate is set."""
     config = _fp8_config(_KDA_PROJECTIONS)
     with envs.SGLANG_OPT_GLM5_NEXT_FUSE_KDA_QKVBFG.override(True):
         assert _fused_qkvbfg_is_unquantized(quant_config=config, prefix=_PREFIX)
@@ -123,9 +123,8 @@ def gloo_world():
 
 
 def test_fused_projections_share_the_runtime_dtype(gloo_world):
-    """The loader can override the checkpoint's declared dtype. Both fused
-    projections must land on the runtime one, or the first forward hits
-    'expected scalar type Half but found BFloat16'."""
+    """Both fused projections follow the runtime dtype, not the checkpoint's;
+    a mismatch raises 'expected scalar type Half but found BFloat16'."""
     config = SimpleNamespace(
         dtype=torch.bfloat16,
         torch_dtype=torch.bfloat16,
@@ -152,10 +151,8 @@ def test_fused_projections_share_the_runtime_dtype(gloo_world):
 
 
 def test_eligible_layer_builds_unquantized(gloo_world):
-    """Eligibility is decided from the original projection names, so the fused
-    layer must be built unquantized too. A quantizer that resolves the fused
-    name without the packed mapping would otherwise pick a quantized method for
-    it and fail on the block shape."""
+    """An eligible layer builds its fused projection unquantized, whatever the
+    quantizer would have resolved the fused name to on its own."""
     quant_config = BlockInt8Config.from_config(
         {
             "quant_method": "blockwise_int8",
@@ -164,11 +161,13 @@ def test_eligible_layer_builds_unquantized(gloo_world):
             "weight_block_size": [128, 128],
         }
     )
-    # Ask the quantizer the way construction would. Checking is_layer_skipped
-    # directly would keep passing if this config ever gained the packed mapping,
-    # leaving the case covering nothing.
+    # Ask the quantizer the way construction does; checking is_layer_skipped
+    # directly would keep passing if this config gained the packed mapping.
     probe = LinearBase(
-        1, 1, quant_config=quant_config, prefix=f"{_PREFIX}.fused_qkvbfg_a_proj"
+        input_size=1,
+        output_size=1,
+        quant_config=quant_config,
+        prefix=f"{_PREFIX}.fused_qkvbfg_a_proj",
     )
     assert not isinstance(probe.quant_method, UnquantizedLinearMethod), (
         "this quantizer must not resolve the fused name to an unquantized "
