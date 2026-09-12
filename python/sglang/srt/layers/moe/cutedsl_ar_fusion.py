@@ -23,10 +23,7 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
-from sglang.srt.layers.moe import (
-    get_moe_a2a_backend,
-    moe_deferred_finalize_serves,
-)
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -337,10 +334,6 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
             return False
         if m is None:
             m = int(forward_batch.input_ids.shape[0])
-        # Must agree with the MoE's own deferred_finalize bound, or the layer
-        # would skip its all-reduce expecting a handoff that never arrives.
-        if not moe_deferred_finalize_serves(m):
-            return False
         return self._should_use_finalize(forward_batch, m)
 
     def _common_eligible(self, forward_batch: ForwardBatch, m: int) -> bool:
