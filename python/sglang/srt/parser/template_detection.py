@@ -738,9 +738,9 @@ def _load_explicit_jinja_template(chat_template_arg: Optional[str]) -> Optional[
 
 
 def _log_undetected_parser(attr: str, label: str) -> None:
-    logger.warning(
-        f"--{attr.replace('_', '-')}=auto specified but could not detect "
-        f"{label} from chat template. Disabling {label}."
+    logger.info(
+        f"No {label} detected from chat template for "
+        f"--{attr.replace('_', '-')}=auto; {label} disabled."
     )
 
 
