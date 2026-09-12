@@ -13,7 +13,10 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.models.glm5_next import (
     Glm5NextForConditionalGeneration,
@@ -146,6 +149,48 @@ def test_fused_projections_share_the_runtime_dtype(gloo_world):
     assert layer.do_fuse_qkvbfg
     assert layer.fused_qkvbfg_a_proj.params_dtype == torch.float16
     assert layer.fused_fg_b_proj.weight.dtype == torch.float16
+
+
+def test_eligible_layer_builds_unquantized(gloo_world):
+    """Eligibility is decided from the original projection names, so the fused
+    layer must be built unquantized too. A quantizer that resolves the fused
+    name without the packed mapping would otherwise pick a quantized method for
+    it and fail on the block shape."""
+    quant_config = BlockInt8Config.from_config(
+        {
+            "quant_method": "blockwise_int8",
+            "activation_scheme": "dynamic",
+            "ignored_layers": _KDA_PROJECTIONS,
+            "weight_block_size": [128, 128],
+        }
+    )
+    assert not is_layer_skipped(
+        f"{_PREFIX}.fused_qkvbfg_a_proj", quant_config.ignored_layers
+    ), "this quantizer must not recognize the fused name, or the case is moot"
+
+    config = SimpleNamespace(
+        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
+        linear_attn_config={
+            "short_conv_kernel_size": 4,
+            "num_heads": 4,
+            "head_dim": 16,
+        },
+    )
+    with (
+        get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0),
+        envs.SGLANG_OPT_GLM5_NEXT_FUSE_KDA_QKVBFG.override(True),
+        set_default_torch_dtype(torch.bfloat16),
+    ):
+        layer = Glm5NextLinearAttention(
+            layer_idx=0,
+            hidden_size=64,
+            config=config,
+            quant_config=quant_config,
+            prefix=_PREFIX,
+        )
+    assert layer.do_fuse_qkvbfg
+    assert isinstance(layer.fused_qkvbfg_a_proj.quant_method, UnquantizedLinearMethod)
 
 
 if __name__ == "__main__":

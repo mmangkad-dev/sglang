@@ -386,7 +386,11 @@ class Glm5NextLinearAttention(nn.Module):
                 self.hidden_size,
                 self.qkvb_sizes,
                 self.fg_sizes,
-                quant_config=quant_config,
+                # The constituents are unquantized or this branch is not taken.
+                # Passing the config would let it resolve the fused name on its
+                # own, and not every quantizer maps that back to the names the
+                # checkpoint lists.
+                quant_config=None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
             )
             self.split_sizes = [
