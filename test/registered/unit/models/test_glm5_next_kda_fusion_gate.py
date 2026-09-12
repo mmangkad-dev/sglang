@@ -20,7 +20,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-_PREFIX = "model.layers.0.linear_attn"
+# GLM-5.3-Flash names its KDA layers self_attn, and its checkpoint lists these
+# projections under that prefix.
+_PREFIX = "model.layers.0.self_attn"
 # Every projection the two fused groups are built from.
 _KDA_PROJECTIONS = [
     f"{_PREFIX}.{name}"
