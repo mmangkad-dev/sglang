@@ -252,6 +252,7 @@ class FlashInferMNNVLCuteDSLARFusion:
         weight_bias: float,
         process_group: ProcessGroup,
         device: torch.device,
+        fuse_residual: bool = True,
     ) -> None:
         if hidden_size <= 0 or top_k <= 0 or max_m <= 0:
             raise ValueError("hidden_size, top_k, and max_m must be positive")
@@ -263,6 +264,9 @@ class FlashInferMNNVLCuteDSLARFusion:
         self.max_m = int(max_m)
         self.rms_epsilon = float(rms_epsilon)
         self.weight_bias = float(weight_bias)
+        # A model whose residual stream is not a plain add (mHC hyper-connections,
+        # for one) takes the reduced value back and combines it itself.
+        self.fuse_residual = bool(fuse_residual)
         self.process_group = process_group
         self.device = torch.device(device)
 
@@ -331,7 +335,7 @@ class FlashInferMNNVLCuteDSLARFusion:
                 routed_scaling_factor=1.0,
                 weight_bias=self.weight_bias,
                 include_shared_expert=True,
-                add_residual=True,
+                add_residual=self.fuse_residual,
                 write_residual_output=True,
                 config=self.workspace_config,
             )
@@ -361,6 +365,8 @@ class FlashInferMNNVLCuteDSLARFusion:
         residual: torch.Tensor,
         gamma: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.fuse_residual:
+            raise RuntimeError("workspace was compiled without the residual add")
         m = int(permuted_indices.shape[0])
         if not self.supports(m):
             raise ValueError(f"workspace does not support M={m}")
@@ -395,6 +401,8 @@ class FlashInferMNNVLCuteDSLARFusion:
         residual: torch.Tensor,
         gamma: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.fuse_residual:
+            raise RuntimeError("workspace was compiled without the residual add")
         m = int(local_contribution.shape[0])
         if not self.supports(m):
             raise ValueError(f"workspace does not support M={m}")
@@ -416,6 +424,38 @@ class FlashInferMNNVLCuteDSLARFusion:
         )
         return norm_output, residual_output
 
+    def all_reduce(
+        self,
+        *,
+        local_contribution: torch.Tensor,
+        gamma: torch.Tensor,
+        norm_scratch: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reduce across TP ranks and hand the sum back unnormalized.
+
+        The compiled kernel always produces the normalized value too; a caller
+        whose residual stream is not a plain add reads the pre-norm output and
+        lets ``norm_scratch`` absorb the rest.
+        """
+        if self.fuse_residual:
+            raise RuntimeError("workspace was compiled with the residual add")
+        m = int(local_contribution.shape[0])
+        if not self.supports(m):
+            raise ValueError(f"workspace does not support M={m}")
+        output = torch.empty_like(local_contribution)
+        self._allreduce_fusion(
+            input=local_contribution,
+            workspace=self.workspace,
+            pattern=self._patterns.kARResidualRMSNorm,
+            launch_with_pdl=True,
+            residual_out=output,
+            norm_out=norm_scratch,
+            rms_gamma=gamma,
+            rms_eps=self.rms_epsilon,
+            weight_bias=self.weight_bias,
+        )
+        return output
+
 
 _WORKSPACE: FlashInferMNNVLCuteDSLARFusion | None = None
 
@@ -427,6 +467,7 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
     max_m: int,
     rms_epsilon: float,
     weight_bias: float,
+    fuse_residual: bool = True,
 ) -> FlashInferMNNVLCuteDSLARFusion:
     """Build the process-local workspace. Must run before graph capture."""
     if not torch.cuda.is_available():
@@ -454,5 +495,6 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
         weight_bias=weight_bias,
         process_group=get_tp_group().device_group,
         device=torch.device("cuda", torch.cuda.current_device()),
+        fuse_residual=fuse_residual,
     )
     return _WORKSPACE

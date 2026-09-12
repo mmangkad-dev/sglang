@@ -99,7 +99,13 @@ from sglang.srt.multimodal.mm_utils import (
     run_dp_presharded_mrope_vision_model,
     run_dp_sharded_mrope_vision_model,
 )
-from sglang.srt.runtime_context import get_forward, get_mm, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_mm,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     BumpAllocator,
@@ -556,6 +562,19 @@ class Glm5NextLinearAttention(nn.Module):
         return self.o_proj(core_attn_out)[0]
 
 
+def _use_mnnvl_cutedsl_fusion(config: Glm5NextTextConfig, is_nextn: bool) -> bool:
+    """GLM-5-Next drives the residual-free MNNVL CuTe DSL AllReduce.
+
+    The draft (nextn) stack stays on the ordinary path: it is one layer, and a
+    second forward shape would need its own compiled workspace.
+    """
+    return bool(
+        not is_nextn
+        and config.mhc
+        and get_exec().comm.flashinfer_allreduce_fusion_backend == "cutedsl"
+    )
+
+
 class Glm5NextDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -637,6 +656,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
                 is_nextn=is_nextn,
+                enable_deferred_finalize=_use_mnnvl_cutedsl_fusion(config, is_nextn),
             )
         else:
             if enable_moe_dense_fully_dp():
@@ -699,7 +719,15 @@ class Glm5NextDecoderLayer(nn.Module):
                 hc_ffn_pre=self.hc_ffn_pre,
                 hc_post=self.hc_post,
             )
-            self.layer_communicator = MHCLayerCommunicator(
+            if _use_mnnvl_cutedsl_fusion(config, is_nextn):
+                from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+                    CuteDSLBareAllReduceMHCLayerCommunicator,
+                )
+
+                communicator_cls = CuteDSLBareAllReduceMHCLayerCommunicator
+            else:
+                communicator_cls = MHCLayerCommunicator
+            self.layer_communicator = communicator_cls(
                 **shared_kwargs,
                 **mhc_kwargs,
             )
@@ -805,6 +833,16 @@ class Glm5NextDecoderLayer(nn.Module):
             )
         )
 
+        # The MNNVL path reduces the MLP output inside postprocess_layer, so the
+        # MLP must not reduce it first; postprocess_layer still runs.
+        defer_mlp_allreduce = self.layer_communicator.should_defer_mlp_allreduce(
+            forward_batch
+        )
+        # Both suppress the MLP's own all-reduce and their postconditions are
+        # mutually exclusive: one hands the reduction to the next layer and skips
+        # postprocess_layer, the other needs postprocess_layer to perform it.
+        assert not (should_allreduce_fusion and defer_mlp_allreduce)
+
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
@@ -824,7 +862,7 @@ class Glm5NextDecoderLayer(nn.Module):
             _mlp_ctx = nullcontext()
 
         with get_forward().scoped(
-            fuse_mlp_allreduce=should_allreduce_fusion,
+            fuse_mlp_allreduce=should_allreduce_fusion or defer_mlp_allreduce,
             mlp_reduce_scatter=use_reduce_scatter,
         ):
             with _mlp_ctx:
@@ -895,6 +933,25 @@ class Glm5NextModel(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
+        from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+            install_cutedsl_bare_all_reduce,
+        )
+
+        if _use_mnnvl_cutedsl_fusion(config, is_nextn=False) and (
+            self.pp_group.world_size != 1
+        ):
+            raise RuntimeError(
+                "GLM-5-Next FlashInfer MNNVL CuTe DSL fusion requires PP=1"
+            )
+        self.flashinfer_mnnvl_cutedsl_fusion = install_cutedsl_bare_all_reduce(
+            # PP pads self.layers with PPMissingLayer, which has no communicator.
+            self.layers[self.start_layer : self.end_layer],
+            hidden_size=config.hidden_size,
+            top_k=config.num_experts_per_tok,
+            rms_epsilon=config.rms_norm_eps,
+            label="GLM-5-Next",
+        )
+
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -947,6 +1004,17 @@ class Glm5NextModel(nn.Module):
             self.enable_a2a_moe = True
         else:
             self.enable_a2a_moe = False
+
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        from sglang.srt.layers.moe.cutedsl_ar_fusion import (
+            prepare_cutedsl_bare_all_reduce,
+        )
+
+        prepare_cutedsl_bare_all_reduce(
+            self.flashinfer_mnnvl_cutedsl_fusion,
+            max_running_requests=model_runner.max_running_requests,
+            label="GLM-5-Next",
+        )
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
@@ -1181,6 +1249,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.is_mrope_enabled = not self.encoder_only and "mrope_section" in (
             self.config.rope_scaling or {}
         )
+
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        # BaseRunner looks the hook up here; the handle lives on the inner model.
+        if self.model is not None:
+            self.model.prepare_before_cuda_graph_capture(model_runner)
 
     def get_input_embeddings(self) -> nn.Embedding:
         if self.model is None:

@@ -156,6 +156,7 @@ def test_wrapper_calls_only_the_stable_unified_api():
     wrapper.max_m = 4
     wrapper.rms_epsilon = 1e-5
     wrapper.weight_bias = 0.0
+    wrapper.fuse_residual = True
     wrapper.device = torch.device("cpu")
     wrapper.workspace = object()
     wrapper.supports = lambda m: True
@@ -482,6 +483,86 @@ def test_dual_stream_op_still_republishes_its_operand_flags():
 
     assert seen["fuse"] is True
     assert seen["scatter"] is False
+
+
+def test_bare_workspace_refuses_the_fused_patterns():
+    """A workspace compiled without the residual add cannot serve the fused
+    patterns; the model reads the cross-rank sum and combines it itself."""
+    wrapper = object.__new__(FlashInferMNNVLCuteDSLARFusion)
+    wrapper.fuse_residual = False
+
+    with pytest.raises(RuntimeError, match="without the residual add"):
+        wrapper.all_reduce_residual_rms_norm(
+            local_contribution=torch.empty(2, 8, dtype=torch.bfloat16),
+            residual=torch.empty(2, 8, dtype=torch.bfloat16),
+            gamma=torch.empty(8, dtype=torch.bfloat16),
+        )
+
+
+def test_fused_workspace_refuses_the_bare_collective():
+    """The converse: reading the pre-norm output of a residual-adding workspace
+    would return sum + residual, not the sum."""
+    wrapper = object.__new__(FlashInferMNNVLCuteDSLARFusion)
+    wrapper.fuse_residual = True
+
+    with pytest.raises(RuntimeError, match="with the residual add"):
+        wrapper.all_reduce(
+            local_contribution=torch.empty(2, 8, dtype=torch.bfloat16),
+            gamma=torch.empty(8, dtype=torch.bfloat16),
+            norm_scratch=torch.empty(2, 8, dtype=torch.bfloat16),
+        )
+
+
+def test_bare_collective_reads_the_pre_norm_output():
+    """The sum leaves through residual_out; norm_out is scratch the model never
+    reads. Swapping them would silently return normalized values."""
+    calls = {}
+    wrapper = object.__new__(FlashInferMNNVLCuteDSLARFusion)
+    wrapper.fuse_residual = False
+    wrapper.rms_epsilon = 1e-5
+    wrapper.weight_bias = 0.0
+    wrapper.workspace = object()
+    wrapper.supports = lambda m: True
+    wrapper._patterns = SimpleNamespace(kARResidualRMSNorm=1)
+    wrapper._allreduce_fusion = lambda **kw: calls.update(kw)
+
+    local = torch.empty(2, 8, dtype=torch.bfloat16)
+    scratch = torch.empty(2, 8, dtype=torch.bfloat16)
+    out = wrapper.all_reduce(
+        local_contribution=local,
+        gamma=torch.empty(8, dtype=torch.bfloat16),
+        norm_scratch=scratch,
+    )
+
+    assert calls["residual_out"] is out
+    assert calls["norm_out"] is scratch
+    assert calls["pattern"] == 1
+
+
+def test_decode_max_m_scales_by_the_draft_token_count():
+    """Speculative decode submits num_draft_tokens rows per request, and the
+    workspace is compiled for a fixed M_max: under-sizing it silently drops the
+    optimization at every eligible forward."""
+    from sglang.srt.layers.moe.cutedsl_ar_fusion import resolve_decode_max_m
+
+    reset_context()
+    publish(
+        ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="EAGLE",
+            speculative_num_draft_tokens=6,
+            speculative_num_steps=5,
+            speculative_eagle_topk=1,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(max_bs=64, bs=[1, 16, 64]),
+                prefill=PhaseConfig(max_bs=4096, bs=[4096]),
+            ),
+        ),
+        role="test",
+    )
+
+    # Prefill bounds are excluded; 64 requests x 6 draft tokens.
+    assert resolve_decode_max_m(max_running_requests=64) == 384
 
 
 if __name__ == "__main__":
