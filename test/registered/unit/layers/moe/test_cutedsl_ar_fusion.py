@@ -342,6 +342,77 @@ def test_hybrid_ep_tp_is_refused_like_the_base_communicator():
             assert comm._common_eligible(forward_batch, 8) is True
 
 
+def test_a_replicated_shared_expert_producer_keeps_its_own_all_reduce():
+    """A TP1 shared expert is added after the layer's own reduction, so handing
+    that reduction to the next layer would scale the shared output by tp_size."""
+    producer = _eligible_communicator(successor=True)
+    producer.owes_local_reduction = True
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE, input_ids=torch.zeros(8)
+    )
+
+    with (
+        patch.object(
+            CuteDSLFusionLayerCommunicator, "_common_eligible", return_value=True
+        ),
+        patch.object(
+            CuteDSLFusionLayerCommunicator,
+            "should_defer_moe_finalize",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.layers.moe.cutedsl_ar_fusion.fused_norm_gamma",
+            return_value=torch.empty(8),
+        ),
+        patch(
+            "sglang.srt.layers.moe.cutedsl_ar_fusion.get_exec",
+            return_value=SimpleNamespace(
+                comm=SimpleNamespace(enable_quant_communications=False)
+            ),
+        ),
+        patch.object(
+            LayerCommunicator,
+            "should_fuse_mlp_allreduce_with_next_layer",
+            return_value=False,
+        ),
+    ):
+        # The publisher of fuse_mlp_allreduce, which is what skips the reduction.
+        assert (
+            producer.should_fuse_mlp_allreduce_with_next_layer(forward_batch) is False
+        )
+        assert producer._can_absorb_post_moe_all_reduce(forward_batch, 8) is False
+        # Consuming what a predecessor skipped stays independently eligible.
+        assert producer._can_consume_post_moe_all_reduce(forward_batch, 8) is True
+
+
+def test_install_records_which_producers_owe_a_local_reduction():
+    """install_cutedsl_fusion must carry the model's predicate onto the layer,
+    or a replicated shared expert silently keeps the unsafe fusion."""
+    from sglang.srt.layers.moe.cutedsl_ar_fusion import install_cutedsl_fusion
+
+    layers = [
+        SimpleNamespace(
+            layer_communicator=CuteDSLFusionLayerCommunicator.__new__(
+                CuteDSLFusionLayerCommunicator
+            ),
+            replicated=replicated,
+        )
+        for replicated in (True, False)
+    ]
+    install_cutedsl_fusion(
+        layers,
+        hidden_size=8,
+        top_k=2,
+        rms_epsilon=1e-6,
+        can_defer_finalize=lambda layer: not layer.replicated,
+        requires_local_reduction=lambda layer: layer.replicated,
+        label="test",
+    )
+
+    assert layers[0].layer_communicator.owes_local_reduction is True
+    assert layers[1].layer_communicator.owes_local_reduction is False
+
+
 def _call_dual_stream_op(fusion, hidden_states, *, fuse_mlp_allreduce=True):
     """Redispatching to the CUDA key runs the real registered implementation
     and its schema, while the stubbed MoE keeps the tensors on CPU."""

@@ -193,6 +193,10 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
     # this excludes the last layer, whose final norm performs no all-reduce.
     successor_absorbs_all_reduce: bool = False
 
+    # This layer's MoE adds a replicated contribution after its own reduction,
+    # so moving that reduction to the next layer would scale it by tp_size.
+    owes_local_reduction: bool = False
+
     def prepare_attn(
         self,
         hidden_states,
@@ -319,9 +323,10 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
         self, forward_batch: ForwardBatch, m: int
     ) -> bool:
         """Outgoing: may this layer skip its own all-reduce because the next
-        one absorbs it. Stands in its own eligibility for the successor's."""
+        one absorbs it. Refused when it owes a local reduction."""
         return (
             self.successor_absorbs_all_reduce
+            and not self.owes_local_reduction
             and self._can_consume_post_moe_all_reduce(forward_batch, m)
         )
 
@@ -358,8 +363,8 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
         m = int(forward_batch.input_ids.shape[0])
         if self.should_defer_moe_finalize(forward_batch, m):
             return True
-        # Above the finalize bound the next layer's input norm can still absorb
-        # the plain post-MoE all-reduce, so keep skipping it here.
+        # A runner that returns a plain tensor can still hand its all-reduce
+        # to the next layer's input norm.
         if self._can_absorb_post_moe_all_reduce(forward_batch, m):
             return True
         return super().should_fuse_mlp_allreduce_with_next_layer(forward_batch)
@@ -372,6 +377,7 @@ def install_cutedsl_fusion(
     top_k: int,
     rms_epsilon: float,
     can_defer_finalize,
+    requires_local_reduction=lambda layer: False,
     final_norm_consumes_handoff: bool = False,
     label: str,
 ) -> CuteDSLFusionService | None:
@@ -381,7 +387,8 @@ def install_cutedsl_fusion(
     layer of a model shares. Every entry of ``layers`` must carry a
     ``layer_communicator``, so a PP-padded list is sliced to the local range
     first. Set ``final_norm_consumes_handoff`` only when the model's final norm
-    closes out the last layer's handoff.
+    closes out the last layer's handoff, and ``requires_local_reduction`` for a
+    layer whose MoE adds a replicated output after its own all-reduce.
     """
     fusion_layers = [
         layer
@@ -414,6 +421,7 @@ def install_cutedsl_fusion(
         communicator.successor_absorbs_all_reduce = successor is not None and (
             isinstance(successor.layer_communicator, CuteDSLFusionLayerCommunicator)
         )
+        communicator.owes_local_reduction = bool(requires_local_reduction(layer))
     logger.info(
         "Installed one %s FlashInfer MNNVL CuTe DSL fusion handle for %d of %d layers "
         "(%d can defer the MoE finalize)",

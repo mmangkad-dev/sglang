@@ -2770,6 +2770,11 @@ class DeepseekV2Model(nn.Module):
                 and layer.mlp.experts.supports_deferred_finalize
                 and not layer.mlp._shared_expert_tp1
             ),
+            # A TP1-replicated shared expert is added after the layer's own
+            # all-reduce, so that reduction cannot move to the next layer.
+            requires_local_reduction=lambda layer: (
+                isinstance(layer.mlp, DeepseekV2MoE) and layer.mlp._shared_expert_tp1
+            ),
             # The final norm takes a plain tensor, not a handoff.
             final_norm_consumes_handoff=False,
             label="DeepSeek-V3/GLM",
