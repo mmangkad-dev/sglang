@@ -203,32 +203,46 @@ def test_flashkda_spec_verify_falls_back():
 
 
 @pytest.mark.parametrize(
-    "seq_lens,expect_fallback",
+    "seq_lens,num_heads,expect_fallback",
     [
-        ([32], True),  # below the chunk size
-        ([256], False),  # short single sequence: FlashKDA
-        ([2048], False),  # at the short-sequence bound
-        ([8192], True),  # one long sequence cannot fill the grid
-        ([8192, 1024], True),  # long + short: still one long-sequence equivalent
-        ([8192, 8192], False),  # two long equivalents: FlashKDA
-        ([8192, 4096, 4096], False),  # mixed, two equivalents
-        ([4096, 2048], True),  # 1.5 equivalents: below the threshold
+        # Below the chunk size, and short sequences (win at any head count).
+        ([32], 16, True),
+        ([256], 16, False),
+        ([2048], 16, False),
+        ([2048], 4, False),  # short: no occupancy requirement
+        # Long sequences: the gate needs seqs x heads >= 32 CTAs, where "seqs"
+        # is total/longest so a batch padded with short requests does not count
+        # as full. Measured speedups are in the comment on the gate itself.
+        ([8192], 16, True),  # 16 CTAs -> 0.83x
+        ([8192, 1024], 16, True),  # 1.1 equivalents -> 0.85x
+        ([8192, 8192], 16, False),  # 32 CTAs -> 1.13x
+        ([8192, 4096, 4096], 16, False),  # 32 CTAs -> 1.12x
+        ([4096, 2048], 16, True),  # 1.5 equivalents, 24 CTAs
+        # Same batches, different per-rank head counts: the crossover moves.
+        ([8192, 8192], 8, True),  # 16 CTAs -> 0.77x, must not run FlashKDA
+        ([8192] * 4, 8, False),  # 32 CTAs -> 1.06x
+        ([8192] * 4, 4, True),  # 16 CTAs -> 0.82x
+        ([8192] * 8, 4, False),  # 32 CTAs -> 1.14x
+        ([8192], 32, False),  # 32 CTAs -> 1.07x, wins on one sequence
     ],
 )
-def test_flashkda_batch_fill_gate(seq_lens, expect_fallback):
-    """The long-sequence gate keys off total tokens / longest sequence, not the
-    longest sequence alone: FlashKDA's cost tracks the longest sequence while
-    Triton's tracks total tokens, so a batch of comparably-long sequences is a
-    FlashKDA win even well past _FLASHKDA_SHORT_SEQ_LEN."""
+def test_flashkda_batch_fill_gate(seq_lens, num_heads, expect_fallback):
+    """The long-sequence gate keys off grid occupancy -- (total tokens /
+    longest sequence) x per-rank heads -- not the longest sequence alone.
+    FlashKDA's cost tracks the longest sequence while Triton's tracks total
+    tokens, so a well-populated batch is a FlashKDA win well past
+    _FLASHKDA_SHORT_SEQ_LEN, and a thin one is a loss even at 2 sequences."""
     cu = torch.zeros(len(seq_lens) + 1, device="cuda", dtype=torch.int32)
     cu[1:] = torch.tensor(seq_lens, device="cuda").cumsum(0)
 
     # Both the CPU-list and the query_start_loc-derived paths must agree.
     for lens_cpu in (seq_lens, None):
         assert (
-            FlashKDAKernel._should_fall_back(LOWER_BOUND, False, cu, lens_cpu)
+            FlashKDAKernel._should_fall_back(
+                LOWER_BOUND, False, cu, lens_cpu, num_heads
+            )
             is expect_fallback
-        ), f"seq_lens={seq_lens} extend_seq_lens_cpu={lens_cpu}"
+        ), f"seq_lens={seq_lens} heads={num_heads} extend_seq_lens_cpu={lens_cpu}"
 
 
 if __name__ == "__main__":
