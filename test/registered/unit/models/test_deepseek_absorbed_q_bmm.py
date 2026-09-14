@@ -60,21 +60,29 @@ class TestAbsorbedQBmm(CustomTestCase):
 
         Only shapes whose token AND head counts both exceed 1 catch this; the
         `out=` view is contiguous anyway when either is 1.
+
+        Values are checked to tolerance, not bit-for-bit: a backend may lower
+        the BMM to a kernel that accumulates in a different order (inductor
+        does, at one token). Bit-exactness is the untraced path's claim.
         """
-        for num_tokens, num_heads in SHAPES:
-            with self.subTest(tokens=num_tokens, heads=num_heads):
-                q_nope, w_kc = _inputs(
-                    num_tokens=num_tokens, num_heads=num_heads, dtype=torch.float32
-                )
-                expected = _reference(q_nope=q_nope, w_kc=w_kc)
-                torch._dynamo.reset()
-                compiled = torch.compile(
-                    _absorbed_q_bmm, backend="eager", fullgraph=True
-                )
-                with enable_tc_piecewise_cuda_graph():
-                    out = compiled(q_nope=q_nope, w_kc=w_kc)
-                self.assertEqual(out.shape, expected.shape)
-                self.assertTrue(torch.equal(out, expected))
+        # Both values of the tc_piecewise `tc_compiler` setting.
+        for backend in ("eager", "inductor"):
+            for num_tokens, num_heads in SHAPES:
+                with self.subTest(backend=backend, tokens=num_tokens, heads=num_heads):
+                    q_nope, w_kc = _inputs(
+                        num_tokens=num_tokens,
+                        num_heads=num_heads,
+                        dtype=torch.float32,
+                    )
+                    expected = _reference(q_nope=q_nope, w_kc=w_kc)
+                    torch._dynamo.reset()
+                    compiled = torch.compile(
+                        _absorbed_q_bmm, backend=backend, fullgraph=True
+                    )
+                    with enable_tc_piecewise_cuda_graph():
+                        out = compiled(q_nope=q_nope, w_kc=w_kc)
+                    self.assertEqual(out.shape, expected.shape)
+                    torch.testing.assert_close(out, expected)
 
 
 if __name__ == "__main__":
