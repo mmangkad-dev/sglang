@@ -9,9 +9,13 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 # FlashKDA chunk size. Sequences shorter than this fall back to Triton.
 _FLASHKDA_CHUNK_SIZE = 64
 
-# FlashKDA's max sequence length, Batches whose longest sequence exceeds this
-# fall back to Triton for the whole batch.
-_FLASHKDA_MAX_SEQ_LEN = 2048
+# Length below which FlashKDA wins on a single sequence, so no batch-fill check
+# is needed.
+_FLASHKDA_SHORT_SEQ_LEN = 2048
+
+# Above _FLASHKDA_SHORT_SEQ_LEN, FlashKDA needs this many longest-sequence
+# equivalents (total tokens / longest sequence) in the batch to beat Triton.
+_FLASHKDA_MIN_SEQ_EQUIVALENTS = 2.0
 
 
 def _load_flash_kda():
@@ -153,22 +157,22 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 track_chunk_idx=kwargs.get("track_chunk_idx"),
             )
 
-        return (
-            self._flashkda_extend(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                lower_bound=lower_bound,
-                beta_is_raw=beta_is_raw,
-            ),
-            None,
+        # Bare tensor, matching chunk_kda and the other KDA extend kernels: the
+        # caller only unpacks (output, h) when it asked for intermediate states,
+        # and that request always takes the Triton fallback above.
+        return self._flashkda_extend(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            beta_is_raw=beta_is_raw,
         )
 
     @staticmethod
@@ -189,23 +193,39 @@ class FlashKDAKernel(LinearAttnKernelBase):
         # gate them here rather than relying on the decode/target_verify stubs.
         if is_spec_decode:
             return True
-        # Short sequences (< chunk size) and long sequences (> the crossover
-        # where Triton's chunked prefill wins) are faster on Triton. Read the
-        # per-request lengths from the CPU-side extend_seq_lens to avoid a
-        # GPU->CPU sync on every layer; derive from query_start_loc (one sync)
-        # only if they are unavailable.
+        # Read the per-request lengths from the CPU-side extend_seq_lens to
+        # avoid a GPU->CPU sync on every layer; derive from query_start_loc
+        # (one sync) only if they are unavailable.
         if extend_seq_lens_cpu is not None:
             if torch.is_tensor(extend_seq_lens_cpu):
                 lo = int(extend_seq_lens_cpu.min())
                 hi = int(extend_seq_lens_cpu.max())
+                total = int(extend_seq_lens_cpu.sum())
             else:
                 lo = min(extend_seq_lens_cpu)
                 hi = max(extend_seq_lens_cpu)
+                total = sum(extend_seq_lens_cpu)
         else:
             seq_lens = query_start_loc[1:] - query_start_loc[:-1]
             lo_t, hi_t = torch.aminmax(seq_lens)
-            lo, hi = int(lo_t), int(hi_t)
-        return lo < _FLASHKDA_CHUNK_SIZE or hi > _FLASHKDA_MAX_SEQ_LEN
+            lo, hi, total = (
+                int(x) for x in torch.stack((lo_t, hi_t, seq_lens.sum())).tolist()
+            )
+        # Sequences below the chunk size are faster on Triton.
+        if lo < _FLASHKDA_CHUNK_SIZE:
+            return True
+        # FlashKDA parallelizes over (sequences x heads), so its cost tracks the
+        # LONGEST sequence in the batch; Triton chunk_kda also parallelizes over
+        # chunks within a sequence, so its cost tracks TOTAL tokens. Past
+        # _FLASHKDA_SHORT_SEQ_LEN the fused kernel therefore only wins once the
+        # batch holds enough comparably-long sequences to fill the grid -- one
+        # long sequence leaves it underutilized. Measured on GB300 at the
+        # GLM-5.3-Flash per-rank KDA shape (H=16, D=128, bf16), speedup vs
+        # Triton: 1x2048 1.94x, 1x4096 0.99x, 1x8192 0.82x, 1x32768 0.78x,
+        # 8192+1024 0.85x, but 2x8192 1.12x, 4x8192 1.69x, 8x2048 2.74x.
+        return (
+            hi > _FLASHKDA_SHORT_SEQ_LEN and total < _FLASHKDA_MIN_SEQ_EQUIVALENTS * hi
+        )
 
     def _flashkda_extend(
         self,

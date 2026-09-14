@@ -80,7 +80,7 @@ def _chunk_kda_ref(d, lower_bound):
     """Triton chunk_kda reference. chunk_kda mutates g/v and the state in place,
     so feed clones; returns (output, updated_state_slots)."""
     st = d["pool"].clone()
-    out, _ = chunk_kda(
+    out = chunk_kda(
         q=d["q"].clone(),
         k=d["k"].clone(),
         v=d["v"].clone(),
@@ -94,6 +94,10 @@ def _chunk_kda_ref(d, lower_bound):
         dt_bias=d["dt_bias"],
         lower_bound=lower_bound,
     )
+    # chunk_kda returns the output alone unless intermediate states are asked
+    # for; keep accepting the legacy (output, states) tuple.
+    if isinstance(out, tuple):
+        out = out[0]
     return out, st[d["idx"]]
 
 
@@ -105,7 +109,7 @@ def test_flashkda_matches_triton_safe_gate(seq_lens):
     ref_out, ref_state = _chunk_kda_ref(d, LOWER_BOUND)
 
     st_fk = d["pool"].clone()
-    out, h = FlashKDAKernel().extend(
+    out = FlashKDAKernel().extend(
         d["q"].clone(),
         d["k"].clone(),
         d["v"].clone(),
@@ -121,7 +125,9 @@ def test_flashkda_matches_triton_safe_gate(seq_lens):
     )
     torch.cuda.synchronize()
 
-    assert h is None
+    # Every KDA extend kernel returns a bare tensor unless intermediate states
+    # were requested; the backend indexes the result directly.
+    assert isinstance(out, torch.Tensor), f"extend returned {type(out).__name__}"
     assert torch.isfinite(out).all(), "FlashKDA output has non-finite values"
     assert torch.isfinite(st_fk).all(), "FlashKDA final state has non-finite values"
     # bf16 cross-implementation noise (chunk=16 CUTLASS vs chunk=64 Triton);
@@ -141,7 +147,7 @@ def test_flashkda_falls_back_without_lower_bound():
     ref_out, _ = _chunk_kda_ref(d, None)
 
     st_fk = d["pool"].clone()
-    out, _ = FlashKDAKernel().extend(
+    out = FlashKDAKernel().extend(
         d["q"].clone(),
         d["k"].clone(),
         d["v"].clone(),
@@ -171,7 +177,7 @@ def test_flashkda_spec_verify_falls_back():
     ref_out, _ = _chunk_kda_ref(d, LOWER_BOUND)
 
     st_fk = d["pool"].clone()
-    out, _ = FlashKDAKernel().extend(
+    out = FlashKDAKernel().extend(
         d["q"].clone(),
         d["k"].clone(),
         d["v"].clone(),
@@ -194,6 +200,35 @@ def test_flashkda_spec_verify_falls_back():
     assert _cos(ref_out, out) > 0.999, (
         f"spec-decode did not fall back: {_cos(ref_out, out):.4f}"
     )
+
+
+@pytest.mark.parametrize(
+    "seq_lens,expect_fallback",
+    [
+        ([32], True),  # below the chunk size
+        ([256], False),  # short single sequence: FlashKDA
+        ([2048], False),  # at the short-sequence bound
+        ([8192], True),  # one long sequence cannot fill the grid
+        ([8192, 1024], True),  # long + short: still one long-sequence equivalent
+        ([8192, 8192], False),  # two long equivalents: FlashKDA
+        ([8192, 4096, 4096], False),  # mixed, two equivalents
+        ([4096, 2048], True),  # 1.5 equivalents: below the threshold
+    ],
+)
+def test_flashkda_batch_fill_gate(seq_lens, expect_fallback):
+    """The long-sequence gate keys off total tokens / longest sequence, not the
+    longest sequence alone: FlashKDA's cost tracks the longest sequence while
+    Triton's tracks total tokens, so a batch of comparably-long sequences is a
+    FlashKDA win even well past _FLASHKDA_SHORT_SEQ_LEN."""
+    cu = torch.zeros(len(seq_lens) + 1, device="cuda", dtype=torch.int32)
+    cu[1:] = torch.tensor(seq_lens, device="cuda").cumsum(0)
+
+    # Both the CPU-list and the query_start_loc-derived paths must agree.
+    for lens_cpu in (seq_lens, None):
+        assert (
+            FlashKDAKernel._should_fall_back(LOWER_BOUND, False, cu, lens_cpu)
+            is expect_fallback
+        ), f"seq_lens={seq_lens} extend_seq_lens_cpu={lens_cpu}"
 
 
 if __name__ == "__main__":
