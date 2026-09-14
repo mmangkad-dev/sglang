@@ -1,6 +1,5 @@
-"""The absorbed MLA query BMM must stay torch.compile-able and keep its result
-token-major: MLA prefill is traced under `--cuda-graph-backend-prefill=tc_piecewise`,
-and Dynamo rejects the non-contiguous `out=` that lands the token-major layout.
+"""MLA prefill is traced under `--cuda-graph-backend-prefill=tc_piecewise`, where
+Dynamo rejects the non-contiguous `out=` that lands the absorbed query token-major.
 """
 
 import unittest
@@ -16,7 +15,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     enable_tc_piecewise_cuda_graph,
 )
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
-    absorbed_q_bmm,
+    _absorbed_q_bmm,
 )
 
 # (num_tokens, num_heads); GLM-5.3-Flash at TP4 is 16 heads, 256 -> 512.
@@ -30,14 +29,14 @@ SHAPES = [
 QK_NOPE_HEAD_DIM, KV_LORA_RANK = 8, 6
 
 
-def _inputs(num_tokens, num_heads, dtype):
+def _inputs(*, num_tokens: int, num_heads: int, dtype: torch.dtype):
     torch.manual_seed(0)
     q_nope = torch.randn(num_tokens, num_heads, QK_NOPE_HEAD_DIM, dtype=dtype)
     w_kc = torch.randn(num_heads, QK_NOPE_HEAD_DIM, KV_LORA_RANK, dtype=dtype)
     return q_nope, w_kc
 
 
-def _reference(q_nope, w_kc):
+def _reference(*, q_nope: torch.Tensor, w_kc: torch.Tensor) -> torch.Tensor:
     return torch.bmm(q_nope.transpose(0, 1), w_kc).transpose(0, 1)
 
 
@@ -47,11 +46,14 @@ class TestAbsorbedQBmm(CustomTestCase):
         for num_tokens, num_heads in SHAPES:
             for dtype in (torch.float32, torch.bfloat16):
                 with self.subTest(tokens=num_tokens, heads=num_heads, dtype=dtype):
-                    q_nope, w_kc = _inputs(num_tokens, num_heads, dtype)
-                    out = absorbed_q_bmm(q_nope=q_nope, w_kc=w_kc)
+                    q_nope, w_kc = _inputs(
+                        num_tokens=num_tokens, num_heads=num_heads, dtype=dtype
+                    )
+                    out = _absorbed_q_bmm(q_nope=q_nope, w_kc=w_kc)
                     self.assertEqual(out.shape, (num_tokens, num_heads, KV_LORA_RANK))
                     self.assertTrue(out.is_contiguous())
-                    self.assertTrue(torch.equal(out, _reference(q_nope, w_kc)))
+                    expected = _reference(q_nope=q_nope, w_kc=w_kc)
+                    self.assertTrue(torch.equal(out, expected))
 
     def test_compiles_while_traced(self):
         """Traced, the helper must not hand Dynamo a non-contiguous `out=`.
@@ -61,14 +63,16 @@ class TestAbsorbedQBmm(CustomTestCase):
         """
         for num_tokens, num_heads in SHAPES:
             with self.subTest(tokens=num_tokens, heads=num_heads):
-                q_nope, w_kc = _inputs(num_tokens, num_heads, torch.float32)
-                expected = _reference(q_nope, w_kc)
+                q_nope, w_kc = _inputs(
+                    num_tokens=num_tokens, num_heads=num_heads, dtype=torch.float32
+                )
+                expected = _reference(q_nope=q_nope, w_kc=w_kc)
                 torch._dynamo.reset()
                 compiled = torch.compile(
-                    absorbed_q_bmm, backend="eager", fullgraph=True
+                    _absorbed_q_bmm, backend="eager", fullgraph=True
                 )
                 with enable_tc_piecewise_cuda_graph():
-                    out = compiled(q_nope, w_kc)
+                    out = compiled(q_nope=q_nope, w_kc=w_kc)
                 self.assertEqual(out.shape, expected.shape)
                 self.assertTrue(torch.equal(out, expected))
 

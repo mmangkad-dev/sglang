@@ -127,18 +127,14 @@ def _apply_attention_output_gate(module, attn_output, gate):
     )
 
 
-def absorbed_q_bmm(q_nope: torch.Tensor, w_kc: torch.Tensor) -> torch.Tensor:
-    """Absorb the query into the KV latent: (T, N, P) @ (N, P, L) -> (T, N, L).
-
-    The GEMM batches over heads and so produces (N, T, L); a transposed `out`
-    view lands it token-major and contiguous for the same single kernel, which
-    is the layout the fp8 q cast and the attention backends read best.
-    """
+def _absorbed_q_bmm(q_nope: torch.Tensor, w_kc: torch.Tensor) -> torch.Tensor:
+    # (T, N, P) @ (N, P, L) -> (T, N, L), token-major; non-contiguous while traced.
     if is_in_tc_piecewise_cuda_graph():
-        # Dynamo rejects a non-contiguous `out=`, so the traced path returns a
-        # transposed view; callers must not assume the result is contiguous.
+        # Dynamo rejects a non-contiguous `out=`; stay with the allocating form.
         return torch.bmm(q_nope.transpose(0, 1), w_kc).transpose(0, 1)
 
+    # The GEMM batches over heads and so lands (N, T, L); a transposed `out`
+    # view makes it token-major for the same single kernel.
     q_nope_out = q_nope.new_empty((q_nope.shape[0], q_nope.shape[1], w_kc.shape[-1]))
     torch.bmm(q_nope.transpose(0, 1), w_kc, out=q_nope_out.transpose(0, 1))
     return q_nope_out
@@ -590,7 +586,7 @@ class DeepseekMLAForwardMixin:
             else:
                 # bf16 only: bmm_fp8 ignores `out`'s strides, so the branches
                 # above cannot land the result token-major.
-                q_nope_out = absorbed_q_bmm(q_nope=q_nope, w_kc=self.w_kc)
+                q_nope_out = _absorbed_q_bmm(q_nope=q_nope, w_kc=self.w_kc)
                 q_nope_out_is_token_major = True
 
             if not q_nope_out_is_token_major:
@@ -987,11 +983,9 @@ class DeepseekMLAForwardMixin:
 # fallback BMM is captured alone in its own single-kernel CUDA graph submodule,
 # paying per-submodule host overhead with no fusion benefit.
 #
-# `q_nope_out_buf` and `q_nope_out_view` are the same storage under two
-# layouts: the op writes the (N, T, L) `q_nope_out_buf` via
-# `torch.bmm(..., out=...)` and then reads through the token-major
-# `q_nope_out_view`, so both are mutated. Declare both in `mutates_args` to
-# keep the schema honest.
+# `q_nope_out_buf` is the (N, T, L) alias of the token-major `q_nope_out_view`:
+# the op writes one via `torch.bmm(..., out=...)` and reads the other, so both
+# are declared in `mutates_args` to keep the schema honest.
 @register_custom_op(
     mutates_args=["q_nope_out_buf", "q_nope_out_view", "attn_output_buf"]
 )

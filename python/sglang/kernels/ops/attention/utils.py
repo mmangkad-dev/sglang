@@ -193,10 +193,8 @@ def mla_quantize_for_fp8_no_rope(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     attn_dtype = torch.float8_e4m3fn
     if qk_rope_head_dim == 0:
-        # NoPE: the buffer below would be a same-shaped copy of q_nope plus a
-        # zero-width slice assign, so cast in one pass. `contiguous_format` is
-        # load-bearing -- `to()` alone inherits q_nope's layout, and callers
-        # require a contiguous query.
+        # NoPE: the buffer below is a same-shaped copy plus an empty slice assign.
+        # `contiguous_format` is load-bearing; callers require a contiguous query.
         return (
             q_nope.to(attn_dtype, memory_format=torch.contiguous_format),
             k_nope.to(attn_dtype),
