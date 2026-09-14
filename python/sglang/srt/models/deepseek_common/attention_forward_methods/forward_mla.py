@@ -127,6 +127,23 @@ def _apply_attention_output_gate(module, attn_output, gate):
     )
 
 
+def absorbed_q_bmm(q_nope: torch.Tensor, w_kc: torch.Tensor) -> torch.Tensor:
+    """Absorb the query into the KV latent: (T, N, P) @ (N, P, L) -> (T, N, L).
+
+    The GEMM batches over heads and so produces (N, T, L); a transposed `out`
+    view lands it token-major and contiguous for the same single kernel, which
+    is the layout the fp8 q cast and the attention backends read best.
+    """
+    if is_in_tc_piecewise_cuda_graph():
+        # Dynamo rejects a non-contiguous `out=`, so the traced path returns a
+        # transposed view; callers must not assume the result is contiguous.
+        return torch.bmm(q_nope.transpose(0, 1), w_kc).transpose(0, 1)
+
+    q_nope_out = q_nope.new_empty((q_nope.shape[0], q_nope.shape[1], w_kc.shape[-1]))
+    torch.bmm(q_nope.transpose(0, 1), w_kc, out=q_nope_out.transpose(0, 1))
+    return q_nope_out
+
+
 class DeepseekMLAForwardMixin:
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
@@ -194,14 +211,16 @@ class DeepseekMLAForwardMixin:
         q: torch.Tensor,
         q_nope: torch.Tensor,
     ) -> MlaBmmFusionPlan:
-        q_nope_out_buf = q.new_empty(
+        # Token-major, with the transposed (N, T, L) alias handed to the BMM as
+        # its `out`; the view attention reads is then contiguous.
+        q_nope_out_view = q.new_empty(
             (
-                self.num_local_heads,
                 q.shape[0],
+                self.num_local_heads,
                 self.kv_lora_rank,
             )
         )
-        q_nope_out_view = q_nope_out_buf.transpose(0, 1)
+        q_nope_out_buf = q_nope_out_view.transpose(0, 1)
         attn_output_buf = q.new_empty(
             (
                 q.shape[0],
@@ -520,6 +539,10 @@ class DeepseekMLAForwardMixin:
 
                 _kvb_q = kv_b_lora_q_prepare(self, q_nope)
 
+            # Set by the branches that produce (T, N, L) directly; the others
+            # produce (N, T, L) and are transposed into place below.
+            q_nope_out_is_token_major = False
+
             if self.use_deep_gemm_bmm:
                 (
                     q_nope_val,
@@ -565,9 +588,13 @@ class DeepseekMLAForwardMixin:
                         torch.bfloat16,
                     )
             else:
-                q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+                # bf16 only: bmm_fp8 ignores `out`'s strides, so the branches
+                # above cannot land the result token-major.
+                q_nope_out = absorbed_q_bmm(q_nope=q_nope, w_kc=self.w_kc)
+                q_nope_out_is_token_major = True
 
-            q_nope_out = q_nope_out.transpose(0, 1)
+            if not q_nope_out_is_token_major:
+                q_nope_out = q_nope_out.transpose(0, 1)
             if _SGLANG_EXPERIMENTAL_LORA_OPTI:
                 from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
                     kv_b_lora_q_apply,
@@ -960,10 +987,11 @@ class DeepseekMLAForwardMixin:
 # fallback BMM is captured alone in its own single-kernel CUDA graph submodule,
 # paying per-submodule host overhead with no fusion benefit.
 #
-# `q_nope_out_view` aliases `q_nope_out_buf` (transposed). The op writes
-# `q_nope_out_buf` via `torch.bmm(..., out=...)` and then reads through
-# `q_nope_out_view`, so the alias's storage is mutated too. Declare it in
-# `mutates_args` to keep the schema honest.
+# `q_nope_out_buf` and `q_nope_out_view` are the same storage under two
+# layouts: the op writes the (N, T, L) `q_nope_out_buf` via
+# `torch.bmm(..., out=...)` and then reads through the token-major
+# `q_nope_out_view`, so both are mutated. Declare both in `mutates_args` to
+# keep the schema honest.
 @register_custom_op(
     mutates_args=["q_nope_out_buf", "q_nope_out_view", "attn_output_buf"]
 )
