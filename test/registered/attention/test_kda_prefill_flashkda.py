@@ -94,10 +94,6 @@ def _chunk_kda_ref(d, lower_bound):
         dt_bias=d["dt_bias"],
         lower_bound=lower_bound,
     )
-    # chunk_kda returns the output alone unless intermediate states are asked
-    # for; keep accepting the legacy (output, states) tuple.
-    if isinstance(out, tuple):
-        out = out[0]
     return out, st[d["idx"]]
 
 
@@ -125,8 +121,7 @@ def test_flashkda_matches_triton_safe_gate(seq_lens):
     )
     torch.cuda.synchronize()
 
-    # Every KDA extend kernel returns a bare tensor unless intermediate states
-    # were requested; the backend indexes the result directly.
+    # kda_backend indexes this result directly; a tuple reaches the model as one.
     assert isinstance(out, torch.Tensor), f"extend returned {type(out).__name__}"
     assert torch.isfinite(out).all(), "FlashKDA output has non-finite values"
     assert torch.isfinite(st_fk).all(), "FlashKDA final state has non-finite values"
@@ -227,11 +222,8 @@ def test_flashkda_spec_verify_falls_back():
     ],
 )
 def test_flashkda_batch_fill_gate(seq_lens, num_heads, expect_fallback):
-    """The long-sequence gate keys off grid occupancy -- (total tokens /
-    longest sequence) x per-rank heads -- not the longest sequence alone.
-    FlashKDA's cost tracks the longest sequence while Triton's tracks total
-    tokens, so a well-populated batch is a FlashKDA win well past
-    _FLASHKDA_SHORT_SEQ_LEN, and a thin one is a loss even at 2 sequences."""
+    """A gate that reads batch shape without the per-rank head count sends thin
+    long-sequence batches to FlashKDA, where it is slower than Triton."""
     cu = torch.zeros(len(seq_lens) + 1, device="cuda", dtype=torch.int32)
     cu[1:] = torch.tensor(seq_lens, device="cuda").cumsum(0)
 
@@ -239,7 +231,11 @@ def test_flashkda_batch_fill_gate(seq_lens, num_heads, expect_fallback):
     for lens_cpu in (seq_lens, None):
         assert (
             FlashKDAKernel._should_fall_back(
-                LOWER_BOUND, False, cu, lens_cpu, num_heads
+                lower_bound=LOWER_BOUND,
+                is_spec_decode=False,
+                query_start_loc=cu,
+                extend_seq_lens_cpu=lens_cpu,
+                num_heads=num_heads,
             )
             is expect_fallback
         ), f"seq_lens={seq_lens} heads={num_heads} extend_seq_lens_cpu={lens_cpu}"

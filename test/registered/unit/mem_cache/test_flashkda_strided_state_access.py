@@ -183,8 +183,7 @@ class TestFlashKDAStridedStateAccess(unittest.TestCase):
         # Routing: the fused path ran exactly once (a silent re-route to the
         # triton fallback would make every assertion below vacuous).
         self.assertEqual(self.fake.calls, 1)
-        # extend() returns a bare tensor unless intermediate states were asked
-        # for, matching chunk_kda and the other KDA extend kernels.
+        # extend() returns a bare tensor unless intermediate states were asked for.
         self.assertIsInstance(out, torch.Tensor)
         self.assertEqual(tuple(out.shape), (1, 2 * _SEQ_LEN, _H, _V))
 
