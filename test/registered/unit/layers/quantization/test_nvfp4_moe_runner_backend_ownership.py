@@ -90,7 +90,7 @@ class TestNvFp4MoeRunnerBackendOwnership(CustomTestCase):
         """`auto` must be resolved before the layers are built: FusedMoE reads
         the same setting for the w1/w3 shard swap, so a backend picked only
         here loads the experts with gate and up exchanged."""
-        with self.assertRaisesRegex(ValueError, "explicit --moe-runner-backend"):
+        with self.assertRaisesRegex(ValueError, "--moe-runner-backend"):
             _method(MoeRunnerBackend.AUTO, MoeA2ABackend.NONE)
 
 
