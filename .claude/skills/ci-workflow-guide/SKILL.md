@@ -77,7 +77,7 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
  │  │ (large GPUs, e.g. H100)     │    │
  │  └─────────────────────────────┘    │
  │  ┌─────────────────────────────┐    │
- │  │ base-b-test-2-gpu-large    │    │
+ │  │ base-b-test-2-gpu-h100    │    │
  │  │ (large GPUs, e.g. H100)     │    │
  │  └─────────────────────────────┘    │
  └──────┬──────────────────────────────┘
@@ -168,7 +168,7 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 [
   {"prefix": "base-b-test-1-gpu-small", "expected_count": 8},
   {"prefix": "base-b-test-1-gpu-h100", "expected_count": 14},
-  {"prefix": "base-b-test-2-gpu-large", "expected_count": 4},
+  {"prefix": "base-b-test-2-gpu-h100", "expected_count": 4},
   {"prefix": "base-b-test-4-gpu-b200", "expected_count": 1}
 ]
 ```
@@ -275,7 +275,7 @@ Large suites are split across matrix jobs using the **LPT (Longest Processing Ti
 | `base-a-test-cpu` | 4 | `ubuntu-latest` | — |
 | `base-b-test-1-gpu-small` | 8 | `1-gpu-5090` | 8 |
 | `base-b-test-1-gpu-h100` | 14 | `1-gpu-h100` | dynamic (3 or 14) |
-| `base-b-test-2-gpu-large` | 4 | `2-gpu-h100` | — |
+| `base-b-test-2-gpu-h100` | 4 | `2-gpu-h100` | — |
 | `base-b-test-4-gpu-b200` | 1 (no matrix) | `4-gpu-b200` | — |
 | `base-b-kernel-unit-test-1-gpu-h100` | 1 (no matrix) | `1-gpu-h100` | — |
 | `base-b-kernel-unit-test-4-gpu-b200` | 1 (no matrix) | `4-gpu-b200` | — |

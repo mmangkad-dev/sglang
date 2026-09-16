@@ -189,13 +189,13 @@ jobs:
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
-  extra-a-test-2-gpu-large:
+  extra-a-test-2-gpu-h100:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
     if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: extra-a-test-2-gpu-large
-      runner_config: 2-gpu-large
+      self_name: extra-a-test-2-gpu-h100
+      runner_config: 2-gpu-h100
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -262,7 +262,7 @@ jobs:
         simulator-test-cpu,
         extra-a-test-1-gpu-small,
         extra-a-test-1-gpu-h100,
-        extra-a-test-2-gpu-large,
+        extra-a-test-2-gpu-h100,
         extra-b-test-4-gpu-h100,
         extra-b-test-4-gpu-b200,
         extra-b-test-8-gpu-h200,

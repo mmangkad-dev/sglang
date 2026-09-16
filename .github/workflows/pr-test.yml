@@ -150,7 +150,7 @@ jobs:
             [
               {"prefix": "base-b-test-1-gpu-small", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-1-gpu-small'].size }}},
               {"prefix": "base-b-test-1-gpu-h100", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-1-gpu-h100'].size }}},
-              {"prefix": "base-b-test-2-gpu-large", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-2-gpu-large'].size }}},
+              {"prefix": "base-b-test-2-gpu-h100", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-2-gpu-h100'].size }}},
               {"prefix": "base-b-test-4-gpu-b200", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-4-gpu-b200'].size }}}
             ]
           max-wait-minutes: '480'
@@ -358,13 +358,13 @@ jobs:
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
-  base-b-test-2-gpu-large:
+  base-b-test-2-gpu-h100:
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: base-b-test-2-gpu-large
-      runner_config: 2-gpu-large
+      self_name: base-b-test-2-gpu-h100
+      runner_config: 2-gpu-h100
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -531,7 +531,7 @@ jobs:
         base-a-test-cpu,
         base-b-test-1-gpu-small,
         base-b-test-1-gpu-h100,
-        base-b-test-2-gpu-large,
+        base-b-test-2-gpu-h100,
         base-b-test-4-gpu-b200,
         base-c-test-4-gpu-h100,
         base-c-test-8-gpu-h20,

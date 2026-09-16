@@ -9,7 +9,7 @@ from sglang.test.test_utils import (
     parse_models,
 )
 
-register_cuda_ci(est_time=450, stage="nightly", runner_config="2-gpu-large")
+register_cuda_ci(est_time=450, stage="nightly", runner_config="2-gpu-h100")
 
 RESULT_DIR = "performance_results_text_models"
 

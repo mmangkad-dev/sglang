@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(
     est_time=720,
     stage="extra-a",
-    runner_config="2-gpu-large",
+    runner_config="2-gpu-h100",
     disabled="FIXME(kpham-sgl): temporary drop due to accuracies issue",
 )
 

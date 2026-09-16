@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(
-    est_time=180, stage="nightly", runner_config="2-gpu-large", nightly=True
+    est_time=180, stage="nightly", runner_config="2-gpu-h100", nightly=True
 )
 
 _REQUEST_TIMEOUT = 180

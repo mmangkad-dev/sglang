@@ -71,7 +71,7 @@ PER_COMMIT_SUITES = {
         "base-a-test-1-gpu-small",
         "base-b-test-1-gpu-small",
         "base-b-test-1-gpu-h100",
-        "base-b-test-2-gpu-large",
+        "base-b-test-2-gpu-h100",
         "base-b-test-4-gpu-b200",
         "base-b-kernel-unit-test-1-gpu-h100",
         "base-b-kernel-unit-test-4-gpu-b200",
@@ -97,7 +97,7 @@ PER_COMMIT_SUITES = {
         # (tests still tagged per-commit but skipped on default PR runs).
         "extra-a-test-1-gpu-small",
         "extra-a-test-1-gpu-h100",
-        "extra-a-test-2-gpu-large",
+        "extra-a-test-2-gpu-h100",
         "extra-b-test-4-gpu-h100",
         "extra-b-test-4-gpu-b200",
         "extra-b-test-8-gpu-h200",
@@ -131,7 +131,7 @@ NIGHTLY_SUITES = {
         # shape as the per-commit suites. No `nightly=True`: the stage name
         # carries the cadence; only the legacy suites below still need the flag.
         "nightly-test-1-gpu-h100",
-        "nightly-test-2-gpu-large",
+        "nightly-test-2-gpu-h100",
         "nightly-test-4-gpu-h100",
         "nightly-test-4-gpu-b200",
         "nightly-test-4-gpu-gb300",
@@ -211,7 +211,7 @@ OTHER_SUITES = {
         # readability only; validation reads their union. One entry per row of
         # the matrix in weekly-test-nvidia.yml.
         "weekly-test-1-gpu-h100",
-        "weekly-test-2-gpu-large",
+        "weekly-test-2-gpu-h100",
         "weekly-test-4-gpu-h100",
         "weekly-test-4-gpu-b200",
         "weekly-test-8-gpu-h200",

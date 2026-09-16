@@ -20,7 +20,7 @@ on:
         options:
           - 'all'
           - '1-gpu-h100'
-          - '2-gpu-large'
+          - '2-gpu-h100'
           - '4-gpu-h100'
           - '4-gpu-b200'
           - '4-gpu-gb300'
@@ -94,13 +94,13 @@ jobs:
       scheduled: true
     secrets: inherit
 
-  nightly-2-gpu-large:
+  nightly-2-gpu-h100:
     needs: check-changes
-    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '2-gpu-large')
+    if: github.repository == 'sgl-project/sglang' && (inputs.runner_filter == '' || inputs.runner_filter == 'all' || inputs.runner_filter == '2-gpu-h100')
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
-      self_name: nightly-test-2-gpu-large
-      runner_config: 2-gpu-large
+      self_name: nightly-test-2-gpu-h100
+      runner_config: 2-gpu-h100
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
@@ -262,7 +262,7 @@ jobs:
     # before the download step globs `*metrics-*`.
     needs:
       - nightly-1-gpu-h100
-      - nightly-2-gpu-large
+      - nightly-2-gpu-h100
       - nightly-4-gpu-h100
       - nightly-4-gpu-b200
       - nightly-4-gpu-gb300
@@ -309,7 +309,7 @@ jobs:
     if: github.repository == 'sgl-project/sglang' && always()
     needs:
       - nightly-1-gpu-h100
-      - nightly-2-gpu-large
+      - nightly-2-gpu-h100
       - nightly-4-gpu-h100
       - nightly-4-gpu-b200
       - nightly-4-gpu-gb300

@@ -20,7 +20,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(
     est_time=60,
     stage="base-b",
-    runner_config="2-gpu-large",
+    runner_config="2-gpu-h100",
     disabled="Temporarily disabled",
 )
 

@@ -106,7 +106,7 @@ Use the lightest suite that meets your test's needs. Full suite tables are in th
 | Large GPU memory or Hopper features | `base-b-test-1-gpu-h100` |
 | JIT kernel correctness | `base-b-kernel-unit-test-1-gpu-h100` |
 | JIT kernel benchmarks | `base-b-kernel-benchmark-test-1-gpu-h100` |
-| Multi-GPU (2/4/8) | `base-b-test-2-gpu-large`, `base-c-test-*` |
+| Multi-GPU (2/4/8) | `base-b-test-2-gpu-h100`, `base-c-test-*` |
 | Long-running or experimental | `nightly-*` suites |
 
 ## Steps for Adding a Test
