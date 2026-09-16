@@ -1218,7 +1218,9 @@ class TestNvFp4MoeRunnerBackendResolution(CustomTestCase):
     def test_auto_resolves_to_marlin_before_blackwell(self):
         self.assertEqual(self._resolved(self._args()), "marlin")
 
-    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    @override_platform(
+        is_cuda=True, is_sm100=True, is_sm120=False, device_capability=(10, 0)
+    )
     def test_auto_is_left_to_the_user_with_an_a2a_backend(self):
         # The A2A combinations are validated per runner, so `auto` stays put and
         # ModelOptNvFp4FusedMoEMethod rejects it with the flag to pass.
