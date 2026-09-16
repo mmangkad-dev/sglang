@@ -1191,13 +1191,20 @@ class TestNvFp4MoeRunnerBackendResolution(CustomTestCase):
     with gate and up exchanged."""
 
     @staticmethod
-    def _args(moe_runner_backend="auto", moe_a2a_backend="none"):
-        return ServerArgs(
+    def _args(
+        moe_runner_backend="auto",
+        moe_a2a_backend="none",
+        cli_quantization="modelopt_fp4",
+        detected_quantization="modelopt_fp4",
+    ):
+        server_args = ServerArgs(
             model_path="dummy",
-            quantization="modelopt_fp4",
+            quantization=cli_quantization,
             moe_runner_backend=moe_runner_backend,
             moe_a2a_backend=moe_a2a_backend,
         )
+        server_args._model_config = SimpleNamespace(quantization=detected_quantization)
+        return server_args
 
     def _resolved(self, server_args):
         handle_moe_kernel_config(server_args)
@@ -1225,6 +1232,25 @@ class TestNvFp4MoeRunnerBackendResolution(CustomTestCase):
         # The A2A combinations are validated per runner, so `auto` stays put and
         # ModelOptNvFp4FusedMoEMethod rejects it with the flag to pass.
         self.assertEqual(self._resolved(self._args(moe_a2a_backend="deepep")), "auto")
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_auto_resolves_for_a_checkpoint_detected_as_nvfp4(self):
+        # An NVFP4 checkpoint served without --quantization: the CLI string stays
+        # None and only the model config carries the resolved method.
+        self.assertEqual(
+            self._resolved(self._args(cli_quantization=None)), "flashinfer_trtllm"
+        )
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_auto_is_kept_for_a_checkpoint_that_is_not_nvfp4(self):
+        self.assertEqual(
+            self._resolved(
+                self._args(
+                    cli_quantization=None, detected_quantization="modelopt_mixed"
+                )
+            ),
+            "auto",
+        )
 
     @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
     def test_explicit_backend_is_kept(self):
