@@ -2298,16 +2298,23 @@ def _compute_gemm1_alphas(
 def _resolve_nvfp4_moe_runner_backend() -> MoeRunnerBackendLike:
     """Pick the MoE runner backend an NVFP4 fused-MoE method runs on.
 
-    `auto` resolves to marlin on pre-Blackwell CUDA (the W4A16 fallback that
-    makes NVFP4 checkpoints loadable on SM80/SM90) and to TRT-LLM elsewhere,
-    currently the most performant and tested FP4 MoE backend.
+    Only the marlin fallback is decided here; it is invisible to the rest of
+    the stack. Any other backend has to be resolved before the layers are
+    built (see _moe_runner_backend_quant_constraints), because FusedMoE keys
+    its w1/w3 shard swap, its 128 round-up and inplace off the same setting.
     """
     moe_runner_backend = get_moe_runner_backend()
     if not moe_runner_backend.is_auto():
         return moe_runner_backend
     if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
+        # NVFP4 checkpoints run W4A16 through marlin before Blackwell.
         return MoeRunnerBackend.MARLIN
-    return MoeRunnerBackend.FLASHINFER_TRTLLM
+    raise ValueError(
+        "NVFP4 MoE needs an explicit --moe-runner-backend on this platform; "
+        "`auto` reached the quantization method unresolved. Pass "
+        "--moe-runner-backend flashinfer_trtllm (or flashinfer_cutlass, "
+        "flashinfer_cutedsl)."
+    )
 
 
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
@@ -2319,16 +2326,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
-        # Resolve the MoE and A2A backends ONCE, here, and let every later
-        # decision of this method read the resolved values: parameter
-        # allocation, weight layout, weight prep, the MoeRunner built in
-        # create_moe_runner, and the kernel apply() dispatches to. Re-reading
-        # the process-wide backends afterwards is wrong under speculative
-        # decoding -- speculative_moe_backend_context and
-        # speculative_moe_a2a_backend_context swap the globals to the draft's
-        # backends around draft work that also runs the target's layers (e.g.
-        # adaptive CUDA-graph capture), while this method still owns weights
-        # prepared for the target's backend.
+        # The speculative contexts swap the process-wide MoE and A2A backends
+        # around draft work that also runs the target's layers, so resolve once
+        # here and never re-read them.
         self._moe_runner_backend = _resolve_nvfp4_moe_runner_backend()
         self._moe_a2a_is_deepep = get_moe_a2a_backend().is_deepep()
         if not get_platform().is_blackwell and not self._moe_runner_backend.is_marlin():
@@ -2377,9 +2377,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     def _is_cutedsl_v1_deepep(self) -> bool:
         """CuteDSL v1 + DeepEP low-latency path (masked grouped GEMM).
 
-        Both halves are this method's resolved backends, not the live globals:
-        the v1/v2 answer picks the weight layout at load time and the kernel at
-        forward time, and those two must be the same answer.
+        Reads the resolved backends: this answer picks the weight layout at
+        load time and the kernel at forward time, and both must agree.
         """
         return self.enable_flashinfer_cutedsl_moe and self._moe_a2a_is_deepep
 
@@ -2787,20 +2786,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # Weight processing based on strategy
         if self.enable_flashinfer_trtllm_moe:
-            # apply() dispatches on the same resolved backend, so this is the
-            # only prep that produces what the TRT-LLM branch dereferences
-            # (g1_scale_c, the shuffled weights). Preparing CUTLASS weights
-            # instead would only defer the failure to the first forward.
-            if reorder_rows_for_gated_act_gemm is None or shuffle_matrix_sf_a is None:
-                raise ImportError(
-                    "NVFP4 MoE with moe_runner_backend="
-                    f"{moe_runner_backend.value} needs flashinfer's "
-                    "reorder_rows_for_gated_act_gemm and shuffle_matrix_sf_a, "
-                    "which this flashinfer build does not provide. Install a "
-                    "flashinfer build that has them, or pick another backend, "
-                    "e.g. --moe-runner-backend flashinfer_cutlass."
-                )
-
+            # apply() dispatches on the same resolved backend, so this prep is
+            # the only one that produces what the TRT-LLM branch dereferences;
+            # preparing CUTLASS weights instead defers the failure to the first
+            # forward.
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 align_fp4_moe_weights_for_flashinfer_trtllm,
             )
