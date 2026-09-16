@@ -2298,10 +2298,10 @@ def _compute_gemm1_alphas(
 def _resolve_nvfp4_moe_runner_backend() -> MoeRunnerBackendLike:
     """Pick the MoE runner backend an NVFP4 fused-MoE method runs on.
 
-    Only the marlin fallback is decided here; it is invisible to the rest of
-    the stack. Any other backend has to be resolved before the layers are
-    built (see _moe_runner_backend_quant_constraints), because FusedMoE keys
-    its w1/w3 shard swap, its 128 round-up and inplace off the same setting.
+    Only the marlin fallback is decided here: it has no FusedMoE-side coupling.
+    Every other backend has to be resolved before the layers are built (see
+    _moe_runner_backend_quant_constraints), because FusedMoE keys its w1/w3
+    shard swap, its 128 round-up and inplace off the same setting.
     """
     moe_runner_backend = get_moe_runner_backend()
     if not moe_runner_backend.is_auto():
@@ -2310,10 +2310,11 @@ def _resolve_nvfp4_moe_runner_backend() -> MoeRunnerBackendLike:
         # NVFP4 checkpoints run W4A16 through marlin before Blackwell.
         return MoeRunnerBackend.MARLIN
     raise ValueError(
-        "NVFP4 MoE needs an explicit --moe-runner-backend on this platform; "
+        "NVFP4 MoE needs an explicit MoE runner backend on this platform; "
         "`auto` reached the quantization method unresolved. Pass "
         "--moe-runner-backend flashinfer_trtllm (or flashinfer_cutlass, "
-        "flashinfer_cutedsl)."
+        "flashinfer_cutedsl), and --speculative-moe-runner-backend likewise "
+        "when a draft model carries NVFP4 MoE layers."
     )
 
 
