@@ -58,6 +58,9 @@ def _ht_shard_split(
     elements, and consumer_threads must divide its 16-byte vector count.
     """
     packs = hidden_size // _VEC_BF16
+    # packs // 2 forces vectors_per_thread >= 2. The kernel only requires it to
+    # be positive; the floor of 2 is inherited from the shipped GB300 presets
+    # and is not otherwise justified, so it is safe to relax if measured.
     limit = min(max_consumer_threads, packs // 2)
     for consumer_threads in range(
         limit - limit % _WARP_SIZE, _WARP_SIZE - 1, -_WARP_SIZE
@@ -127,18 +130,20 @@ def _ht_retarget(preset, *, hidden_size: int, tp_size: int):
     return None
 
 
-def _routes(dispatch_type, bounds, ll_target, bt_targets, ht_target):
+def _routes(bounds, ll_target, bt_targets, ht_target):
     """The M-range dispatch for one operation, HT dropped when unroutable.
 
     Without HT the widest BT range takes the unbounded slot, so the profile
     still covers the whole workspace capacity instead of being rejected.
     """
+    from flashinfer.comm.mnnvl_cutedsl import MRangeDispatch
+
     if ht_target is not None:
-        return dispatch_type(
+        return MRangeDispatch(
             upper_bounds=bounds,
             targets=(ll_target, *bt_targets, ht_target),
         )
-    return dispatch_type(
+    return MRangeDispatch(
         upper_bounds=(*bounds[: len(bt_targets)], None),
         targets=(ll_target, *bt_targets),
     )
@@ -156,7 +161,6 @@ def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
     from flashinfer.comm.mnnvl_cutedsl import (
         KernelTarget,
         MNNVLCuteDSLConfig,
-        MRangeDispatch,
         ProtocolKind,
         StaticProfile,
     )
@@ -244,14 +248,12 @@ def _retargeted_config(tp_size: int, hidden_size: int, top_k: int):
         top_k=top_k,
         dtype=torch.bfloat16,
         finalize_routes=_routes(
-            MRangeDispatch,
             finalize_bounds,
             target(ProtocolKind.LL, ll_finalize),
             tuple(target(ProtocolKind.BT, preset) for preset in bt_finalize),
             None if ht_finalize is None else target(ProtocolKind.HT, ht_finalize),
         ),
         all_reduce_routes=_routes(
-            MRangeDispatch,
             all_reduce_bounds,
             target(ProtocolKind.LL, ll_all_reduce),
             tuple(target(ProtocolKind.BT, preset) for preset in bt_all_reduce),
@@ -509,17 +511,19 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
     weight_bias: float,
 ) -> FlashInferMNNVLCuteDSLARFusion:
     """Build the process-local workspace. Must run before graph capture."""
-    if not torch.cuda.is_available():
-        raise RuntimeError("MNNVL CuTe DSL fusion requires CUDA")
-
-    from sglang.srt.distributed.parallel_state import get_tp_group
-
+    # Checked before CUDA: a workspace already existing is a statement about
+    # process state, and reporting "requires CUDA" for it would misdirect.
     global _WORKSPACE
     if _WORKSPACE is not None:
         raise RuntimeError(
             "a second MNNVL CuTe DSL fusion workspace was requested; each one "
             "rendezvouses its own NVLS region, and a process serves one model"
         )
+    if not torch.cuda.is_available():
+        raise RuntimeError("MNNVL CuTe DSL fusion requires CUDA")
+
+    from sglang.srt.distributed.parallel_state import get_tp_group
+
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "creating an MNNVL CuTe DSL fusion workspace during CUDA Graph "

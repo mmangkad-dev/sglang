@@ -62,12 +62,9 @@ Pick your hardware + quantization to generate the launch command. Three of the s
 - **High Throughput** — most tokens per second across many users. Best for batch jobs.
 - **DSpark** — the trained [DSpark draft model](#3-3-dspark-and-replayssm-speculative-decoding) instead of the checkpoint's built-in MTP head. Only offered where DSpark's constraints allow it (see [3.3](#3-3-dspark-and-replayssm-speculative-decoding)).
 
-import "/src/snippets/_deployment.jsx"
-import "/src/snippets/configs/Qwen/qwen3.8-benchmarks.jsx"
-import "/src/snippets/configs/Qwen/qwen3.8.jsx"
-import { benchmarks }
-import { config }
-import { Deployment }
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config }     from "/src/snippets/configs/Qwen/qwen3.8.jsx";
+import { benchmarks } from "/src/snippets/configs/Qwen/qwen3.8-benchmarks.jsx";
 
 <Deployment config={config} benchmarks={benchmarks} />
 
@@ -80,8 +77,7 @@ The knobs come in two flavors:
 - **Built-in SGLang features** — TP / DP-Attention, MoE backend + EP (including WideEP), reasoning / tool-call parsers, speculative-decoding presets, prefill/decode disaggregation, and HiCache tiers.
 - **Qwen3.8 specific features** — the **DSpark** speculative-decoding preset and its **ReplaySSM** opt-out, plus the GDN radix-cache-strategy and KV-cache-precision knobs (see [Configuration Tips](#2-configuration-tips) and [3.3 DSpark and ReplaySSM](#3-3-dspark-and-replayssm-speculative-decoding) below).
 
-import "/src/snippets/_playground.jsx"
-import { Playground }
+import { Playground } from "/src/snippets/_playground.jsx";
 
 <Playground config={config} />
 

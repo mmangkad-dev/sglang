@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import functools
 import logging
-from typing import Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
-import msgspec
 import torch
 
 from sglang.srt.arg_groups.overrides import cutedsl_moe_max_num_tokens
@@ -28,8 +28,15 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_flags,
     get_parallel,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
+
+# A predicate over one decoder layer, evaluated once per layer at install time.
+LayerPredicate = Callable[[torch.nn.Module], bool]
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +62,7 @@ def is_supported_forward_mode(forward_mode: ForwardMode) -> bool:
     )
 
 
-def resolve_max_m(*, server_args, max_running_requests: int | None) -> int:
+def resolve_max_m(*, server_args: ServerArgs, max_running_requests: int | None) -> int:
     """Use framework token bounds as the workspace-capacity source of truth."""
     decode_config = get_exec().graph.cuda_graph_config.decode
     prefill_config = get_exec().graph.cuda_graph_config.prefill
@@ -75,7 +82,12 @@ def resolve_max_m(*, server_args, max_running_requests: int | None) -> int:
     return max(positive)
 
 
-class MoeFinalizeHandoff(msgspec.Struct, frozen=True):
+# Stays a dataclass against .claude/rules/no-dataclasses.md: Dynamo can trace a
+# frozen dataclass constructor but cannot construct a msgspec.Struct (a
+# C-extension type), and both producers build this inside a fullgraph=True
+# region -- qwen2_moe's MoE forward, and DeepSeek's capture-mode dual stream.
+@dataclass(frozen=True)
+class MoeFinalizeHandoff:
     """Unfinalized routed output plus the separately gated shared contribution."""
 
     routed_output: torch.Tensor
@@ -376,8 +388,8 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
 def model_installs_cutedsl_fusion(model: torch.nn.Module) -> bool:
     """Whether any layer of ``model`` carries a CuTe DSL fusion communicator.
 
-    ``LayerCommunicator`` is a plain object, not a submodule, so it is read off
-    each module's own ``__dict__`` rather than through attribute lookup.
+    Most modules carry no ``layer_communicator`` at all, so ``__dict__.get``
+    stands in for a defensive ``getattr`` over a heterogeneous module tree.
     """
     return any(
         isinstance(
@@ -389,13 +401,13 @@ def model_installs_cutedsl_fusion(model: torch.nn.Module) -> bool:
 
 
 def install_cutedsl_fusion(
-    layers,
+    layers: Sequence[torch.nn.Module],
     *,
     hidden_size: int,
     top_k: int,
     rms_epsilon: float,
-    can_defer_finalize,
-    requires_local_reduction=lambda layer: False,
+    can_defer_finalize: LayerPredicate,
+    requires_local_reduction: LayerPredicate | None = None,
     final_norm_consumes_handoff: bool = False,
     label: str,
 ) -> CuteDSLFusionService | None:
@@ -408,6 +420,13 @@ def install_cutedsl_fusion(
     closes out the last layer's handoff, and ``requires_local_reduction`` for a
     layer whose MoE adds a replicated output after its own all-reduce.
     """
+    if get_flags().moe.in_speculative_scope:
+        # A draft model is built inside the target's process, and each workspace
+        # rendezvouses its own NVLS region, so a second one is refused outright.
+        # A draft has nothing to install anyway: its layers have no successor to
+        # absorb a deferred finalize.
+        return None
+
     fusion_layers = [
         layer
         for layer in layers
@@ -415,6 +434,22 @@ def install_cutedsl_fusion(
     ]
     if not fusion_layers:
         return None
+
+    # One workspace is compiled for one epsilon; a family with a per-layer value
+    # would otherwise be normalized with the wrong one, silently.
+    for layer in fusion_layers:
+        for norm in (
+            layer.layer_communicator.input_layernorm,
+            layer.layer_communicator.post_attention_layernorm,
+        ):
+            if fused_norm_gamma(norm) is None:
+                continue
+            if float(norm.variance_epsilon) != float(rms_epsilon):
+                raise RuntimeError(
+                    f"{label} CuTe DSL fusion compiles one workspace for "
+                    f"rms_epsilon={rms_epsilon}, but a fused norm uses "
+                    f"{norm.variance_epsilon}"
+                )
 
     service = CuteDSLFusionService(
         hidden_size=hidden_size,
@@ -439,7 +474,9 @@ def install_cutedsl_fusion(
         communicator.successor_absorbs_all_reduce = successor is not None and (
             isinstance(successor.layer_communicator, CuteDSLFusionLayerCommunicator)
         )
-        communicator.owes_local_reduction = bool(requires_local_reduction(layer))
+        communicator.owes_local_reduction = (
+            requires_local_reduction is not None and requires_local_reduction(layer)
+        )
     logger.info(
         "Installed one %s FlashInfer MNNVL CuTe DSL fusion handle for %d of %d layers "
         "(%d can defer the MoE finalize)",
@@ -454,7 +491,7 @@ def install_cutedsl_fusion(
 def prepare_cutedsl_fusion(
     service: CuteDSLFusionService | None,
     *,
-    server_args,
+    server_args: ServerArgs,
     max_running_requests: int | None,
     label: str,
 ) -> None:

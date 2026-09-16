@@ -84,6 +84,7 @@ from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
+from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -2275,7 +2276,7 @@ class DeepseekV2AttentionMLA(
 
 
 def _use_mnnvl_cutedsl_fusion() -> bool:
-    return _is_cuda and get_exec().comm.flashinfer_allreduce_fusion_backend == "cutedsl"
+    return _is_cuda and uses_cutedsl_ar_fusion()
 
 
 class DeepseekV2DecoderLayer(nn.Module):
@@ -2494,9 +2495,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        # Deferring implies fusing, so deciding the deferral first lets it stand
-        # in for that half of the fusion decision instead of walking the same
-        # eligibility predicate twice on every layer.
+        # Deferring implies fusing, and both are published by the one scoped()
+        # block below, so the deferral has to be decided before it.
         may_defer_moe_finalize = self.layer_communicator.should_defer_moe_finalize(
             forward_batch
         )

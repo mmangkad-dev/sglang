@@ -14,6 +14,7 @@ from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     _retargeted_config,
     _with_early_finalize_shared_load,
 )
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.moe.cutedsl_ar_fusion import (
     CuteDSLFusionLayerCommunicator,
     MoeFinalizeHandoff,
@@ -394,13 +395,15 @@ def test_install_records_which_producers_owe_a_local_reduction():
     or a replicated shared expert silently keeps the unsafe fusion."""
     from sglang.srt.layers.moe.cutedsl_ar_fusion import install_cutedsl_fusion
 
+    def _communicator():
+        comm = CuteDSLFusionLayerCommunicator.__new__(CuteDSLFusionLayerCommunicator)
+        # install_cutedsl_fusion() reads both norms to check the workspace epsilon.
+        comm.input_layernorm = RMSNorm(8, eps=1e-6)
+        comm.post_attention_layernorm = RMSNorm(8, eps=1e-6)
+        return comm
+
     layers = [
-        SimpleNamespace(
-            layer_communicator=CuteDSLFusionLayerCommunicator.__new__(
-                CuteDSLFusionLayerCommunicator
-            ),
-            replicated=replicated,
-        )
+        SimpleNamespace(layer_communicator=_communicator(), replicated=replicated)
         for replicated in (True, False)
     ]
     install_cutedsl_fusion(
@@ -632,6 +635,98 @@ def test_unsupported_tp_width_is_refused_with_the_legal_set():
                 process_group=object(),
                 device=torch.device("cuda", 0),
             )
+
+
+def test_a_draft_model_build_installs_no_fusion():
+    """A draft is built in the target's process and each workspace rendezvouses
+    its own NVLS region, so a second install would raise at prepare time. An
+    EAGLE draft subclassing DeepseekV2Model reaches install_cutedsl_fusion with
+    is_nextn False, so the guard has to be the draft scope, not a per-model
+    attribute."""
+    from sglang.srt.layers.moe.cutedsl_ar_fusion import install_cutedsl_fusion
+    from sglang.srt.layers.moe.utils import draft_model_build_scope
+
+    def _layer():
+        comm = CuteDSLFusionLayerCommunicator.__new__(CuteDSLFusionLayerCommunicator)
+        comm.input_layernorm = RMSNorm(8, eps=1e-6)
+        comm.post_attention_layernorm = RMSNorm(8, eps=1e-6)
+        return SimpleNamespace(layer_communicator=comm)
+
+    kwargs = dict(
+        hidden_size=8,
+        top_k=2,
+        rms_epsilon=1e-6,
+        can_defer_finalize=lambda layer: True,
+        label="test",
+    )
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="test")
+
+    assert install_cutedsl_fusion([_layer(), _layer()], **kwargs) is not None
+    with draft_model_build_scope():
+        assert install_cutedsl_fusion([_layer(), _layer()], **kwargs) is None
+
+
+def test_a_per_layer_epsilon_is_refused_at_install():
+    """One workspace is compiled for one epsilon. A family whose norms disagree
+    would be normalized with the wrong one and never raise inside the kernel,
+    which only checks the value the service itself passes."""
+    from sglang.srt.layers.moe.cutedsl_ar_fusion import install_cutedsl_fusion
+
+    comm = CuteDSLFusionLayerCommunicator.__new__(CuteDSLFusionLayerCommunicator)
+    comm.input_layernorm = RMSNorm(8, eps=1e-6)
+    comm.post_attention_layernorm = RMSNorm(8, eps=1e-5)  # disagrees
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="test")
+
+    with pytest.raises(RuntimeError, match="rms_epsilon"):
+        install_cutedsl_fusion(
+            [SimpleNamespace(layer_communicator=comm)],
+            hidden_size=8,
+            top_k=2,
+            rms_epsilon=1e-6,
+            can_defer_finalize=lambda layer: True,
+            label="test",
+        )
+
+
+def test_a_model_without_the_communicator_is_refused_not_silently_unfused():
+    """Selecting cutedsl stands the legacy workspace down, so a model that
+    installed no communicator would serve with every allreduce fusion off."""
+    from sglang.srt.model_executor.runner.base_runner import BaseRunner
+
+    # BaseRunner is abstract; call the method unbound with a duck-typed self.
+    check = BaseRunner._assert_model_installs_cutedsl_fusion
+    unfused = SimpleNamespace(model_runner=SimpleNamespace(model=torch.nn.Linear(2, 2)))
+
+    with pytest.raises(ValueError, match="no CuTe DSL fusion communicator"):
+        check(unfused)
+
+    layer = torch.nn.Linear(2, 2)
+    layer.layer_communicator = CuteDSLFusionLayerCommunicator.__new__(
+        CuteDSLFusionLayerCommunicator
+    )
+    fused = SimpleNamespace(
+        model_runner=SimpleNamespace(model=torch.nn.Sequential(layer))
+    )
+
+    check(fused)
+
+
+def test_a_second_workspace_in_one_process_is_refused():
+    """Each workspace rendezvouses its own NVLS region and a process serves one
+    model, so the second request must raise rather than allocate."""
+    import sglang.srt.layers.flashinfer_mnnvl_cutedsl as mod
+
+    saved = mod._WORKSPACE
+    try:
+        mod._WORKSPACE = object()
+        with pytest.raises(RuntimeError, match="second MNNVL CuTe DSL"):
+            mod.get_flashinfer_mnnvl_cutedsl_ar_fusion(
+                hidden_size=8192, top_k=10, max_m=8, rms_epsilon=1e-6, weight_bias=0.0
+            )
+    finally:
+        mod._WORKSPACE = saved
 
 
 if __name__ == "__main__":

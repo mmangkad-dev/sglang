@@ -288,18 +288,19 @@ class BaseRunner(ABC):
         if get_exec().comm.flashinfer_allreduce_fusion_backend is None:
             return
 
-        # The only unconditional resolution of the configured backend; every
-        # other caller sits behind a workspace that the request may not reach.
-        resolve_flashinfer_allreduce_fusion_backend()
-
         if uses_cutedsl_ar_fusion():
-            # cutedsl builds its own workspace from the model's pre-capture
-            # hook, so there is nothing to pre-initialize here -- but a model
-            # that installed no fusion communicator would otherwise serve with
-            # every allreduce fusion silently off.
+            # Nothing to pre-initialize -- cutedsl builds its own workspace from
+            # the model's pre-capture hook -- but it is also the one backend
+            # whose configured value nothing else resolves, so the platform
+            # check runs here or not at all. Scoped to this branch: the legacy
+            # backends keep degrading quietly rather than raising at warmup.
+            resolve_flashinfer_allreduce_fusion_backend()
+            # A model that installed no fusion communicator would otherwise
+            # serve with every allreduce fusion silently off.
             if not mr.is_draft_worker:
-                # A draft model is expected to carry no fusion: its layers have
-                # no successor to absorb a deferred finalize.
+                # install_cutedsl_fusion() declines inside
+                # draft_model_build_scope(), so a draft legitimately carries no
+                # communicator and must not be held to this check.
                 self._assert_model_installs_cutedsl_fusion()
             return
 
