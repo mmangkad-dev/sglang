@@ -106,9 +106,7 @@ def _fuses_routed_scaling_factor_in_topk(quant_method) -> bool:
         getattr(quant_method, "fuse_routed_scaling_factor_in_topk", False)
         or (
             isinstance(quant_method, ModelOptNvFp4FusedMoEMethod)
-            and not getattr(
-                quant_method, "_moe_runner_backend", get_moe_runner_backend()
-            ).is_marlin()
+            and not quant_method.moe_runner_backend.is_marlin()
         )
         or (
             isinstance(quant_method, Fp8MoEMethod)

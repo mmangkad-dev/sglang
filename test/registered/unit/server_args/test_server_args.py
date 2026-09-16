@@ -41,6 +41,7 @@ from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
+    handle_moe_kernel_config,
     validate_deepep_v2_dispatch_token_budget,
     validate_deepep_v2_speculative_draft,
 )
@@ -1181,6 +1182,58 @@ class TestContextParallelServerArgs(CustomTestCase):
 
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
+
+
+class TestNvFp4MoeRunnerBackendResolution(CustomTestCase):
+    """`--moe-runner-backend auto` with an NVFP4 checkpoint must be resolved
+    here, before any layer is built.
+
+    FusedMoE keys its w1/w3 shard swap, its 128 round-up and inplace off this
+    setting, and ModelOptNvFp4FusedMoEMethod keys its weight prep and its
+    kernel dispatch off it. A backend that only one of them knows about loads
+    the experts with gate and up exchanged, which shows up as degraded output
+    quality rather than an error.
+    """
+
+    @staticmethod
+    def _args(moe_runner_backend="auto", moe_a2a_backend="none"):
+        return ServerArgs(
+            model_path="dummy",
+            quantization="modelopt_fp4",
+            moe_runner_backend=moe_runner_backend,
+            moe_a2a_backend=moe_a2a_backend,
+        )
+
+    def _resolved(self, server_args):
+        handle_moe_kernel_config(server_args)
+        return resolution_result(server_args, "moe_runner_backend")
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_auto_resolves_on_blackwell(self):
+        self.assertEqual(self._resolved(self._args()), "flashinfer_trtllm")
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_auto_resolves_on_sm120(self):
+        # trtllm-gen MoE kernels are SM100-only.
+        self.assertEqual(self._resolved(self._args()), "flashinfer_cutlass")
+
+    @override_platform(
+        is_cuda=True, is_sm100=False, is_sm120=False, device_capability=(9, 0)
+    )
+    def test_auto_resolves_to_marlin_before_blackwell(self):
+        self.assertEqual(self._resolved(self._args()), "marlin")
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_auto_is_left_to_the_user_with_an_a2a_backend(self):
+        # The A2A combinations are picked per backend, so `auto` stays unresolved
+        # and ModelOptNvFp4FusedMoEMethod rejects it with the flag to pass.
+        self.assertEqual(self._resolved(self._args(moe_a2a_backend="deepep")), "auto")
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_explicit_backend_is_kept(self):
+        self.assertEqual(
+            self._resolved(self._args("flashinfer_cutedsl")), "flashinfer_cutedsl"
+        )
 
 
 class TestFlashinferA2ADispatchType(CustomTestCase):
