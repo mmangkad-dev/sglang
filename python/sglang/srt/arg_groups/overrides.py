@@ -1493,6 +1493,25 @@ def _dp_lm_head_validation(view: Any) -> dict:
     return {}
 
 
+def _modelopt_fp4_auto_moe_runner_backend(*, moe_a2a_backend: str) -> str:
+    # FusedMoE keys its w1/w3 shard swap, its 128 round-up and inplace off the
+    # runner backend, so NVFP4 `auto` has to be answered here, for every reader.
+    if get_platform().is_sm120:
+        # trtllm-gen MoE kernels are SM100-only.
+        logger.info("Use flashinfer_cutlass as MoE runner backend on SM120 for fp4")
+        return "flashinfer_cutlass"
+    if get_platform().is_sm100 and moe_a2a_backend == "none":
+        # The A2A combinations are validated per runner; the DeepSeek branch
+        # carries the same restriction.
+        logger.info("Use flashinfer_trtllm as MoE runner backend on SM100 for fp4")
+        return "flashinfer_trtllm"
+    if get_platform().is_cuda and (8, 0) <= get_platform().device_capability < (10, 0):
+        # NVFP4 checkpoints run W4A16 through marlin before Blackwell.
+        logger.info("Use marlin as MoE runner backend on SM80-SM90 for fp4")
+        return "marlin"
+    return "auto"
+
+
 @register_post_process
 def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     """The quantization-driven moe_runner_backend resolutions at the head of
@@ -1547,33 +1566,9 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
             )
             moe_runner_backend = mxfp8_default
     if moe_runner_backend == "auto" and view.quantization == "modelopt_fp4":
-        # Resolve here rather than inside the quant method: FusedMoE keys its
-        # w1/w3 shard swap, its 128 round-up and inplace off the runner backend,
-        # so a backend only the quant method knows about loads the experts with
-        # gate and up exchanged.
-        if get_platform().is_sm120:
-            moe_runner_backend = "flashinfer_cutlass"
-            logger.info(
-                "Use flashinfer_cutlass as MoE runner backend on SM120 for "
-                "modelopt_fp4 (trtllm-gen MoE kernels are SM100-only)"
-            )
-        elif get_platform().is_sm100 and view.moe_a2a_backend == "none":
-            # Same default as the DeepSeek branch, and the same restriction: the
-            # A2A combinations are picked per backend, so leave those to an
-            # explicit --moe-runner-backend.
-            moe_runner_backend = "flashinfer_trtllm"
-            logger.info(
-                "Use flashinfer_trtllm as MoE runner backend on SM100 for modelopt_fp4"
-            )
-        elif get_platform().is_cuda and (8, 0) <= get_platform().device_capability < (
-            10,
-            0,
-        ):
-            # NVFP4 checkpoints run W4A16 through marlin before Blackwell.
-            moe_runner_backend = "marlin"
-            logger.info(
-                "Use marlin as MoE runner backend on SM80-SM90 for modelopt_fp4"
-            )
+        moe_runner_backend = _modelopt_fp4_auto_moe_runner_backend(
+            moe_a2a_backend=view.moe_a2a_backend
+        )
     if moe_runner_backend != view.moe_runner_backend:
         return {"moe_runner_backend": moe_runner_backend}
     return {}

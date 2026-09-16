@@ -1186,14 +1186,9 @@ class TestContextParallelServerArgs(CustomTestCase):
 
 class TestNvFp4MoeRunnerBackendResolution(CustomTestCase):
     """`--moe-runner-backend auto` with an NVFP4 checkpoint must be resolved
-    here, before any layer is built.
-
-    FusedMoE keys its w1/w3 shard swap, its 128 round-up and inplace off this
-    setting, and ModelOptNvFp4FusedMoEMethod keys its weight prep and its
-    kernel dispatch off it. A backend that only one of them knows about loads
-    the experts with gate and up exchanged, which shows up as degraded output
-    quality rather than an error.
-    """
+    before any layer is built: FusedMoE and ModelOptNvFp4FusedMoEMethod read the
+    same setting, and a backend only one of them knows about loads the experts
+    with gate and up exchanged."""
 
     @staticmethod
     def _args(moe_runner_backend="auto", moe_a2a_backend="none"):
@@ -1225,14 +1220,15 @@ class TestNvFp4MoeRunnerBackendResolution(CustomTestCase):
 
     @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
     def test_auto_is_left_to_the_user_with_an_a2a_backend(self):
-        # The A2A combinations are picked per backend, so `auto` stays unresolved
-        # and ModelOptNvFp4FusedMoEMethod rejects it with the flag to pass.
+        # The A2A combinations are validated per runner, so `auto` stays put and
+        # ModelOptNvFp4FusedMoEMethod rejects it with the flag to pass.
         self.assertEqual(self._resolved(self._args(moe_a2a_backend="deepep")), "auto")
 
     @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
     def test_explicit_backend_is_kept(self):
         self.assertEqual(
-            self._resolved(self._args("flashinfer_cutedsl")), "flashinfer_cutedsl"
+            self._resolved(self._args(moe_runner_backend="flashinfer_cutedsl")),
+            "flashinfer_cutedsl",
         )
 
 
