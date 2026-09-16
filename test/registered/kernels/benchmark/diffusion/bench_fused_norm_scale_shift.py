@@ -21,7 +21,7 @@ from sglang.utils import is_in_ci
 register_cuda_ci(
     est_time=17,
     stage="base-b-kernel-benchmark",
-    runner_config="1-gpu-large",
+    runner_config="1-gpu-h100",
     disabled="Temporarily skipped to unblock flashinfer upgrade. Ref: https://github.com/sgl-project/sglang/actions/runs/23735552939/job/69139238979?pr=21422",
 )
 

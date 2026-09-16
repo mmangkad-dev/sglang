@@ -23,7 +23,7 @@ except ImportError:
     HAS_Q16_FLASHMLA = False
 
 register_cuda_ci(
-    est_time=120, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=120, stage="base-b-kernel-benchmark", runner_config="1-gpu-h100"
 )
 
 IS_CI = is_in_ci()

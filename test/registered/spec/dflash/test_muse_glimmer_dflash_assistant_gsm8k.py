@@ -10,7 +10,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=900, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=900, stage="nightly", runner_config="1-gpu-h100")
 
 TARGET_MODEL = "meta-models/Muse-Glimmer-30B"
 DRAFT_MODEL = "meta-models/Muse-Glimmer-30B-assistant"

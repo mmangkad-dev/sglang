@@ -46,7 +46,7 @@ JIT kernel notes:
 | **Unit tests** (no server / engine launch) | None | `register_cpu_ci` | `base-a-test-cpu` |
 | **Common / backend-independent** (middleware, abort, routing, config, arg parsing) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` only | `base-b-test-1-gpu-small` |
 | **Model-agnostic functionality** (sampling, session, OpenAI API features) | `DEFAULT_SMALL_MODEL_NAME_FOR_TEST` (1B) | `register_cuda_ci` (+ AMD if relevant) | `base-b-test-1-gpu-small` |
-| **General performance** (single node, no spec/DP/parallelism) | `DEFAULT_MODEL_NAME_FOR_TEST` (8B) | `register_cuda_ci` | `base-b-test-1-gpu-large` |
+| **General performance** (single node, no spec/DP/parallelism) | `DEFAULT_MODEL_NAME_FOR_TEST` (8B) | `register_cuda_ci` | `base-b-test-1-gpu-h100` |
 | **Bigger features** (spec, DP, TP, disaggregation) | Case by case | Case by case | See **Choosing a Suite** below |
 
 **Key principle for E2E tests**: Do NOT add `register_amd_ci` unless the test specifically exercises AMD/ROCm code paths. Common E2E tests just need any GPU to run — duplicating across backends wastes CI time with no extra coverage.
@@ -69,10 +69,10 @@ Defined in `python/sglang/test/test_utils.py`:
 A per-commit suite name is **generated** from registration metadata as `{stage}-test-{runner_config}` — you don't hand-write it:
 
 - **`stage`** — the CI stage (e.g. `base-b`, `base-b-kernel-unit`, `base-c`).
-- **`runner_config`** — a runner-pool key from `scripts/ci/runner_configs.yml`, which maps it to the physical runner label (so `1-gpu-large` runs on `1-gpu-h100`). AMD/NPU use their own keys (e.g. `amd`).
+- **`runner_config`** — a runner-pool key from `scripts/ci/runner_configs.yml`, which maps it to the physical runner label (so `1-gpu-h100` runs on `1-gpu-h100`). AMD/NPU use their own keys (e.g. `amd`).
 - **Suite** — `register_cuda_ci(stage="base-b", runner_config="1-gpu-small")` → `base-b-test-1-gpu-small`, the name you pass to `run_suite.py --suite`. The `-test-` is just the connector; never put it in `register_*_ci`.
 
-> CUDA nightly uses the same shape with `stage="nightly"` (e.g. `stage="nightly", runner_config="1-gpu-large"` → `nightly-test-1-gpu-large`) and **no** `nightly=True` — the stage name carries the cadence, and setting the flag makes the test silently never run. Legacy single-string `suite=` is left only for `stress` and some AMD/CPU/NPU pools.
+> CUDA nightly uses the same shape with `stage="nightly"` (e.g. `stage="nightly", runner_config="1-gpu-h100"` → `nightly-test-1-gpu-h100`) and **no** `nightly=True` — the stage name carries the cadence, and setting the flag makes the test silently never run. Legacy single-string `suite=` is left only for `stress` and some AMD/CPU/NPU pools.
 
 ### All CI Suites
 
@@ -102,10 +102,10 @@ Use the lightest suite that meets your test's needs:
 
 - **No GPU required** → `base-a-test-cpu`
 - **Most small GPU tests** → `base-b-test-1-gpu-small` (default choice)
-- **Need H100 memory or Hopper features** → `base-b-test-1-gpu-large`
-- **JIT kernel correctness** → `base-b-kernel-unit-test-1-gpu-large`
+- **Need H100 memory or Hopper features** → `base-b-test-1-gpu-h100`
+- **JIT kernel correctness** → `base-b-kernel-unit-test-1-gpu-h100`
 - **JIT kernel correctness for B200 / SM100 paths** → `base-b-kernel-unit-test-4-gpu-b200`
-- **JIT kernel benchmarks** → `base-b-kernel-benchmark-test-1-gpu-large`
+- **JIT kernel benchmarks** → `base-b-kernel-benchmark-test-1-gpu-h100`
 - **Multi-GPU** → only when the test actually needs multiple GPUs
 
 ---
@@ -225,7 +225,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-h100")
 
 
 class TestMyFeaturePerf(CustomTestCase):
@@ -303,10 +303,10 @@ from sglang.test.ci.ci_register import (
 register_cuda_ci(est_time=80, stage="base-b", runner_config="1-gpu-small")
 
 # Per-commit test (large 1-gpu, runs on H100)
-register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-h100")
 
 # Nightly-only test (same shape as per-commit, stage is just "nightly")
-register_cuda_ci(est_time=200, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=200, stage="nightly", runner_config="1-gpu-h100")
 
 # Multi-backend test (only when testing backend-specific code paths)
 register_cuda_ci(est_time=80, stage="base-a", runner_config="1-gpu-small")
@@ -337,19 +337,19 @@ They are ordinary registered tests; only their stage differs:
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # Correctness tests in test/registered/kernel/jit/
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-h100")
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="8-gpu-h200")
 
 # Benchmarks in test/registered/kernel/jit/benchmark/
-register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
+register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-h100")
 
 # Optional nightly registration — same form, stage is just "nightly"
-register_cuda_ci(est_time=120, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="nightly", runner_config="1-gpu-h100")
 register_cuda_ci(est_time=120, stage="nightly", runner_config="8-gpu-h200")
 ```
 
-Every call generates a suite named `{stage}-test-{runner_config}`, e.g. `base-b-kernel-unit-test-1-gpu-large` and `nightly-test-1-gpu-large`. Keep `est_time`, `stage`, `runner_config`, and `suite` as **literal values** — `run_suite.py` collects them by AST parsing.
+Every call generates a suite named `{stage}-test-{runner_config}`, e.g. `base-b-kernel-unit-test-1-gpu-h100` and `nightly-test-1-gpu-h100`. Keep `est_time`, `stage`, `runner_config`, and `suite` as **literal values** — `run_suite.py` collects them by AST parsing.
 
 ---
 

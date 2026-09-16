@@ -902,7 +902,7 @@ def _extract_runner_configs(content):
     """Pull `(runner_config, args_str)` from EVERY `register_cuda_ci(...)` call.
 
     A test file can register itself on multiple pools (e.g. both
-    `4-gpu-b200` and `1-gpu-large`). The earlier `re.search` variant
+    `4-gpu-b200` and `1-gpu-h100`). The earlier `re.search` variant
     returned only the first match, so /rerun-test silently dropped every
     registration after the first — multi-pool files only ever ran on the
     pool listed first. `re.finditer` is what makes the fan-out happen.

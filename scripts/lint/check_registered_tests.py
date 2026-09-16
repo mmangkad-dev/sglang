@@ -12,7 +12,7 @@ Pre-commit hook: validate CI registry calls under test/registered/.
      a. `{stage}-test-{runner_config}` -- the modern name stuffed back into the
         legacy form. Reported with the exact stage/runner split to use.
      b. an older `{stage}-{runner_config}` PR-test name (e.g. the pre-migration
-        `base-b-kernel-unit-1-gpu-large`) -- no longer matches any workflow
+        `base-b-kernel-unit-1-gpu-h100`) -- no longer matches any workflow
         suite at all.
    The modern form resolves to the identical suite (CIRegistry.effective_suite
    is f"{stage}-test-{runner_config}") and is /rerun-test-able.

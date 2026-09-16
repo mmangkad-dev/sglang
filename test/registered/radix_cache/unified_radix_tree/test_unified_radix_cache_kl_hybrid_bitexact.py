@@ -27,7 +27,7 @@ The lazy row was measured in the same session as the 1.18e-05 the non-lazy
 not as one being weaker.
 
 `test_prefill_cache_hit` is the only case that fires on both, so read the rest as
-extra coverage rather than as the guard for one fix. CI runs `1-gpu-large`, which
+extra coverage rather than as the guard for one fix. CI runs `1-gpu-h100`, which
 is SM90.
 
 These classes do not use UnifiedRadixTreeTestMixin: it bundles a gsm8k case an
@@ -73,7 +73,7 @@ from sglang.test.test_utils import (
     unified_radix_tree_server_env,
 )
 
-register_cuda_ci(est_time=2300, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=2300, stage="extra-a", runner_config="1-gpu-h100")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")

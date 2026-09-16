@@ -24,7 +24,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.deepseek_v4.common import make_paged_context, to_seq_extend
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-h100")
 
 C4_RING_SIZE = 16  # get_compress_state_ring_size(4, is_speculative=True)
 C128_RING_SIZE = 256  # get_compress_state_ring_size(128, is_speculative=True)

@@ -48,7 +48,7 @@ jobs:
   # is none -- `stage="weekly"` + `runner_config=` on the test is enough.
   weekly-test:
     # Without this, the matrix default names the job after every value in the
-    # row -- "weekly-test (1-gpu-large, 120, 180)".
+    # row -- "weekly-test (1-gpu-h100, 120, 180)".
     name: weekly-test-${{ matrix.runner_config }}
     needs: check-changes
     if: github.repository == 'sgl-project/sglang'
@@ -56,7 +56,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner_config: 1-gpu-large, run_timeout: '120', job_timeout: '180' }
+          - { runner_config: 1-gpu-h100, run_timeout: '120', job_timeout: '180' }
           - { runner_config: 2-gpu-large, run_timeout: '240', job_timeout: '300' }
           - { runner_config: 4-gpu-h100, run_timeout: '120', job_timeout: '180' }
           - { runner_config: 4-gpu-b200, run_timeout: '150', job_timeout: '210' }

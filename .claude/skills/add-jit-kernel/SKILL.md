@@ -488,23 +488,23 @@ if torch.cuda.get_device_capability()[0] < 9:
 
 JIT kernel correctness tests and benchmarks live under `test/registered/kernels/ops/<group>/` and `test/registered/kernels/benchmark/<group>/`, mirroring the wrapper's group under `python/sglang/kernels/ops/` (NOT inside the `sglang` package -- a `register_*_ci(...)` call anywhere under `python/sglang/` is rejected by the `check-no-registered-tests-in-package` pre-commit hook). Only their test-only helpers (e.g. `benchmark/marker.py`) stay alongside the kernel source under `python/sglang/kernels/jit/` and are imported by absolute path. **CI does not run `pytest` in those directories directly.** The unified runner `test/run_suite.py` discovers every `test_*.py` and `bench_*.py` under `test/registered/`, collects `register_*_ci(...)` calls by **statically parsing each file's AST**, and executes the selected suite. Every test file must register at least one CUDA entry or the collector fails its sanity check.
 
-- **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `base-b-kernel-unit-test-1-gpu-large` on H100 and `base-b-kernel-unit-test-4-gpu-b200` on B200/SM100 paths (see `.github/workflows/pr-test-jit-kernel.yml`). Multi-GPU JIT tests use `base-b-kernel-unit-test-8-gpu-h200`.
-- **Nightly kernel suite**: register with `stage="nightly"` plus the `runner_config` of the machine it needs (e.g. `1-gpu-large`), giving the `nightly-test-1-gpu-large` suite. `.github/workflows/nightly-test-nvidia.yml` sets `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1` for the whole nightly run, so the expanded parameter grids apply automatically (see `python/sglang/kernels/jit/utils/common.py` → `should_run_full_tests` / `get_ci_test_range`). There is no separate kernel-only nightly job: every nightly test on one machine type shares that machine's suite.
+- **PR / per-commit CUDA suites** (see `test/run_suite.py` → `PER_COMMIT_SUITES`): JIT unit tests use `base-b-kernel-unit-test-1-gpu-h100` on H100 and `base-b-kernel-unit-test-4-gpu-b200` on B200/SM100 paths (see `.github/workflows/pr-test-jit-kernel.yml`). Multi-GPU JIT tests use `base-b-kernel-unit-test-8-gpu-h200`.
+- **Nightly kernel suite**: register with `stage="nightly"` plus the `runner_config` of the machine it needs (e.g. `1-gpu-h100`), giving the `nightly-test-1-gpu-h100` suite. `.github/workflows/nightly-test-nvidia.yml` sets `SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1` for the whole nightly run, so the expanded parameter grids apply automatically (see `python/sglang/kernels/jit/utils/common.py` → `should_run_full_tests` / `get_ci_test_range`). There is no separate kernel-only nightly job: every nightly test on one machine type shares that machine's suite.
 
 Registration pattern (module level, **literal** `est_time`, `stage`, and `runner_config` values — required for AST parsing):
 
 ```python
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-h100")
 # Optional B200/SM100 registration for tests that cover Blackwell-specific code paths
 # register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 # Optional second registration: same file also runs nightly, same form,
 # stage is just "nightly" there (and no `nightly=True`)
-# register_cuda_ci(est_time=120, stage="nightly", runner_config="1-gpu-large")
+# register_cuda_ci(est_time=120, stage="nightly", runner_config="1-gpu-h100")
 ```
 
-CI generates the suite name as `{stage}-test-{runner_config}`, so `stage="base-b-kernel-unit", runner_config="1-gpu-large"` becomes the `base-b-kernel-unit-test-1-gpu-large` suite you pass to `run_suite.py` below — don't put the `-test-` infix in `register_cuda_ci`. Nightly uses the same shape with `stage="nightly"`; the single-string `suite=` form is left only for `stress` and non-CUDA pools.
+CI generates the suite name as `{stage}-test-{runner_config}`, so `stage="base-b-kernel-unit", runner_config="1-gpu-h100"` becomes the `base-b-kernel-unit-test-1-gpu-h100` suite you pass to `run_suite.py` below — don't put the `-test-` infix in `register_cuda_ci`. Nightly uses the same shape with `stage="nightly"`; the single-string `suite=` form is left only for `stress` and non-CUDA pools.
 
 Keep `est_time`, `stage`, `runner_config`, and `suite` as literal values. `run_suite.py` collects them from the file AST, so computed values and helper wrappers can break CI discovery.
 
@@ -513,7 +513,7 @@ Use `register_cuda_ci(..., disabled="reason")` if the file must stay in-tree but
 **Run like CI** (from repo root):
 
 ```bash
-(cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-unit-test-1-gpu-large)
+(cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-unit-test-1-gpu-h100)
 # For B200/SM100-specific coverage:
 (cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-unit-test-4-gpu-b200)
 ```
@@ -528,7 +528,7 @@ import torch
 from sglang.kernels.ops.elementwise.scale import scale
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-h100")
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -573,7 +573,7 @@ if __name__ == "__main__":
 
 ## Step 5: Add a benchmark (required)
 
-Benchmarks are `bench_*.py` files under `test/registered/kernels/benchmark/<group>/`. They are picked up by the same `run_suite.py` machinery as unit tests. Register them for **`base-b-kernel-benchmark-test-1-gpu-large`** (PR JIT benchmark job: `python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-large`).
+Benchmarks are `bench_*.py` files under `test/registered/kernels/benchmark/<group>/`. They are picked up by the same `run_suite.py` machinery as unit tests. Register them for **`base-b-kernel-benchmark-test-1-gpu-h100`** (PR JIT benchmark job: `python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-h100`).
 
 Benchmarks use the project's own `marker` framework (in `python/sglang/kernels/jit/benchmark/marker.py`) — **do not** use `triton.testing.perf_report` / `triton.testing.do_bench` directly. The marker framework provides (public names: `benchmark`, `parametrize`, `do_bench`, `skip`, `BenchResult`, `BenchSkip`):
 
@@ -600,7 +600,7 @@ from sglang.kernels.jit.benchmark.utils import create_random
 from sglang.kernels.ops.elementwise.scale import scale as jit_scale
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
+register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-h100")
 
 
 @torch.compile()
@@ -654,7 +654,7 @@ python test/registered/kernels/benchmark/elementwise/bench_scale.py
 Run the benchmark suite the way CI does:
 
 ```bash
-cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-large
+cd test && python3 run_suite.py --hw cuda --suite base-b-kernel-benchmark-test-1-gpu-h100
 ```
 
 ---

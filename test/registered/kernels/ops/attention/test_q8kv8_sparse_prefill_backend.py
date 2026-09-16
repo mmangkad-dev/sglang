@@ -33,7 +33,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-h100")
 
 
 def test_q8kv8_sparse_prefill_backend_selector_uses_cli_value():

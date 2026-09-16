@@ -138,7 +138,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=95, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=95, stage="base-b-kernel-unit", runner_config="1-gpu-h100")
 register_amd_ci(est_time=8, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

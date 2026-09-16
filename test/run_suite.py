@@ -70,13 +70,13 @@ PER_COMMIT_SUITES = {
     HWBackend.CUDA: [
         "base-a-test-1-gpu-small",
         "base-b-test-1-gpu-small",
-        "base-b-test-1-gpu-large",
+        "base-b-test-1-gpu-h100",
         "base-b-test-2-gpu-large",
         "base-b-test-4-gpu-b200",
-        "base-b-kernel-unit-test-1-gpu-large",
+        "base-b-kernel-unit-test-1-gpu-h100",
         "base-b-kernel-unit-test-4-gpu-b200",
         "base-b-kernel-unit-test-8-gpu-h200",
-        "base-b-kernel-benchmark-test-1-gpu-large",
+        "base-b-kernel-benchmark-test-1-gpu-h100",
         # Diffusion keeps case-level pytest partitioning behind registered
         # bridge files while sharing this discovery and dispatch entry point.
         "base-b-test-diffusion-1-gpu-h100",
@@ -96,7 +96,7 @@ PER_COMMIT_SUITES = {
         # extra-a / extra-b: label-gated PR opt-in suites in pr-test-extra.yml
         # (tests still tagged per-commit but skipped on default PR runs).
         "extra-a-test-1-gpu-small",
-        "extra-a-test-1-gpu-large",
+        "extra-a-test-1-gpu-h100",
         "extra-a-test-2-gpu-large",
         "extra-b-test-4-gpu-h100",
         "extra-b-test-4-gpu-b200",
@@ -130,7 +130,7 @@ NIGHTLY_SUITES = {
         # `stage="nightly"` + a runner_config, same `{stage}-test-{runner_config}`
         # shape as the per-commit suites. No `nightly=True`: the stage name
         # carries the cadence; only the legacy suites below still need the flag.
-        "nightly-test-1-gpu-large",
+        "nightly-test-1-gpu-h100",
         "nightly-test-2-gpu-large",
         "nightly-test-4-gpu-h100",
         "nightly-test-4-gpu-b200",
@@ -210,7 +210,7 @@ OTHER_SUITES = {
         # `stage="weekly"` -- same shape. The three dicts group names for
         # readability only; validation reads their union. One entry per row of
         # the matrix in weekly-test-nvidia.yml.
-        "weekly-test-1-gpu-large",
+        "weekly-test-1-gpu-h100",
         "weekly-test-2-gpu-large",
         "weekly-test-4-gpu-h100",
         "weekly-test-4-gpu-b200",

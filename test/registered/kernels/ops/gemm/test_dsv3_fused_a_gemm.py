@@ -14,7 +14,7 @@ from sglang.kernels.jit.utils import (
 from sglang.kernels.ops.gemm.dsv3_fused_a_gemm import dsv3_fused_a_gemm
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-h100")
 
 # hd_in must be a multiple of 256; 2048/6144/7168 cover the real fused-A shapes
 # (2048 is q_b_proj TP4/TP8, 6144/7168 are qkv_a).

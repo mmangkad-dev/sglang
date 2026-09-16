@@ -1,4 +1,4 @@
-"""Regression test for PR #32208 / base-b-test-1-gpu-large CI failure.
+"""Regression test for PR #32208 / base-b-test-1-gpu-h100 CI failure.
 
 FlashAttentionBackend's prefill-aware-SWA scratch buffer
 (``_pa_swa_prefill_lens``) is indexed directly by raw ``req_pool_idx`` values

@@ -13,8 +13,8 @@ from sglang.kernels.jit.utils import (
 from sglang.kernels.ops.gemm.tiny_gemm import can_use_tiny_gemm, tiny_gemm_bf16
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_cuda_ci(est_time=300, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-h100")
+register_cuda_ci(est_time=300, stage="nightly", runner_config="1-gpu-h100")
 
 # One kernel is built per m in [1, MAX_M], so hold max_m fixed across the sweep:
 # every num_tokens of a shape then shares one JIT module.

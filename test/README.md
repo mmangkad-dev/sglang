@@ -51,7 +51,7 @@ python3 test/run_suite.py --hw cpu --suite base-a-test-cpu
 python3 test/run_suite.py --hw cuda --suite base-a-test-1-gpu-small
 
 # Nightly tests (CUDA nightly suites take no --nightly; the stage is in the name)
-python3 test/run_suite.py --hw cuda --suite nightly-test-1-gpu-large
+python3 test/run_suite.py --hw cuda --suite nightly-test-1-gpu-h100
 
 # With auto-partitioning (for parallel CI jobs)
 python3 test/run_suite.py --hw cuda --suite base-b-test-1-gpu-small \
@@ -92,8 +92,8 @@ New JIT kernel correctness tests and benchmarks live under
 incrementally. Helpers stay alongside the kernel source under
 `python/sglang/kernels/jit/` and are imported by absolute path:
 
-- Correctness tests: `test/registered/kernel/jit/test_*.py` → `base-b-kernel-unit-test-1-gpu-large`
-- Benchmarks: `test/registered/kernel/jit/benchmark/bench_*.py` → `base-b-kernel-benchmark-test-1-gpu-large`
+- Correctness tests: `test/registered/kernel/jit/test_*.py` → `base-b-kernel-unit-test-1-gpu-h100`
+- Benchmarks: `test/registered/kernel/jit/benchmark/bench_*.py` → `base-b-kernel-benchmark-test-1-gpu-h100`
 
 ## Choosing a Suite
 
@@ -103,9 +103,9 @@ Use the lightest suite that meets your test's needs. Full suite tables are in th
 |------|-------|
 | No GPU required | `base-a-test-cpu` |
 | Small GPU (fits 5090, 32GB) | `base-b-test-1-gpu-small` (most tests go here) |
-| Large GPU memory or Hopper features | `base-b-test-1-gpu-large` |
-| JIT kernel correctness | `base-b-kernel-unit-test-1-gpu-large` |
-| JIT kernel benchmarks | `base-b-kernel-benchmark-test-1-gpu-large` |
+| Large GPU memory or Hopper features | `base-b-test-1-gpu-h100` |
+| JIT kernel correctness | `base-b-kernel-unit-test-1-gpu-h100` |
+| JIT kernel benchmarks | `base-b-kernel-benchmark-test-1-gpu-h100` |
 | Multi-GPU (2/4/8) | `base-b-test-2-gpu-large`, `base-c-test-*` |
 | Long-running or experimental | `nightly-*` suites |
 

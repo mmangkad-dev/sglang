@@ -35,7 +35,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 # CI runs the trimmed matrix (17 cases, one dtype), but on a cold runner the
 # single JIT compile is ~29s of the ~31s total -- the case count is nearly free.
-register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-h100")
 
 DEVICE = "cuda"
 
