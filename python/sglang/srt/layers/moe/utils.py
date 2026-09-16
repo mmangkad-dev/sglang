@@ -646,14 +646,6 @@ def has_per_rank_fused_shared_slots(num_fused_shared_experts: int) -> bool:
     return num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
 
 
-def is_flashinfer_cutedsl_v1_path() -> bool:
-    """CuteDSL v1 + DeepEP low-latency path (no MoeRunner, no autotune)."""
-    return (
-        get_moe_runner_backend().is_flashinfer_cutedsl()
-        and get_moe_a2a_backend().is_deepep()
-    )
-
-
 def get_tbo_token_distribution_threshold() -> float:
     moe = get_flags().moe
     if moe.tbo_token_distribution_threshold is None:
