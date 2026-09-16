@@ -66,7 +66,6 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
-    get_device_capability,
     is_cuda,
     round_up,
     set_weight_attrs,
@@ -2296,12 +2295,12 @@ def _compute_gemm1_alphas(
 
 
 def _resolve_nvfp4_moe_runner_backend() -> MoeRunnerBackendLike:
-    # Only marlin is decided here; it has no FusedMoE-side coupling, while the
-    # trtllm/cutlass answers also key its shard swap, round-up and inplace.
+    # Only marlin is decided here; the trtllm/cutlass answers also key FusedMoE's
+    # shard swap and padding, so they resolve in _moe_runner_backend_quant_constraints.
     moe_runner_backend = get_moe_runner_backend()
     if not moe_runner_backend.is_auto():
         return moe_runner_backend
-    if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
+    if get_platform().is_cuda and (8, 0) <= get_platform().device_capability < (10, 0):
         # NVFP4 checkpoints run W4A16 through marlin before Blackwell.
         return MoeRunnerBackend.MARLIN
     raise ValueError(

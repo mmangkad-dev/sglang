@@ -41,7 +41,10 @@ def _method(*, runner_backend: MoeRunnerBackend, a2a_backend: MoeA2ABackend):
 
 class TestNvFp4MoeRunnerBackendOwnership(CustomTestCase):
     def setUp(self):
-        platform = override_platform(is_cuda=True, is_blackwell=True)
+        self._platform(is_cuda=True, is_blackwell=True, device_capability=(10, 0))
+
+    def _platform(self, **facts):
+        platform = override_platform(**facts)
         platform.install()
         self.addCleanup(platform.restore)
 
@@ -97,6 +100,17 @@ class TestNvFp4MoeRunnerBackendOwnership(CustomTestCase):
             _method(
                 runner_backend=MoeRunnerBackend.AUTO, a2a_backend=MoeA2ABackend.NONE
             )
+
+    def test_auto_still_takes_the_marlin_fallback_before_blackwell(self):
+        """Marlin is the one answer this method may give itself: no FusedMoE
+        switch keys off it, and NVFP4 has no other pre-Blackwell path."""
+        self._platform(is_cuda=True, is_blackwell=False, device_capability=(9, 0))
+
+        method = _method(
+            runner_backend=MoeRunnerBackend.AUTO, a2a_backend=MoeA2ABackend.NONE
+        )
+
+        self.assertEqual(method.moe_runner_backend, MoeRunnerBackend.MARLIN)
 
 
 if __name__ == "__main__":
