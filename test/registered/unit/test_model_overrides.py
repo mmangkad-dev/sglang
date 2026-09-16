@@ -2543,14 +2543,21 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _moe_runner_backend_quant_constraints,
         )
 
-        def _view(**kw):
+        def _view(detected_quantization=None, **kw):
             defaults = dict(
                 quantization=None,
                 moe_runner_backend="auto",
                 moe_a2a_backend="none",
             )
             defaults.update(kw)
-            return ResolvedView(SimpleNamespace(**defaults))
+            # The modelopt_fp4 resolution reads the detected method, so the
+            # fixture supplies a model config rather than having one built.
+            server_args = SimpleNamespace(**defaults)
+            server_args._model_config = SimpleNamespace(
+                quantization=detected_quantization or defaults["quantization"]
+            )
+            server_args._model_config_built_from = None
+            return ResolvedView(server_args)
 
         with override_platform(is_sm100=True):
             self.assertEqual(

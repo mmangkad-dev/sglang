@@ -1565,7 +1565,12 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
                 moe_runner_backend,
             )
             moe_runner_backend = mxfp8_default
-    if moe_runner_backend == "auto" and view.quantization == "modelopt_fp4":
+    # The resolved method, not the CLI string: an NVFP4 checkpoint served without
+    # an explicit --quantization leaves view.quantization None.
+    if (
+        moe_runner_backend == "auto"
+        and model_config_of(view).quantization == "modelopt_fp4"
+    ):
         moe_runner_backend = _modelopt_fp4_auto_moe_runner_backend(
             moe_a2a_backend=view.moe_a2a_backend
         )
