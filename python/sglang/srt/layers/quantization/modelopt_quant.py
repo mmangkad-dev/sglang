@@ -22,8 +22,8 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
+    MoeRunnerBackendLike,
     get_flashinfer_a2a_dispatch_type,
-    is_flashinfer_cutedsl_v1_path,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
@@ -2295,6 +2295,21 @@ def _compute_gemm1_alphas(
     return g1_alphas, g1_alphas_up
 
 
+def _resolve_nvfp4_moe_runner_backend() -> MoeRunnerBackendLike:
+    """Pick the MoE runner backend an NVFP4 fused-MoE method runs on.
+
+    `auto` resolves to marlin on pre-Blackwell CUDA (the W4A16 fallback that
+    makes NVFP4 checkpoints loadable on SM80/SM90) and to TRT-LLM elsewhere,
+    currently the most performant and tested FP4 MoE backend.
+    """
+    moe_runner_backend = get_moe_runner_backend()
+    if not moe_runner_backend.is_auto():
+        return moe_runner_backend
+    if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
+        return MoeRunnerBackend.MARLIN
+    return MoeRunnerBackend.FLASHINFER_TRTLLM
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -2304,37 +2319,46 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
-        moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto() and is_cuda():
-            capability = get_device_capability()
-            use_marlin_fallback = (8, 0) <= capability < (10, 0)
-        else:
-            use_marlin_fallback = moe_runner_backend.is_marlin()
-        if not get_platform().is_blackwell and not use_marlin_fallback:
+        # Resolve the MoE and A2A backends ONCE, here, and let every later
+        # decision of this method read the resolved values: parameter
+        # allocation, weight layout, weight prep, the MoeRunner built in
+        # create_moe_runner, and the kernel apply() dispatches to. Re-reading
+        # the process-wide backends afterwards is wrong under speculative
+        # decoding -- speculative_moe_backend_context and
+        # speculative_moe_a2a_backend_context swap the globals to the draft's
+        # backends around draft work that also runs the target's layers (e.g.
+        # adaptive CUDA-graph capture), while this method still owns weights
+        # prepared for the target's backend.
+        self._moe_runner_backend = _resolve_nvfp4_moe_runner_backend()
+        self._moe_a2a_is_deepep = get_moe_a2a_backend().is_deepep()
+        if not get_platform().is_blackwell and not self._moe_runner_backend.is_marlin():
             raise ValueError(
                 "Current platform does not support NVFP4"
                 " quantization with the selected MoE backend. Please use "
                 "Blackwell and above, or use moe_runner_backend=marlin on SM80+."
             )
-        self.enable_flashinfer_trtllm_moe = (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
-        )
         self._cache_permute_indices = {}
 
     @property
-    def enable_flashinfer_cutlass_moe(self) -> bool:
-        from sglang.srt.layers.moe import get_moe_runner_backend
+    def moe_runner_backend(self) -> MoeRunnerBackendLike:
+        """The backend this method prepares its weights and its runner for."""
+        return self._moe_runner_backend
 
-        """Access the global enable_flashinfer_cutlass_moe setting."""
-        return get_moe_runner_backend().is_flashinfer_cutlass()
+    @property
+    def enable_flashinfer_trtllm_moe(self) -> bool:
+        """TRT-LLM FP4 kernels; the routed backend shares their weight prep."""
+        return (
+            self._moe_runner_backend.is_flashinfer_trtllm()
+            or self._moe_runner_backend.is_flashinfer_trtllm_routed()
+        )
+
+    @property
+    def enable_flashinfer_cutlass_moe(self) -> bool:
+        return self._moe_runner_backend.is_flashinfer_cutlass()
 
     @property
     def enable_flashinfer_cutedsl_moe(self) -> bool:
-        """Access the global enable_flashinfer_cutedsl_moe setting."""
-        from sglang.srt.layers.moe import get_moe_runner_backend
-
-        return get_moe_runner_backend().is_flashinfer_cutedsl()
+        return self._moe_runner_backend.is_flashinfer_cutedsl()
 
     # ----- CuteDSL v1 vs v2 path helpers -----
     #
@@ -2351,8 +2375,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     @property
     def _is_cutedsl_v1_deepep(self) -> bool:
-        """CuteDSL v1 + DeepEP low-latency path (masked grouped GEMM)."""
-        return is_flashinfer_cutedsl_v1_path()
+        """CuteDSL v1 + DeepEP low-latency path (masked grouped GEMM).
+
+        Both halves are this method's resolved backends, not the live globals:
+        the v1/v2 answer picks the weight layout at load time and the kernel at
+        forward time, and those two must be the same answer.
+        """
+        return self.enable_flashinfer_cutedsl_moe and self._moe_a2a_is_deepep
 
     @property
     def _is_cutedsl_v2_standard(self) -> bool:
@@ -2444,7 +2473,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # swizzle+allocate here to avoid GPU memory fragmentation
         if (
             self.enable_flashinfer_trtllm_moe
-            or get_moe_runner_backend().is_flashinfer_megamoe()
+            or self._moe_runner_backend.is_flashinfer_megamoe()
         ):
             layer.w13_blockscale_swizzled = None
         else:
@@ -2467,7 +2496,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if (
             self.enable_flashinfer_trtllm_moe
-            or get_moe_runner_backend().is_flashinfer_megamoe()
+            or self._moe_runner_backend.is_flashinfer_megamoe()
         ):
             layer.w2_blockscale_swizzled = None
         else:
@@ -2555,9 +2584,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # GEMM1 scale processing is deferred until the input scale is known;
         # see _compute_gemm1_alphas, which splits w13's gate/up weight scales.
-        moe_runner_backend = getattr(
-            self, "_moe_runner_backend", get_moe_runner_backend()
-        )
+        moe_runner_backend = self._moe_runner_backend
         use_nvfp4_dispatch = _use_nvfp4_dispatch()
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
@@ -2730,7 +2757,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ("w2", layer.w2_weight_scale),
         ]:
             # For NVFP4 TRTLLM we require one scale per 16 inputs (last dim == expected_blocks[name]).
-            if get_moe_runner_backend().is_flashinfer_trtllm():
+            if moe_runner_backend.is_flashinfer_trtllm():
                 expected_blocks = {
                     "w13": layer.w13_weight.shape[2] * 2 // block_size,
                     "w2": layer.w2_weight.shape[2] * 2 // block_size,
@@ -2759,11 +2786,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             return
 
         # Weight processing based on strategy
-        if (
-            self.enable_flashinfer_trtllm_moe
-            and reorder_rows_for_gated_act_gemm is not None
-            and shuffle_matrix_sf_a is not None
-        ):
+        if self.enable_flashinfer_trtllm_moe:
+            # apply() dispatches on the same resolved backend, so this is the
+            # only prep that produces what the TRT-LLM branch dereferences
+            # (g1_scale_c, the shuffled weights). Preparing CUTLASS weights
+            # instead would only defer the failure to the first forward.
+            if reorder_rows_for_gated_act_gemm is None or shuffle_matrix_sf_a is None:
+                raise ImportError(
+                    "NVFP4 MoE with moe_runner_backend="
+                    f"{moe_runner_backend.value} needs flashinfer's "
+                    "reorder_rows_for_gated_act_gemm and shuffle_matrix_sf_a, "
+                    "which this flashinfer build does not provide. Install a "
+                    "flashinfer build that has them, or pick another backend, "
+                    "e.g. --moe-runner-backend flashinfer_cutlass."
+                )
+
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 align_fp4_moe_weights_for_flashinfer_trtllm,
             )
@@ -2910,17 +2947,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        moe_runner_backend = get_moe_runner_backend()
-
-        if moe_runner_backend.is_auto():
-            if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
-                moe_runner_backend = MoeRunnerBackend.MARLIN
-            else:
-                # TRTLLM is currently the most performant and tested FP4 MoE
-                # backend, so use it as the default.
-                moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
-
-        self._moe_runner_backend = moe_runner_backend
+        moe_runner_backend = self._moe_runner_backend
 
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
@@ -2977,9 +3004,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # tuple). Defer per-attribute access to the branches that actually
         # consume them.
         activation = self.moe_runner_config.activation
-        moe_runner_backend = getattr(
-            self, "_moe_runner_backend", get_moe_runner_backend()
-        )
+        moe_runner_backend = self._moe_runner_backend
 
         assert activation in _SUPPORTED_ACT_STRS or (
             activation == "situ" and moe_runner_backend.is_flashinfer_trtllm()
@@ -3009,8 +3034,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             quant_info = self.get_marlin_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
 
-        # FlashInfer TRTLLM FP4 path
-        if self.enable_flashinfer_trtllm_moe and hasattr(layer, "g1_scale_c"):
+        # FlashInfer TRTLLM FP4 path (the routed backend shares it)
+        if self.enable_flashinfer_trtllm_moe:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 FlashInferTrtllmFp4MoeQuantInfo,
             )
