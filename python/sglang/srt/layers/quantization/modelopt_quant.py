@@ -2296,13 +2296,8 @@ def _compute_gemm1_alphas(
 
 
 def _resolve_nvfp4_moe_runner_backend() -> MoeRunnerBackendLike:
-    """Pick the MoE runner backend an NVFP4 fused-MoE method runs on.
-
-    Only the marlin fallback is decided here: it has no FusedMoE-side coupling.
-    Every other backend has to be resolved before the layers are built (see
-    _moe_runner_backend_quant_constraints), because FusedMoE keys its w1/w3
-    shard swap, its 128 round-up and inplace off the same setting.
-    """
+    # Only marlin is decided here; it has no FusedMoE-side coupling, while the
+    # trtllm/cutlass answers also key its shard swap, round-up and inplace.
     moe_runner_backend = get_moe_runner_backend()
     if not moe_runner_backend.is_auto():
         return moe_runner_backend
@@ -2328,8 +2323,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
         # The speculative contexts swap the process-wide MoE and A2A backends
-        # around draft work that also runs the target's layers, so resolve once
-        # here and never re-read them.
+        # around draft work that also runs the target's layers; resolve once here.
         self._moe_runner_backend = _resolve_nvfp4_moe_runner_backend()
         self._moe_a2a_is_deepep = get_moe_a2a_backend().is_deepep()
         if not get_platform().is_blackwell and not self._moe_runner_backend.is_marlin():
@@ -2376,11 +2370,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     @property
     def _is_cutedsl_v1_deepep(self) -> bool:
-        """CuteDSL v1 + DeepEP low-latency path (masked grouped GEMM).
-
-        Reads the resolved backends: this answer picks the weight layout at
-        load time and the kernel at forward time, and both must agree.
-        """
+        """CuteDSL v1 + DeepEP low-latency path (masked grouped GEMM)."""
         return self.enable_flashinfer_cutedsl_moe and self._moe_a2a_is_deepep
 
     @property
@@ -2787,10 +2777,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # Weight processing based on strategy
         if self.enable_flashinfer_trtllm_moe:
-            # apply() dispatches on the same resolved backend, so this prep is
-            # the only one that produces what the TRT-LLM branch dereferences;
-            # preparing CUTLASS weights instead defers the failure to the first
-            # forward.
+            # apply() dispatches on the same backend, so this is the only prep
+            # that produces what the TRT-LLM branch dereferences.
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 align_fp4_moe_weights_for_flashinfer_trtllm,
             )
@@ -3024,7 +3012,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             quant_info = self.get_marlin_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
 
-        # FlashInfer TRTLLM FP4 path (the routed backend shares it)
+        # FlashInfer TRTLLM FP4 path
         if self.enable_flashinfer_trtllm_moe:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 FlashInferTrtllmFp4MoeQuantInfo,
