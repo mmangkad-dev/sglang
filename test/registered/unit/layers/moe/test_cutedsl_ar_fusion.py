@@ -729,6 +729,32 @@ def test_a_second_workspace_in_one_process_is_refused():
         mod._WORKSPACE = saved
 
 
+def test_the_handoff_constructs_inside_a_dynamo_traced_region():
+    """Both producers build a handoff inside a fullgraph=True region -- qwen2_moe's
+    MoE forward, and DeepSeek's capture-mode dual stream under tc_piecewise --
+    and Dynamo cannot construct a msgspec.Struct. Migrating this container to
+    the repo's preferred one is a capture-time server failure, not a graph
+    break, so the container choice is pinned here rather than by comment.
+
+    Constructs the dataclass directly: routing through from_flashinfer() would
+    trace a stand-in producer object instead, and fail for its own reasons.
+    """
+
+    def build(x):
+        return MoeFinalizeHandoff(
+            routed_output=x,
+            expert_weights=x,
+            permuted_indices=x,
+            gated_shared_output=x,
+            m=2,
+        )
+
+    handoff = torch.compile(build, fullgraph=True, backend="eager")(torch.zeros(4, 8))
+
+    assert handoff.m == 2
+    assert tuple(handoff.routed_output.shape) == (4, 8)
+
+
 if __name__ == "__main__":
     import sys
 
