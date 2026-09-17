@@ -300,18 +300,13 @@ class BaseRunner(ABC):
             return
 
         if uses_cutedsl_ar_fusion():
-            # Nothing to pre-initialize -- cutedsl builds its own workspace from
-            # the model's pre-capture hook -- but it is also the one backend
-            # whose configured value nothing else resolves, so the platform
-            # check runs here or not at all. Scoped to this branch: the legacy
-            # backends keep degrading quietly rather than raising at warmup.
+            # cutedsl builds its own workspace from the model's pre-capture
+            # hook, and nothing else resolves its configured value, so the
+            # platform check runs here or not at all.
             resolve_flashinfer_allreduce_fusion_backend()
-            # A model that installed no fusion communicator would otherwise
-            # serve with every allreduce fusion silently off.
             if not mr.is_draft_worker:
                 # install_cutedsl_fusion() declines inside
-                # draft_model_build_scope(), so a draft legitimately carries no
-                # communicator and must not be held to this check.
+                # draft_model_build_scope(), so a draft carries no communicator.
                 self._assert_model_installs_cutedsl_fusion()
             return
 
@@ -322,8 +317,6 @@ class BaseRunner(ABC):
         )
 
     def _assert_model_installs_cutedsl_fusion(self):
-        """Fail closed when --flashinfer-allreduce-fusion-backend cutedsl names
-        a backend no layer of this model can run."""
         from sglang.srt.layers.moe.cutedsl_ar_fusion import (
             model_installs_cutedsl_fusion,
         )
