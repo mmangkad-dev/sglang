@@ -285,6 +285,61 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
         )
 
 
+def _load_fused_per_tensor_scale(
+    param: torch.nn.Parameter, loaded_weight: torch.Tensor
+) -> None:
+    """Broadcast a checkpoint-wide per-tensor scale over a per-expert param."""
+    param_data = param.data
+    loaded_weight = loaded_weight.to(param_data.device, param_data.dtype)
+    if loaded_weight.numel() == 1:
+        param_data.fill_(loaded_weight.reshape(()).item())
+        return
+    if loaded_weight.dim() == 1 and param_data.dim() == 2:
+        param_data.copy_(loaded_weight.unsqueeze(-1).expand_as(param_data))
+        return
+    param_data.copy_(loaded_weight.reshape(param_data.shape))
+
+
+def match_fused_expert_param(
+    name: str,
+    expert_params_mapping,
+    params_dict,
+):
+    """Bind a fused-expert checkpoint tensor to its parameter, by exact suffix.
+
+    Checkpoint names share prefixes ("gate_up_proj" is a prefix of
+    "gate_up_proj_weight_scale"), so a substring test binds the wrong parameter.
+    Returns (mapped_name, shard_id), or (None, None) when nothing matches.
+    """
+    for param_name, weight_name, shard_id in expert_params_mapping:
+        if not name.endswith(weight_name):
+            continue
+        mapped_name = name[: -len(weight_name)] + param_name
+        if mapped_name not in params_dict:
+            continue
+        return mapped_name, shard_id
+    return None, None
+
+
+def _narrow_checkpoint_to_rank(
+    loaded_weight: torch.Tensor,
+    shard_dim: int,
+    moe_tp_size: int,
+    tp_rank: int,
+    use_presharded_weights: bool,
+) -> torch.Tensor:
+    """This rank's slice of a full checkpoint tensor, sized by the checkpoint.
+
+    The parameter's own shard size is padded (trtllm-gen rounds the intermediate
+    to 128), so using it to index the checkpoint makes rank 0 read into rank 1's
+    rows and rank 1 start past its own.
+    """
+    if use_presharded_weights:
+        return loaded_weight
+    shard = loaded_weight.shape[shard_dim] // moe_tp_size
+    return loaded_weight.narrow(shard_dim, shard * tp_rank, shard)
+
+
 def _copy_into_padded_expert_data(
     expert_data: torch.Tensor, loaded_weight: torch.Tensor
 ) -> None:
@@ -675,27 +730,6 @@ class FusedMoE(torch.nn.Module):
         elif shard_id == "w2":
             param_data[expert_id] = loaded_weight
 
-    def _load_fused_per_tensor_scale(
-        self,
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-    ):
-        """Broadcast a checkpoint-wide per-tensor scale over a per-expert param.
-
-        The parameter is [num_experts] or [num_experts, num_shards]; the loaded
-        value is a scalar, or already per-expert, in which case it is broadcast
-        over the shard dim only.
-        """
-        param_data = param.data
-        loaded_weight = loaded_weight.to(param_data.device, param_data.dtype)
-        if loaded_weight.numel() == 1:
-            param_data.fill_(loaded_weight.reshape(()).item())
-            return
-        if loaded_weight.dim() == 1 and param_data.dim() == 2:
-            param_data.copy_(loaded_weight.unsqueeze(-1).expand_as(param_data))
-            return
-        param_data.copy_(loaded_weight.reshape(param_data.shape))
-
     def _load_model_weight_or_group_weight_scale(
         self,
         shard_dim: int,
@@ -790,11 +824,18 @@ class FusedMoE(torch.nn.Module):
             start = 0
 
         if self.use_padded_loading:
+            loaded_weight = _narrow_checkpoint_to_rank(
+                loaded_weight,
+                shard_dim,
+                self.moe_tp_size,
+                tp_rank,
+                self.use_presharded_weights,
+            )
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
                 start,
-                shard_size * tp_rank,
+                0,  # weight_start: loaded_weight is already this rank's slice
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,
@@ -869,11 +910,20 @@ class FusedMoE(torch.nn.Module):
             shard_size = expert_data.shape[shard_dim]
 
         if self.use_padded_loading:
+            if not is_bias:
+                # w2's bias is replicated across ranks, its weight is not.
+                loaded_weight = _narrow_checkpoint_to_rank(
+                    loaded_weight,
+                    shard_dim,
+                    self.moe_tp_size,
+                    tp_rank,
+                    self.use_presharded_weights,
+                )
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
                 0,  # param_data_start
-                shard_size * tp_rank,
+                0,  # weight_start: loaded_weight is already this rank's slice
                 shard_dim,
                 shard_size,
                 not self.use_presharded_weights,
@@ -1492,7 +1542,7 @@ class FusedMoE(torch.nn.Module):
         if weight_name.endswith("_weight_scale_2") or weight_name.endswith(
             "_input_scale"
         ):
-            self._load_fused_per_tensor_scale(param, loaded_weight)
+            _load_fused_per_tensor_scale(param, loaded_weight)
             return
 
         # Fetch the dim to shard the parameter/loaded weight

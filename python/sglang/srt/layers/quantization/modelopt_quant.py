@@ -2382,6 +2382,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         hidden_size: int,
         intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
+        with_bias: bool = False,
         **extra_weight_attrs,
     ):
         # TODO(ch-wan): check if this is needed
@@ -2394,11 +2395,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_loader = self.prepare_weight_loader(
             layer, extra_weight_attrs.get("weight_loader")
         )
+        # A padded hidden size leaves a tail the loader never writes, and an
+        # uninitialized float8_e4m3fn byte can decode to NaN.
+        alloc = (
+            torch.zeros if hidden_size != layer.hidden_size_unpadded else torch.empty
+        )
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
         w13_weight = ModelWeightParameter(
-            data=torch.empty(
+            data=alloc(
                 layer.num_local_experts,
                 num_shards * intermediate_size_per_partition,
                 # 2 fp4 items are packed in the input dimension
@@ -2413,7 +2419,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # GEMM 2
         w2_weight = ModelWeightParameter(
-            data=torch.empty(
+            data=alloc(
                 layer.num_local_experts,
                 hidden_size,
                 # 2 fp4 items are packed in the input dimension
@@ -2427,7 +2433,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight", w2_weight)
 
         w13_weight_scale = ModelWeightParameter(
-            data=torch.empty(
+            data=alloc(
                 layer.num_local_experts,
                 num_shards * intermediate_size_per_partition,
                 hidden_size // self.quant_config.group_size,
@@ -2453,7 +2459,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
         w2_weight_scale = ModelWeightParameter(
-            data=torch.empty(
+            data=alloc(
                 layer.num_local_experts,
                 hidden_size,
                 intermediate_size_per_partition // self.quant_config.group_size,
@@ -2475,25 +2481,25 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
             )
 
-        if getattr(layer, "with_bias", False):
-            # GPT-OSS style experts: fp32 per-expert, per-output-channel bias.
+        if with_bias:
+            # fp32 [num_local_experts, out_features], one value per output channel.
             w13_weight_bias = ModelWeightParameter(
-                data=torch.empty(
+                data=torch.zeros(
                     layer.num_local_experts,
                     num_shards * intermediate_size_per_partition,
                     dtype=torch.float32,
                 ),
-                input_dim=0,
+                input_dim=1,
                 output_dim=1,
                 weight_loader=weight_loader,
             )
             layer.register_parameter("w13_weight_bias", w13_weight_bias)
 
             w2_weight_bias = ModelWeightParameter(
-                data=torch.empty(
+                data=torch.zeros(
                     layer.num_local_experts, hidden_size, dtype=torch.float32
                 ),
-                input_dim=0,
+                input_dim=1,
                 output_dim=1,
                 weight_loader=weight_loader,
             )
@@ -2565,6 +2571,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
+        if (
+            getattr(layer, "w13_weight_bias", None) is not None
+            and not self.enable_flashinfer_trtllm_moe
+        ):
+            # Only the trtllm-gen kernels take gemm1_bias/gemm2_bias; every other
+            # NVFP4 payload would drop the bias and serve wrong outputs.
+            raise NotImplementedError(
+                "NVFP4 experts with biases require --moe-runner-backend "
+                f"flashinfer_trtllm, got {get_moe_runner_backend()}."
+            )
+
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
             layer, "_w13_deinterleaved", False
         ):
@@ -3145,11 +3162,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             assert not moe_runner_config.apply_router_weight_on_input, (
                 "apply_router_weight_on_input is not supported for Flashinfer"
-            )
-            assert getattr(layer, "w13_weight_bias", None) is None, (
-                "NVFP4 experts with biases are only supported by the "
-                "flashinfer_trtllm MoE runner; the CUTLASS payload has no "
-                "bias, which would silently drop it."
             )
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="fp4",

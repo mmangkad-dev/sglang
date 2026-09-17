@@ -49,7 +49,10 @@ from sglang.srt.layers.moe import (
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.fused_moe_triton.layer import (
+    FusedMoE,
+    match_fused_expert_param,
+)
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
@@ -874,14 +877,7 @@ class GptOssForCausalLM(nn.Module):
         return self.model.end_layer
 
     def _uses_fused_nvfp4_experts(self) -> bool:
-        """True for ModelOpt NVFP4 checkpoints with fused per-layer experts.
-
-        Those checkpoints keep the NVFP4 block scales and per-tensor scales in
-        the same fused layout as the weights, and their w13 rows stay
-        interleaved as (gate_i, up_i) pairs like the BF16/MXFP4 releases.
-        """
-        quant_config = getattr(self, "quant_config", None)
-        return quant_config is not None and quant_config.get_name() in (
+        return self.quant_config is not None and self.quant_config.get_name() in (
             "modelopt_fp4",
             "nvfp4_online",
         )
@@ -1310,16 +1306,10 @@ class GptOssForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, shard_id = mapping
-                    # Exact suffix match: checkpoint names share prefixes
-                    # ("gate_up_proj" vs "gate_up_proj_weight_scale"), so a
-                    # substring test would bind the wrong parameter.
-                    if not name.endswith(weight_name):
-                        continue
-                    mapped_name = name[: -len(weight_name)] + param_name
-                    if mapped_name not in params_dict:
-                        continue
+                mapped_name, shard_id = match_fused_expert_param(
+                    name, expert_params_mapping, params_dict
+                )
+                if mapped_name is not None:
                     name = mapped_name
                     param = params_dict[name]
                     weight_loader = param.weight_loader
@@ -1337,7 +1327,6 @@ class GptOssForCausalLM(nn.Module):
                         name,
                         shard_id=shard_id,
                     )
-                    break
                 else:
                     if name.endswith(".bias") and name not in params_dict:
                         continue

@@ -563,11 +563,12 @@ def _rescale_fp4_moe_biases_to_gemm_domain(
     """Convert fp32 checkpoint biases into the GEMM accumulator domain.
 
     The trtllm-gen kernels add the bias to the raw GEMM output and apply the
-    dequant scalars afterwards (g1_alphas / g1_scale_c for GEMM1, g2_alphas for
-    GEMM2), which is also why the SwiGLU clamp limit is divided by g1_alphas.
-    A bias stored in real units therefore has to be divided by the same scale.
-    W13 is in ``[linear; gate]`` halves here, and the two halves carry
-    different GEMM1 scales.
+    dequant scalars afterwards, which is also why the SwiGLU clamp limit is
+    divided by g1_alphas. W13 is in [linear; gate] halves here: the linear half
+    is scaled by g1_alphas_up (carried in g1_scale_c) and the gate half by
+    g1_alphas, per _compute_g1_scale_c. gemm1_beta, the other constant added to
+    the linear half, uses g1_alphas; the two agree whenever gate and up share a
+    weight_scale_2, which is every NVFP4 checkpoint seen so far.
     """
     g1_alphas = cast(torch.Tensor, layer.g1_alphas).to(torch.float32)
     g1_alphas_up = cast(
@@ -1394,20 +1395,27 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
 
     # Quantize hidden states to FP4
     hidden_states_scale = dispatch_output.hidden_states_scale
-    origin_hidden_size = hidden_states.shape[-1]
-    if (
-        quant_info.padded_hidden_size is not None
-        and hidden_states_scale is None
-        and quant_info.padded_hidden_size != origin_hidden_size
-    ):
-        # GEMM1's K must equal the activation width, so match the padding the
-        # weights carry. The zeros contribute nothing to the GEMM.
-        hidden_states = torch.nn.functional.pad(
-            hidden_states,
-            (0, quant_info.padded_hidden_size - origin_hidden_size),
-            mode="constant",
-            value=0.0,
+    if quant_info.padded_hidden_size is not None:
+        # NVFP4-packed activations carry two values per byte.
+        activation_hidden_size = hidden_states.shape[-1] * (
+            2 if hidden_states_scale is not None else 1
         )
+        if quant_info.padded_hidden_size != activation_hidden_size:
+            if hidden_states_scale is not None:
+                raise NotImplementedError(
+                    "Padding hidden_size for trtllm-gen is not supported when the "
+                    "dispatcher delivers pre-quantized NVFP4 activations: GEMM1's "
+                    f"K is {quant_info.padded_hidden_size} but the activation is "
+                    f"{activation_hidden_size} wide."
+                )
+            # GEMM1's K must equal the activation width, so match the padding the
+            # weights carry. The zeros contribute nothing to the GEMM.
+            hidden_states = torch.nn.functional.pad(
+                hidden_states,
+                (0, quant_info.padded_hidden_size - activation_hidden_size),
+                mode="constant",
+                value=0.0,
+            )
     per_token_scale = None
     if hidden_states_scale is not None:
         # NVFP4 dispatch (flashinfer a2a): inputs are already FP4-quantized by
@@ -1593,10 +1601,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             )
         else:
             result = result[0]
-
-    if isinstance(result, torch.Tensor) and result.shape[-1] != origin_hidden_size:
-        # Drop the alignment padding the weights carry.
-        result = result[..., :origin_hidden_size]
 
     return StandardCombineInput(hidden_states=result)
 
