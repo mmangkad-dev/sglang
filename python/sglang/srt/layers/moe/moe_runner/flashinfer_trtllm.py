@@ -554,6 +554,56 @@ def _align_fp4_moe_weights(
     return padded_w13, padded_w13_scale, padded_w2, padded_w2_scale, padded_intermediate
 
 
+def _rescale_fp4_moe_biases_to_gemm_domain(
+    w13_bias: torch.Tensor,
+    w2_bias: torch.Tensor,
+    layer: Module,
+    is_gated: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert fp32 checkpoint biases into the GEMM accumulator domain.
+
+    The trtllm-gen kernels add the bias to the raw GEMM output and apply the
+    dequant scalars afterwards (g1_alphas / g1_scale_c for GEMM1, g2_alphas for
+    GEMM2), which is also why the SwiGLU clamp limit is divided by g1_alphas.
+    A bias stored in real units therefore has to be divided by the same scale.
+    W13 is in ``[linear; gate]`` halves here, and the two halves carry
+    different GEMM1 scales.
+    """
+    g1_alphas = cast(torch.Tensor, layer.g1_alphas).to(torch.float32)
+    g1_alphas_up = cast(
+        torch.Tensor, getattr(layer, "g1_alphas_up", layer.g1_alphas)
+    ).to(torch.float32)
+    g2_alphas = cast(torch.Tensor, layer.g2_alphas).to(torch.float32)
+
+    w13_bias = w13_bias.clone()
+    if is_gated:
+        half = w13_bias.shape[-1] // 2
+        w13_bias[:, :half] /= g1_alphas_up.reshape(-1, 1)
+        w13_bias[:, half:] /= g1_alphas.reshape(-1, 1)
+    else:
+        w13_bias /= g1_alphas.reshape(-1, 1)
+    return w13_bias, w2_bias / g2_alphas.reshape(-1, 1)
+
+
+def _align_fp4_moe_biases(
+    w13_bias: torch.Tensor,
+    w2_bias: torch.Tensor,
+    is_gated: bool,
+    padded_intermediate: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad the GEMM1 bias to match the padded intermediate size.
+
+    GEMM2's bias indexes hidden_size, which is never padded here.
+    """
+    up_mult = 2 if is_gated else 1
+    padded_rows = up_mult * padded_intermediate
+    if w13_bias.shape[-1] == padded_rows:
+        return w13_bias, w2_bias
+    padded = w13_bias.new_zeros((w13_bias.shape[0], padded_rows))
+    padded[:, : w13_bias.shape[-1]] = w13_bias
+    return padded, w2_bias
+
+
 def _compute_g1_scale_c(
     w2_input_scale_quant: torch.Tensor,
     g1_alphas: torch.Tensor,
@@ -613,11 +663,29 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
         )
     )
 
+    w13_weight_bias = getattr(layer, "w13_weight_bias", None)
+    w2_weight_bias = getattr(layer, "w2_weight_bias", None)
+    if w13_weight_bias is not None:
+        w13_weight_bias, w2_weight_bias = _rescale_fp4_moe_biases_to_gemm_domain(
+            cast(torch.Tensor, w13_weight_bias).data.to(torch.float32),
+            cast(torch.Tensor, w2_weight_bias).data.to(torch.float32),
+            layer,
+            is_gated,
+        )
+        w13_weight_bias, w2_weight_bias = _align_fp4_moe_biases(
+            w13_weight_bias,
+            w2_weight_bias,
+            is_gated,
+            intermediate_size,
+        )
+
     (
         gemm1_weights_fp4_shuffled,
         gemm1_scales_fp4_shuffled,
         gemm2_weights_fp4_shuffled,
         gemm2_scales_fp4_shuffled,
+        gemm1_bias_shuffled,
+        gemm2_bias_shuffled,
     ) = prepare_static_weights_for_trtllm_fp4_moe(
         w13_weight,
         w2_weight,
@@ -627,7 +695,12 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
         intermediate_size,  # padded intermediate_size
         w13_weight.size(0),  # num_experts
         is_gated=is_gated,
+        gemm1_bias=w13_weight_bias,
+        gemm2_bias=w2_weight_bias,
     )
+    if gemm1_bias_shuffled is not None:
+        copy_or_rebind_param(layer, "w13_weight_bias", gemm1_bias_shuffled.contiguous())
+        copy_or_rebind_param(layer, "w2_weight_bias", gemm2_bias_shuffled.contiguous())
 
     # Set flashinfer parameters in-place
     copy_or_rebind_param(layer, "w13_weight", gemm1_weights_fp4_shuffled.contiguous())
@@ -1250,6 +1323,14 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
     gemm1_beta: Optional[torch.Tensor] = None
     gemm1_clamp_limit: Optional[torch.Tensor] = None
 
+    # fp32 per expert per output channel, already shuffled to match the
+    # permuted weight rows. GPT-OSS style experts set these.
+    w13_weight_bias: Optional[torch.Tensor] = None
+    w2_weight_bias: Optional[torch.Tensor] = None
+
+    # Hidden size the weights were padded to, when it exceeds the model's own.
+    padded_hidden_size: Optional[int] = None
+
 
 def quantize_hidden_states_fp4(
     hidden_states: torch.Tensor,
@@ -1313,6 +1394,20 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
 
     # Quantize hidden states to FP4
     hidden_states_scale = dispatch_output.hidden_states_scale
+    origin_hidden_size = hidden_states.shape[-1]
+    if (
+        quant_info.padded_hidden_size is not None
+        and hidden_states_scale is None
+        and quant_info.padded_hidden_size != origin_hidden_size
+    ):
+        # GEMM1's K must equal the activation width, so match the padding the
+        # weights carry. The zeros contribute nothing to the GEMM.
+        hidden_states = torch.nn.functional.pad(
+            hidden_states,
+            (0, quant_info.padded_hidden_size - origin_hidden_size),
+            mode="constant",
+            value=0.0,
+        )
     per_token_scale = None
     if hidden_states_scale is not None:
         # NVFP4 dispatch (flashinfer a2a): inputs are already FP4-quantized by
@@ -1414,13 +1509,13 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             hidden_states_scale=hs_scale,
             gemm1_weights=quant_info.w13_weight,
             gemm1_weights_scale=quant_info.w13_weight_scale.view(torch.float8_e4m3fn),
-            gemm1_bias=None,
+            gemm1_bias=quant_info.w13_weight_bias,
             gemm1_alpha=quant_info.gemm1_alpha,
             gemm1_beta=quant_info.gemm1_beta,
             gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
-            gemm2_bias=None,
+            gemm2_bias=quant_info.w2_weight_bias,
             output1_scale_scalar=quant_info.g1_scale_c,
             output1_scale_gate_scalar=quant_info.g1_alphas,
             output2_scale_scalar=quant_info.g2_alphas,
@@ -1455,13 +1550,13 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             hidden_states_scale=hs_scale,
             gemm1_weights=quant_info.w13_weight,
             gemm1_weights_scale=quant_info.w13_weight_scale.view(torch.float8_e4m3fn),
-            gemm1_bias=None,
+            gemm1_bias=quant_info.w13_weight_bias,
             gemm1_alpha=quant_info.gemm1_alpha,
             gemm1_beta=quant_info.gemm1_beta,
             gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
-            gemm2_bias=None,
+            gemm2_bias=quant_info.w2_weight_bias,
             output1_scale_scalar=quant_info.g1_scale_c,
             output1_scale_gate_scalar=quant_info.g1_alphas,
             output2_scale_scalar=quant_info.g2_alphas,
@@ -1498,6 +1593,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             )
         else:
             result = result[0]
+
+    if isinstance(result, torch.Tensor) and result.shape[-1] != origin_hidden_size:
+        # Drop the alignment padding the weights carry.
+        result = result[..., :origin_hidden_size]
 
     return StandardCombineInput(hidden_states=result)
 

@@ -51,7 +51,10 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    filter_moe_weight_param_global_expert,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -244,10 +247,22 @@ class GptOssSparseMoeBlock(nn.Module):
             activation=self.activation,
             gemm1_alpha=self.gemm1_alpha,
             gemm1_clamp_limit=self.gemm1_clamp_limit,
+            # GPT-OSS routes with TopK followed by a softmax over the selected
+            # experts; kernels that do their own routing need to be told.
+            routing_method_type=RoutingMethodType.Renormalize,
             with_bias=True,
             prefix=add_prefix("experts", prefix),
             **extra_kwargs,
         )
+
+        if quant_config is not None and quant_config.get_name() in (
+            "modelopt_fp4",
+            "nvfp4_online",
+        ):
+            # NVFP4 checkpoints keep the checkpoint's (gate_i, up_i) row pairs;
+            # the ModelOpt MoE method de-interleaves them into the halves layout
+            # its kernels expect.
+            self.experts.inference_moe_w13_interleaved = True
 
         self.router = TinyGemmLinear(
             config.hidden_size,
@@ -858,6 +873,19 @@ class GptOssForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
+    def _uses_fused_nvfp4_experts(self) -> bool:
+        """True for ModelOpt NVFP4 checkpoints with fused per-layer experts.
+
+        Those checkpoints keep the NVFP4 block scales and per-tensor scales in
+        the same fused layout as the weights, and their w13 rows stay
+        interleaved as (gate_i, up_i) pairs like the BF16/MXFP4 releases.
+        """
+        quant_config = getattr(self, "quant_config", None)
+        return quant_config is not None and quant_config.get_name() in (
+            "modelopt_fp4",
+            "nvfp4_online",
+        )
+
     def _get_default_weight_mapping(self):
         """Generate default weight name mapping for GptOss safetensors."""
         weight_mapping = {}
@@ -1229,7 +1257,14 @@ class GptOssForCausalLM(nn.Module):
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
         ]
-        expert_params_mapping = FusedMoE.make_expert_params_mapping_fused(
+        # NVFP4 (ModelOpt) checkpoints additionally carry the block scales and
+        # the per-tensor weight/input scales as fused per-layer tensors.
+        make_mapping = (
+            FusedMoE.make_expert_params_mapping_fused_nvfp4
+            if self._uses_fused_nvfp4_experts()
+            else FusedMoE.make_expert_params_mapping_fused
+        )
+        expert_params_mapping = make_mapping(
             ckpt_gate_up_proj_name="gate_up_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_gate_up_proj_bias_name="gate_up_proj_bias",
@@ -1277,14 +1312,21 @@ class GptOssForCausalLM(nn.Module):
             else:
                 for mapping in expert_params_mapping:
                     param_name, weight_name, shard_id = mapping
-                    if weight_name not in name:
+                    # Exact suffix match: checkpoint names share prefixes
+                    # ("gate_up_proj" vs "gate_up_proj_weight_scale"), so a
+                    # substring test would bind the wrong parameter.
+                    if not name.endswith(weight_name):
                         continue
-                    name = name.replace(weight_name, param_name)
-                    if name not in params_dict:
+                    mapped_name = name[: -len(weight_name)] + param_name
+                    if mapped_name not in params_dict:
                         continue
+                    name = mapped_name
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    if "bias" not in name:
+                    # Fused expert matrices and their block scales are stored
+                    # [E, in, out]; the runtime layout is [E, out, in]. Biases
+                    # and per-tensor scales carry no such dim to swap.
+                    if "bias" not in name and loaded_weight.dim() == 3:
                         loaded_weight = loaded_weight.transpose(-2, -1)
                     if "w2_weight_bias" in name and get_parallel().moe_tp_rank != 0:
                         loaded_weight = loaded_weight.zero_()

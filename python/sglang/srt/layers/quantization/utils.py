@@ -635,6 +635,8 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     intermediate_size,
     num_experts,
     is_gated: bool = True,
+    gemm1_bias=None,
+    gemm2_bias=None,
 ):
     from flashinfer import nvfp4_block_scale_interleave
     from flashinfer.fused_moe.core import (
@@ -680,6 +682,9 @@ def prepare_static_weights_for_trtllm_fp4_moe(
         output = scales.new_empty((num_experts, per_expert_numel), dtype=torch.uint8)
         scratch = torch.empty(per_expert_shape, dtype=torch.uint8, device=scales.device)
         return output, scratch
+
+    gemm1_bias_shuffled = None if gemm1_bias is None else torch.empty_like(gemm1_bias)
+    gemm2_bias_shuffled = None if gemm2_bias is None else torch.empty_like(gemm2_bias)
 
     gemm1_scales_fp4_shuffled, g1s_scratch = _alloc_scale_buffers(
         gemm1_scales_linear_fp4
@@ -738,6 +743,32 @@ def prepare_static_weights_for_trtllm_fp4_moe(
         )
         gemm2_scales_fp4_shuffled[i] = nvfp4_block_scale_interleave(g2s_scratch)
 
+        # A bias entry belongs to an output row, so it must follow exactly the
+        # row permutation applied to that GEMM's weights.
+        if gemm1_bias is not None:
+            bias_permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+                _cache_permute_indices,
+                gemm1_bias[i].reshape(-1, 1),
+                epilogue_tile_m,
+                is_gated_act_gemm=is_gated,
+            )
+            gemm1_bias_shuffled[i] = (
+                gemm1_bias[i]
+                .reshape(-1, 1)[bias_permute_indices.to(gemm1_bias.device)]
+                .reshape(-1)
+            )
+        if gemm2_bias is not None:
+            bias_permute_indices = get_w2_permute_indices_with_cache(
+                _cache_permute_indices,
+                gemm2_bias[i].reshape(-1, 1),
+                epilogue_tile_m,
+            )
+            gemm2_bias_shuffled[i] = (
+                gemm2_bias[i]
+                .reshape(-1, 1)[bias_permute_indices.to(gemm2_bias.device)]
+                .reshape(-1)
+            )
+
     del g1s_scratch, g2s_scratch
 
     # Weight outputs stay as uint8 (FP4 packed) — the TRTLLM kernel expects this.
@@ -753,4 +784,6 @@ def prepare_static_weights_for_trtllm_fp4_moe(
         gemm1_scales_fp4_shuffled,
         gemm2_weights_fp4_shuffled,
         gemm2_scales_fp4_shuffled,
+        gemm1_bias_shuffled,
+        gemm2_bias_shuffled,
     )

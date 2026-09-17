@@ -2475,6 +2475,30 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
             )
 
+        if getattr(layer, "with_bias", False):
+            # GPT-OSS style experts: fp32 per-expert, per-output-channel bias.
+            w13_weight_bias = ModelWeightParameter(
+                data=torch.empty(
+                    layer.num_local_experts,
+                    num_shards * intermediate_size_per_partition,
+                    dtype=torch.float32,
+                ),
+                input_dim=0,
+                output_dim=1,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("w13_weight_bias", w13_weight_bias)
+
+            w2_weight_bias = ModelWeightParameter(
+                data=torch.empty(
+                    layer.num_local_experts, hidden_size, dtype=torch.float32
+                ),
+                input_dim=0,
+                output_dim=1,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("w2_weight_bias", w2_weight_bias)
+
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         extra_weight_attrs.update(
@@ -2551,6 +2575,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             layer.w13_weight_scale.data = deinterleave_w13(
                 layer.w13_weight_scale.data, up_first=up_first
             )
+            w13_bias = getattr(layer, "w13_weight_bias", None)
+            if w13_bias is not None:
+                # The bias indexes the same rows as w13, so it follows the same
+                # de-interleave; unsqueeze to reuse the row-dim helper.
+                layer.w13_weight_bias.data = deinterleave_w13(
+                    w13_bias.data.unsqueeze(-1), up_first=up_first
+                ).squeeze(-1)
             layer._w13_deinterleaved = True
 
         # GEMM1 scale processing is deferred until the input scale is known;
@@ -3024,6 +3055,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             gemm1_clamp = getattr(layer, "gemm1_clamp_limit", None)
             gemm1_alpha = getattr(layer, "gemm1_alpha", None)
             gemm1_beta = getattr(layer, "gemm1_beta", None)
+            w13_bias = getattr(layer, "w13_weight_bias", None)
+            w2_bias = getattr(layer, "w2_weight_bias", None)
             quant_info = FlashInferTrtllmFp4MoeQuantInfo(
                 w13_weight=layer.w13_weight.data,
                 w2_weight=layer.w2_weight.data,
@@ -3042,6 +3075,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 gemm1_alpha=gemm1_alpha.data if gemm1_alpha is not None else None,
                 gemm1_beta=gemm1_beta.data if gemm1_beta is not None else None,
                 gemm1_clamp_limit=gemm1_clamp.data if gemm1_clamp is not None else None,
+                w13_weight_bias=w13_bias.data if w13_bias is not None else None,
+                w2_weight_bias=w2_bias.data if w2_bias is not None else None,
+                padded_hidden_size=layer.hidden_size,
             )
 
             return self.runner.run(dispatch_output, quant_info)
@@ -3109,6 +3145,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             assert not moe_runner_config.apply_router_weight_on_input, (
                 "apply_router_weight_on_input is not supported for Flashinfer"
+            )
+            assert getattr(layer, "w13_weight_bias", None) is None, (
+                "NVFP4 experts with biases are only supported by the "
+                "flashinfer_trtllm MoE runner; the CUTLASS payload has no "
+                "bias, which would silently drop it."
             )
             quant_info = FlashInferCutlassMoeQuantInfo(
                 quant_type="fp4",

@@ -285,6 +285,23 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
         )
 
 
+def _copy_into_padded_expert_data(
+    expert_data: torch.Tensor, loaded_weight: torch.Tensor
+) -> None:
+    """Copy a checkpoint slice into a possibly padded expert buffer.
+
+    Buffers can be padded past the checkpoint on any dimension (intermediate
+    size for kernel alignment, hidden size for trtllm-gen). Copy into the
+    leading slice of each padded dim and leave the tail as allocated. Tensors
+    of different rank (bias, scalar scales) keep the plain broadcast copy.
+    """
+    if loaded_weight.dim() == expert_data.dim():
+        for dim in range(expert_data.dim()):
+            if loaded_weight.shape[dim] < expert_data.shape[dim]:
+                expert_data = expert_data.narrow(dim, 0, loaded_weight.shape[dim])
+    expert_data.copy_(loaded_weight)
+
+
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
 
@@ -431,6 +448,14 @@ class FusedMoE(torch.nn.Module):
             and self.quant_config.get_name() == "mxfp4"
             and self.use_flashinfer_mxfp4_moe
         ):
+            hidden_size = round_up(hidden_size, 256)
+        elif (
+            self.quant_config is not None
+            and self.quant_config.get_name() in ("modelopt_fp4", "nvfp4_online")
+            and self.use_flashinfer_trtllm_moe
+        ):
+            # trtllm-gen has no batched-GEMM config for an unaligned hidden
+            # size, and its scale shuffle needs GEMM2's rows % 128 == 0.
             hidden_size = round_up(hidden_size, 256)
         self.hidden_size = hidden_size
 
@@ -650,6 +675,27 @@ class FusedMoE(torch.nn.Module):
         elif shard_id == "w2":
             param_data[expert_id] = loaded_weight
 
+    def _load_fused_per_tensor_scale(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ):
+        """Broadcast a checkpoint-wide per-tensor scale over a per-expert param.
+
+        The parameter is [num_experts] or [num_experts, num_shards]; the loaded
+        value is a scalar, or already per-expert, in which case it is broadcast
+        over the shard dim only.
+        """
+        param_data = param.data
+        loaded_weight = loaded_weight.to(param_data.device, param_data.dtype)
+        if loaded_weight.numel() == 1:
+            param_data.fill_(loaded_weight.reshape(()).item())
+            return
+        if loaded_weight.dim() == 1 and param_data.dim() == 2:
+            param_data.copy_(loaded_weight.unsqueeze(-1).expand_as(param_data))
+            return
+        param_data.copy_(loaded_weight.reshape(param_data.shape))
+
     def _load_model_weight_or_group_weight_scale(
         self,
         shard_dim: int,
@@ -715,8 +761,10 @@ class FusedMoE(torch.nn.Module):
         assert shard_id in {"w1", "w3", "w13"}
 
         if is_bias:
-            # if this weight is a bias, the last dimension must be the sharded dimension
-            shard_dim = -1
+            # A bias has one row dim per expert, so its sharded dimension is the
+            # last one. Normalize it: the padded-loading helper indexes dims
+            # positionally and cannot take -1.
+            shard_dim = expert_data.dim() - 1
 
         if shard_id in {"w1", "w3"} and self.moe_runner_config.is_gated:
             # non-fused version
@@ -742,8 +790,6 @@ class FusedMoE(torch.nn.Module):
             start = 0
 
         if self.use_padded_loading:
-            if _is_cpu and is_bias:
-                shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -770,20 +816,7 @@ class FusedMoE(torch.nn.Module):
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
 
         loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
-        # loaded_weight may be smaller than expert_data along shard_dim when
-        # the buffer is padded.  Copy into the leading slice and leave the
-        # trailing padding as zeros.  Rank-mismatched tensors (bias / scalar
-        # scales) don't carry shard_dim; they keep the plain broadcast copy.
-        if (
-            loaded_weight.dim() == expert_data.dim()
-            and shard_dim < expert_data.dim()
-            and loaded_weight.shape[shard_dim] < expert_data.shape[shard_dim]
-        ):
-            expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim]).copy_(
-                loaded_weight
-            )
-        else:
-            expert_data.copy_(loaded_weight)
+        _copy_into_padded_expert_data(expert_data, loaded_weight)
 
     def _load_w2(
         self,
@@ -811,10 +844,12 @@ class FusedMoE(torch.nn.Module):
         if (
             self.quant_config is not None
             and "modelopt" in self.quant_config.get_name()
-            and (expert_data.dim() != 2 or loaded_weight.dim() != 2)
+            and expert_data.dim() != loaded_weight.dim()
         ):
             raise ValueError(
-                f"Expected 2D tensors, got expert_data shape {expert_data.shape} and loaded_weight shape {loaded_weight.shape}"
+                "Rank mismatch between the w2 parameter and the checkpoint tensor: "
+                f"expert_data shape {expert_data.shape}, "
+                f"loaded_weight shape {loaded_weight.shape}"
             )
 
         if shard_id != "w2":
@@ -826,6 +861,7 @@ class FusedMoE(torch.nn.Module):
         if is_bias:
             # this expert_data is a bias, not weight,
             # for w2_weight_bias in TP, it does not need to be sharded
+            shard_dim = expert_data.dim() - 1
             shard_size = expert_data.shape[-1]
         else:
             # this parameter is a weight matrix
@@ -833,8 +869,6 @@ class FusedMoE(torch.nn.Module):
             shard_size = expert_data.shape[shard_dim]
 
         if self.use_padded_loading:
-            if _is_cpu and is_bias:
-                shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -857,19 +891,7 @@ class FusedMoE(torch.nn.Module):
 
         # w2, down_proj: Load into only logical weight of w2.
         loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
-        # loaded_weight may be smaller than expert_data along shard_dim when
-        # the buffer is padded.  Copy into the leading slice only.  See the
-        # rank-mismatch note in _load_w13.
-        if (
-            loaded_weight.dim() == expert_data.dim()
-            and shard_dim < expert_data.dim()
-            and loaded_weight.shape[shard_dim] < expert_data.shape[shard_dim]
-        ):
-            expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim]).copy_(
-                loaded_weight
-            )
-        else:
-            expert_data.copy_(loaded_weight)
+        _copy_into_padded_expert_data(expert_data, loaded_weight)
 
     def _maybe_load_fp8_shared_expert_as_fp4(
         self,
@@ -1463,6 +1485,16 @@ class FusedMoE(torch.nn.Module):
         if shard_id not in ("w13", "w2"):
             raise ValueError(f"shard_id must be ['w13','w2'] but got {shard_id}.")
 
+        # Fused NVFP4 checkpoints store the per-tensor weight/input scales as a
+        # single scalar (or one value per expert) shared by every expert, while
+        # the parameters are per-expert. Broadcast instead of going through the
+        # matrix-sharding path below, which assumes a matching layout.
+        if weight_name.endswith("_weight_scale_2") or weight_name.endswith(
+            "_input_scale"
+        ):
+            self._load_fused_per_tensor_scale(param, loaded_weight)
+            return
+
         # Fetch the dim to shard the parameter/loaded weight
         # based on the shard id. This will be whatever
         # dimension intermediate_size is used.
@@ -1662,6 +1694,63 @@ class FusedMoE(torch.nn.Module):
             ),
             ("experts.w2_weight", f"experts.{ckpt_down_proj_name}", "w2"),
             ("experts.w2_weight_bias", f"experts.{ckpt_down_proj_bias_name}", "w2"),
+        ]
+
+    @classmethod
+    def make_expert_params_mapping_fused_nvfp4(
+        cls,
+        ckpt_gate_up_proj_name: str,
+        ckpt_down_proj_name: str,
+        ckpt_gate_up_proj_bias_name: str,
+        ckpt_down_proj_bias_name: str,
+    ):
+        """Mapping for ModelOpt NVFP4 checkpoints with fused expert tensors.
+
+        Such checkpoints (e.g. NVFP4 GPT-OSS) keep every expert of a layer in a
+        single tensor: packed weights, biases, NVFP4 block scales and the
+        per-tensor weight/input scales. Ordered most-specific name first because
+        ``gate_up_proj`` and ``gate_up_proj_weight_scale`` are prefixes of the
+        longer names below them.
+        """
+        return [
+            (
+                "experts.w13_weight_scale_2",
+                f"experts.{ckpt_gate_up_proj_name}_weight_scale_2",
+                "w13",
+            ),
+            (
+                "experts.w2_weight_scale_2",
+                f"experts.{ckpt_down_proj_name}_weight_scale_2",
+                "w2",
+            ),
+            (
+                "experts.w13_weight_scale",
+                f"experts.{ckpt_gate_up_proj_name}_weight_scale",
+                "w13",
+            ),
+            (
+                "experts.w2_weight_scale",
+                f"experts.{ckpt_down_proj_name}_weight_scale",
+                "w2",
+            ),
+            (
+                "experts.w13_input_scale",
+                f"experts.{ckpt_gate_up_proj_name}_input_scale",
+                "w13",
+            ),
+            (
+                "experts.w2_input_scale",
+                f"experts.{ckpt_down_proj_name}_input_scale",
+                "w2",
+            ),
+            (
+                "experts.w13_weight_bias",
+                f"experts.{ckpt_gate_up_proj_bias_name}",
+                "w13",
+            ),
+            ("experts.w2_weight_bias", f"experts.{ckpt_down_proj_bias_name}", "w2"),
+            ("experts.w13_weight", f"experts.{ckpt_gate_up_proj_name}", "w13"),
+            ("experts.w2_weight", f"experts.{ckpt_down_proj_name}", "w2"),
         ]
 
     @classmethod

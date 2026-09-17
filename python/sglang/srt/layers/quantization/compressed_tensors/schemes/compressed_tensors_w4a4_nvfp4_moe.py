@@ -245,6 +245,8 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 gemm1_scales_fp4_shuffled,
                 gemm2_weights_fp4_shuffled,
                 gemm2_scales_fp4_shuffled,
+                _,
+                _,
             ) = prepare_static_weights_for_trtllm_fp4_moe(
                 layer.w13_weight,
                 layer.w2_weight,
