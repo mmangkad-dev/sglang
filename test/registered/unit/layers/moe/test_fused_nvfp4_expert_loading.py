@@ -8,8 +8,12 @@ broadcast, and padded copies.
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
+
+from sglang.srt.utils import round_up
 
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
@@ -176,7 +180,7 @@ class TestLoadW13ShardSlicing(CustomTestCase):
 
 
 class TestQuantBlockAlignedPartition(CustomTestCase):
-    """A rank boundary that splits a quantization block is unloadable.
+    """A rank boundary that splits a quantization block must be rejected.
 
     Packed NVFP4 weights hold 2 channels per byte and block scales hold
     group_size, so if a rank's channel count is not a multiple of group_size the
@@ -185,23 +189,109 @@ class TestQuantBlockAlignedPartition(CustomTestCase):
     channels, 180 packed bytes (360 channels) but 22 scales (352 channels).
     """
 
-    GROUP_SIZE = 16
+    def _create_weights(self, unpadded_per_rank, tp_size):
+        """Run the real create_weights far enough to hit its validation."""
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptNvFp4FusedMoEMethod,
+        )
 
-    def _slices_agree(self, intermediate, tp_size):
-        channels = intermediate // tp_size
-        packed = (intermediate // 2) // tp_size
-        scales = (intermediate // self.GROUP_SIZE) // tp_size
-        return packed * 2 == scales * self.GROUP_SIZE == channels
+        # __init__ requires Blackwell; the validation under test does not.
+        method = ModelOptNvFp4FusedMoEMethod.__new__(ModelOptNvFp4FusedMoEMethod)
+        method.quant_config = SimpleNamespace(group_size=16)
+        layer = SimpleNamespace(
+            intermediate_size_per_partition_unpadded=unpadded_per_rank,
+            moe_tp_size=tp_size,
+            num_local_experts=128,
+            hidden_size_unpadded=2880,
+            moe_runner_config=SimpleNamespace(is_gated=True),
+        )
+        try:
+            method.create_weights(
+                layer,
+                num_experts=128,
+                hidden_size=2880,
+                intermediate_size_per_partition=round_up(unpadded_per_rank, 128),
+                params_dtype=torch.bfloat16,
+            )
+        except Exception as exc:  # the stub layer stops it after the validation
+            return exc
+        return None
 
-    def test_block_aligned_partitions_describe_the_same_channels(self):
+    def _rejected_for_alignment(self, exc):
+        return isinstance(exc, ValueError) and "divisible by" in str(exc)
+
+    def test_unaligned_partition_is_rejected(self):
+        exc = self._create_weights(2880 // 8, 8)
+        self.assertTrue(
+            self._rejected_for_alignment(exc),
+            msg=f"TP=8 leaves 360 channels per rank and must be rejected, got {exc!r}",
+        )
+
+    def test_block_aligned_partitions_are_accepted(self):
         for tp_size in (1, 2, 4):
-            self.assertEqual(2880 // tp_size % self.GROUP_SIZE, 0)
-            self.assertTrue(self._slices_agree(2880, tp_size), msg=f"tp={tp_size}")
+            exc = self._create_weights(2880 // tp_size, tp_size)
+            self.assertFalse(
+                self._rejected_for_alignment(exc),
+                msg=f"tp={tp_size} is block-aligned and must pass validation",
+            )
 
-    def test_unaligned_partition_is_detectable_by_the_guard(self):
-        # What ModelOptNvFp4FusedMoEMethod.create_weights rejects.
-        self.assertNotEqual(2880 // 8 % self.GROUP_SIZE, 0)
-        self.assertFalse(self._slices_agree(2880, 8))
+
+class TestNarrowFusedExpertsToEpRank(CustomTestCase):
+    """EP ownership covers per-expert scale vectors, not just matrices."""
+
+    @staticmethod
+    def _narrow(param_name, tensor, ep_size, ep_rank, redundant=0):
+        from sglang.srt.models import gpt_oss
+
+        model = gpt_oss.GptOssForCausalLM.__new__(gpt_oss.GptOssForCausalLM)
+        parallel = SimpleNamespace(moe_ep_size=ep_size, moe_ep_rank=ep_rank)
+        exec_ctx = SimpleNamespace(
+            moe=SimpleNamespace(ep_num_redundant_experts=redundant)
+        )
+        with (
+            mock.patch.object(gpt_oss, "get_parallel", return_value=parallel),
+            mock.patch.object(gpt_oss, "get_exec", return_value=exec_ctx),
+        ):
+            return model._narrow_fused_experts_to_ep_rank(param_name, tensor)
+
+    def test_per_expert_scale_vector_is_sharded(self):
+        # A weight_scale_2 stored per expert rather than as one scalar: the
+        # parameter is rank-local, so it has to be sliced like the matrices.
+        scales = torch.arange(128, dtype=torch.float32)
+        for ep_rank in (0, 1):
+            got = self._narrow("experts.w13_weight_scale_2", scales, 2, ep_rank)
+            torch.testing.assert_close(got, scales[ep_rank * 64 : (ep_rank + 1) * 64])
+
+    def test_singleton_scale_is_kept_whole(self):
+        for scale in (torch.tensor(0.5), torch.tensor([0.5])):
+            got = self._narrow("experts.w2_weight_scale_2", scale, 2, 1)
+            torch.testing.assert_close(got, scale)
+
+    def test_input_scales_stay_global(self):
+        scales = torch.arange(128, dtype=torch.float32)
+        got = self._narrow("experts.w13_input_scale", scales, 2, 1)
+        torch.testing.assert_close(got, scales)
+
+    def test_matrices_are_sharded(self):
+        w = torch.arange(128 * 2, dtype=torch.float32).reshape(128, 2)
+        got = self._narrow("experts.w2_weight", w, 4, 3)
+        torch.testing.assert_close(got, w[96:128])
+
+    def test_sharded_scale_vector_then_loads_into_the_rank_local_param(self):
+        # The composition is the failure: an unsharded [128] reaching
+        # _load_fused_per_tensor_scale reshapes into a [64, 2] parameter and
+        # raises "shape '[64]' is invalid for input of size 128".
+        scales = torch.arange(128, dtype=torch.float32)
+        param = torch.nn.Parameter(torch.empty(64, 2), requires_grad=False)
+        sharded = self._narrow("experts.w13_weight_scale_2", scales, 2, 1)
+        _load_fused_per_tensor_scale(param, sharded)
+        torch.testing.assert_close(param.data[:, 0], scales[64:])
+        torch.testing.assert_close(param.data[:, 1], scales[64:])
+
+    def test_expert_count_must_divide_over_ranks(self):
+        w = torch.zeros(127, 2)
+        with self.assertRaises(ValueError):
+            self._narrow("experts.w2_weight", w, 2, 0)
 
 
 class TestCopyIntoPaddedExpertData(CustomTestCase):

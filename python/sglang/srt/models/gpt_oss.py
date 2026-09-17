@@ -888,19 +888,16 @@ class GptOssForCausalLM(nn.Module):
         """This rank's experts out of a fused checkpoint tensor.
 
         The fused tensors carry every expert of a layer, while the parameters
-        hold only this EP rank's. Per-tensor scales stay global: their
-        parameters are registered with _sglang_require_global_experts.
+        hold only this EP rank's -- including a per-expert weight_scale_2 stored
+        as a vector. A scale shared by every expert is a singleton and stays
+        whole, and input scales stay global: their parameters are registered
+        with _sglang_require_global_experts.
         """
         ep_size = get_parallel().moe_ep_size
-        if ep_size == 1 or loaded_weight.dim() < 2:
+        if ep_size == 1 or loaded_weight.numel() == 1:
             return loaded_weight
         if param_name.endswith("_input_scale"):
             return loaded_weight
-        if get_exec().moe.ep_num_redundant_experts:
-            raise NotImplementedError(
-                "Fused NVFP4 expert checkpoints do not support redundant "
-                "experts; every rank owns a contiguous slice of the fused tensor."
-            )
         num_global_experts = loaded_weight.shape[0]
         if num_global_experts % ep_size != 0:
             raise ValueError(
@@ -1289,6 +1286,13 @@ class GptOssForCausalLM(nn.Module):
             if self._uses_fused_nvfp4_experts()
             else FusedMoE.make_expert_params_mapping_fused
         )
+        if self._uses_fused_nvfp4_experts() and get_exec().moe.ep_num_redundant_experts:
+            # Every rank owns a contiguous slice of the fused tensor, so there is
+            # nowhere to put a redundant copy.
+            raise NotImplementedError(
+                "Fused NVFP4 expert checkpoints do not support redundant experts."
+            )
+
         expert_params_mapping = make_mapping(
             ckpt_gate_up_proj_name="gate_up_proj",
             ckpt_down_proj_name="down_proj",
