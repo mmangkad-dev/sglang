@@ -2482,28 +2482,26 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
         if with_bias:
-            # fp32 [num_local_experts, out_features], one value per output channel.
-            w13_weight_bias = ModelWeightParameter(
-                data=torch.zeros(
+            # fp32 [num_local_experts, out_features], one value per output
+            # channel. A bias has no input dim, so it is a plain Parameter
+            # rather than a ModelWeightParameter, as in the MXFP4 path.
+            w13_weight_bias = torch.nn.Parameter(
+                torch.zeros(
                     layer.num_local_experts,
                     num_shards * intermediate_size_per_partition,
                     dtype=torch.float32,
                 ),
-                input_dim=1,
-                output_dim=1,
-                weight_loader=weight_loader,
+                requires_grad=False,
             )
             layer.register_parameter("w13_weight_bias", w13_weight_bias)
+            set_weight_attrs(w13_weight_bias, {"weight_loader": weight_loader})
 
-            w2_weight_bias = ModelWeightParameter(
-                data=torch.zeros(
-                    layer.num_local_experts, hidden_size, dtype=torch.float32
-                ),
-                input_dim=1,
-                output_dim=1,
-                weight_loader=weight_loader,
+            w2_weight_bias = torch.nn.Parameter(
+                torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.float32),
+                requires_grad=False,
             )
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
+            set_weight_attrs(w2_weight_bias, {"weight_loader": weight_loader})
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
