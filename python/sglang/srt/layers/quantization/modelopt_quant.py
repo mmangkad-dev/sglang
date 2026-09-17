@@ -2390,6 +2390,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.params_dtype = params_dtype
         layer.quant_config = self.quant_config
 
+        group_size = self.quant_config.group_size
+        unpadded = layer.intermediate_size_per_partition_unpadded
+        if unpadded % group_size != 0:
+            # Packed weights hold 2 channels per byte and block scales hold
+            # group_size, so a rank boundary off a block boundary makes the two
+            # slices cover different channels -- silently, since both divide.
+            raise ValueError(
+                f"NVFP4 MoE needs intermediate_size_per_partition divisible by "
+                f"{group_size}, got {unpadded} "
+                f"({layer.intermediate_size_per_partition_unpadded * layer.moe_tp_size}"
+                f" over moe_tp_size={layer.moe_tp_size}). Use a tensor-parallel "
+                "size that keeps each rank's shard block-aligned."
+            )
+
         weight_dtype = torch.uint8
         weight_scale_dtype = torch.float8_e4m3fn
         weight_loader = self.prepare_weight_loader(
@@ -2584,19 +2598,27 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             layer, "_w13_deinterleaved", False
         ):
             up_first = self.enable_flashinfer_trtllm_moe
-            layer.w13_weight.data = deinterleave_w13(
-                layer.w13_weight.data, up_first=up_first
+            copy_or_rebind_param(
+                layer,
+                "w13_weight",
+                deinterleave_w13(layer.w13_weight.data, up_first=up_first),
             )
-            layer.w13_weight_scale.data = deinterleave_w13(
-                layer.w13_weight_scale.data, up_first=up_first
+            copy_or_rebind_param(
+                layer,
+                "w13_weight_scale",
+                deinterleave_w13(layer.w13_weight_scale.data, up_first=up_first),
             )
             w13_bias = getattr(layer, "w13_weight_bias", None)
             if w13_bias is not None:
                 # The bias indexes the same rows as w13, so it follows the same
                 # de-interleave; unsqueeze to reuse the row-dim helper.
-                layer.w13_weight_bias.data = deinterleave_w13(
-                    w13_bias.data.unsqueeze(-1), up_first=up_first
-                ).squeeze(-1)
+                copy_or_rebind_param(
+                    layer,
+                    "w13_weight_bias",
+                    deinterleave_w13(
+                        w13_bias.data.unsqueeze(-1), up_first=up_first
+                    ).squeeze(-1),
+                )
             layer._w13_deinterleaved = True
 
         # GEMM1 scale processing is deferred until the input scale is known;

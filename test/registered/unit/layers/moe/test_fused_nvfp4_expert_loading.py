@@ -21,7 +21,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10)
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 # Every expert tensor an NVFP4 GPT-OSS layer carries, and the parameter each one
 # must reach. Taken from the safetensors index of mmangkad/gpt-oss-120b-nvfp4.
@@ -173,6 +173,35 @@ class TestLoadW13ShardSlicing(CustomTestCase):
                     ckpt[0, rank * n_real : (rank + 1) * n_real, 0],
                 )
                 self.assertTrue(torch.all(param[0, n_real:, 0] == 0))
+
+
+class TestQuantBlockAlignedPartition(CustomTestCase):
+    """A rank boundary that splits a quantization block is unloadable.
+
+    Packed NVFP4 weights hold 2 channels per byte and block scales hold
+    group_size, so if a rank's channel count is not a multiple of group_size the
+    two slices describe different channels -- and both still divide evenly, so
+    nothing raises on its own. GPT-OSS at TP=8 is the case: 2880/8 = 360
+    channels, 180 packed bytes (360 channels) but 22 scales (352 channels).
+    """
+
+    GROUP_SIZE = 16
+
+    def _slices_agree(self, intermediate, tp_size):
+        channels = intermediate // tp_size
+        packed = (intermediate // 2) // tp_size
+        scales = (intermediate // self.GROUP_SIZE) // tp_size
+        return packed * 2 == scales * self.GROUP_SIZE == channels
+
+    def test_block_aligned_partitions_describe_the_same_channels(self):
+        for tp_size in (1, 2, 4):
+            self.assertEqual(2880 // tp_size % self.GROUP_SIZE, 0)
+            self.assertTrue(self._slices_agree(2880, tp_size), msg=f"tp={tp_size}")
+
+    def test_unaligned_partition_is_detectable_by_the_guard(self):
+        # What ModelOptNvFp4FusedMoEMethod.create_weights rejects.
+        self.assertNotEqual(2880 // 8 % self.GROUP_SIZE, 0)
+        self.assertFalse(self._slices_agree(2880, 8))
 
 
 class TestCopyIntoPaddedExpertData(CustomTestCase):

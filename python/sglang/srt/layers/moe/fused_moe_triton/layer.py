@@ -480,6 +480,13 @@ class FusedMoE(torch.nn.Module):
         )
         self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
 
+        # The checkpoint's own per-rank intermediate size, before any kernel
+        # alignment padding. Quantized loaders need it to check that a rank
+        # boundary does not cut a quantization block.
+        self.intermediate_size_per_partition_unpadded = (
+            self.intermediate_size_per_partition
+        )
+
         # flashinfer_trtllm kernel requires intermediate_size to be a multiple of 128
         # Pad the intermediate_size_per_partition if necessary
         if (
@@ -1534,6 +1541,11 @@ class FusedMoE(torch.nn.Module):
 
         if shard_id not in ("w13", "w2"):
             raise ValueError(f"shard_id must be ['w13','w2'] but got {shard_id}.")
+
+        if shard_id == "w13":
+            # This write restores the checkpoint's interleaved row order, so any
+            # de-interleave from a previous load generation no longer holds.
+            self._w13_deinterleaved = False
 
         # Fused NVFP4 checkpoints store the per-tensor weight/input scales as a
         # single scalar (or one value per expert) shared by every expert, while

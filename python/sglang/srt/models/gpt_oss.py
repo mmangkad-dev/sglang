@@ -882,6 +882,35 @@ class GptOssForCausalLM(nn.Module):
             "nvfp4_online",
         )
 
+    def _narrow_fused_experts_to_ep_rank(
+        self, param_name: str, loaded_weight: torch.Tensor
+    ) -> torch.Tensor:
+        """This rank's experts out of a fused checkpoint tensor.
+
+        The fused tensors carry every expert of a layer, while the parameters
+        hold only this EP rank's. Per-tensor scales stay global: their
+        parameters are registered with _sglang_require_global_experts.
+        """
+        ep_size = get_parallel().moe_ep_size
+        if ep_size == 1 or loaded_weight.dim() < 2:
+            return loaded_weight
+        if param_name.endswith("_input_scale"):
+            return loaded_weight
+        if get_exec().moe.ep_num_redundant_experts:
+            raise NotImplementedError(
+                "Fused NVFP4 expert checkpoints do not support redundant "
+                "experts; every rank owns a contiguous slice of the fused tensor."
+            )
+        num_global_experts = loaded_weight.shape[0]
+        if num_global_experts % ep_size != 0:
+            raise ValueError(
+                f"{num_global_experts} experts do not divide over "
+                f"moe_ep_size={ep_size}."
+            )
+        num_local = num_global_experts // ep_size
+        start = get_parallel().moe_ep_rank * num_local
+        return loaded_weight.narrow(0, start, num_local)
+
     def _get_default_weight_mapping(self):
         """Generate default weight name mapping for GptOss safetensors."""
         weight_mapping = {}
@@ -1318,6 +1347,9 @@ class GptOssForCausalLM(nn.Module):
                     # and per-tensor scales carry no such dim to swap.
                     if "bias" not in name and loaded_weight.dim() == 3:
                         loaded_weight = loaded_weight.transpose(-2, -1)
+                    loaded_weight = self._narrow_fused_experts_to_ep_rank(
+                        name, loaded_weight
+                    )
                     if "w2_weight_bias" in name and get_parallel().moe_tp_rank != 0:
                         loaded_weight = loaded_weight.zero_()
 
