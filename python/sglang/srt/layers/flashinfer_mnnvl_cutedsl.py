@@ -302,7 +302,13 @@ def _with_early_finalize_shared_load(config):
 
 
 class FlashInferMNNVLCuteDSLARFusion:
-    """One graph-stable workspace serving both supported fusion patterns."""
+    """One graph-stable workspace serving both supported fusion patterns.
+
+    ``add_residual=False`` compiles the same two patterns without their residual
+    add, so ``residual_out`` carries the bare reduced row. That is what an mHC
+    model needs: its residual update is a learned per-token mix over hc_mult
+    streams, not ``residual + x``.
+    """
 
     def __init__(
         self,
@@ -314,6 +320,7 @@ class FlashInferMNNVLCuteDSLARFusion:
         weight_bias: float,
         process_group: ProcessGroup,
         device: torch.device,
+        add_residual: bool = True,
     ) -> None:
         if hidden_size <= 0 or top_k <= 0 or max_m <= 0:
             raise ValueError("hidden_size, top_k, and max_m must be positive")
@@ -325,6 +332,7 @@ class FlashInferMNNVLCuteDSLARFusion:
         self.max_m = int(max_m)
         self.rms_epsilon = float(rms_epsilon)
         self.weight_bias = float(weight_bias)
+        self.add_residual = bool(add_residual)
         self.process_group = process_group
         # Fixed for the workspace's lifetime; supports() is on the per-layer
         # eligibility path and must not re-enter c10d to learn it.
@@ -391,9 +399,18 @@ class FlashInferMNNVLCuteDSLARFusion:
                 routed_scaling_factor=1.0,
                 weight_bias=self.weight_bias,
                 include_shared_expert=True,
-                add_residual=True,
+                add_residual=self.add_residual,
                 write_residual_output=True,
                 config=self.workspace_config,
+            )
+            # Both patterns require rms_gamma and always compute the norm, so a
+            # non-folding workspace still has to hand the kernel a multiplier.
+            self._discarded_gamma = (
+                None
+                if self.add_residual
+                else torch.ones(
+                    self.hidden_size, dtype=torch.bfloat16, device=self.device
+                )
             )
 
             # Publish only after the mailbox barrier; without it the ranks
@@ -421,6 +438,7 @@ class FlashInferMNNVLCuteDSLARFusion:
         residual: torch.Tensor,
         gamma: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.add_residual
         m = int(permuted_indices.shape[0])
         if not self.supports(m):
             raise ValueError(f"workspace does not support M={m}")
@@ -454,6 +472,7 @@ class FlashInferMNNVLCuteDSLARFusion:
         residual: torch.Tensor,
         gamma: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.add_residual
         m = int(local_contribution.shape[0])
         if not self.supports(m):
             raise ValueError(f"workspace does not support M={m}")
@@ -475,6 +494,58 @@ class FlashInferMNNVLCuteDSLARFusion:
         )
         return norm_output, residual_output
 
+    def moe_finalize_all_reduce(
+        self,
+        *,
+        routed_output: torch.Tensor,
+        expert_weights: torch.Tensor,
+        permuted_indices: torch.Tensor,
+        gated_shared_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """The finalize pattern's reduced row, with no residual folded in."""
+        assert not self.add_residual
+        m = int(permuted_indices.shape[0])
+        if not self.supports(m):
+            raise ValueError(f"workspace does not support M={m}")
+        reduced = torch.empty(
+            (m, self.hidden_size), dtype=torch.bfloat16, device=self.device
+        )
+
+        self._allreduce_fusion(
+            input=routed_output,
+            workspace=self.workspace,
+            pattern=self._patterns.kMoEFinalizeARResidualRMSNorm,
+            launch_with_pdl=True,
+            residual_out=reduced,
+            rms_gamma=self._discarded_gamma,
+            rms_eps=self.rms_epsilon,
+            weight_bias=self.weight_bias,
+            expanded_idx_to_permuted_idx=permuted_indices,
+            expert_scale_factor=expert_weights,
+            shared_expert_output=gated_shared_output,
+        )
+        return reduced
+
+    def all_reduce(self, local_contribution: torch.Tensor) -> torch.Tensor:
+        """The all-reduce pattern's reduced row, with no residual folded in."""
+        assert not self.add_residual
+        m = int(local_contribution.shape[0])
+        if not self.supports(m):
+            raise ValueError(f"workspace does not support M={m}")
+        reduced = torch.empty_like(local_contribution)
+
+        self._allreduce_fusion(
+            input=local_contribution,
+            workspace=self.workspace,
+            pattern=self._patterns.kARResidualRMSNorm,
+            launch_with_pdl=True,
+            residual_out=reduced,
+            rms_gamma=self._discarded_gamma,
+            rms_eps=self.rms_epsilon,
+            weight_bias=self.weight_bias,
+        )
+        return reduced
+
 
 _WORKSPACE: FlashInferMNNVLCuteDSLARFusion | None = None
 
@@ -486,6 +557,7 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
     max_m: int,
     rms_epsilon: float,
     weight_bias: float,
+    add_residual: bool = True,
 ) -> FlashInferMNNVLCuteDSLARFusion:
     """Build the process-local workspace. Must run before graph capture."""
     # Before the CUDA check: "requires CUDA" would misdirect for a second one.
@@ -514,5 +586,6 @@ def get_flashinfer_mnnvl_cutedsl_ar_fusion(
         weight_bias=weight_bias,
         process_group=get_tp_group().device_group,
         device=torch.device("cuda", torch.cuda.current_device()),
+        add_residual=add_residual,
     )
     return _WORKSPACE

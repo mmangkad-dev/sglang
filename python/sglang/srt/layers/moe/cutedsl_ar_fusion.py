@@ -3,6 +3,10 @@
 Two patterns share one workspace, both consumed at the next layer's input
 RMSNorm: AR + residual + RMSNorm, and the same with the MoE finalize and the
 shared-expert add folded in when the runner hands back a MoeFinalizeHandoff.
+
+A model whose residual update is not ``residual + x`` builds the workspace
+without the residual add (``folds_residual_norm=False``) and takes the bare
+reduced row; see ``cutedsl_ar_fusion_mhc`` for the mHC family.
 """
 
 from __future__ import annotations
@@ -117,10 +121,12 @@ class CuteDSLFusionService:
         hidden_size: int,
         top_k: int,
         rms_epsilon: float,
+        folds_residual_norm: bool = True,
     ) -> None:
         self.hidden_size = int(hidden_size)
         self.top_k = int(top_k)
         self.rms_epsilon = float(rms_epsilon)
+        self.folds_residual_norm = bool(folds_residual_norm)
         self.max_m: int | None = None
         self._workspace = None
 
@@ -144,6 +150,7 @@ class CuteDSLFusionService:
             rms_epsilon=self.rms_epsilon,
             # fused_norm_gamma() already returns the multiplier as applied.
             weight_bias=0.0,
+            add_residual=self.folds_residual_norm,
         )
         self._workspace = workspace
         self.max_m = workspace.max_m
@@ -180,6 +187,69 @@ class CuteDSLFusionService:
             residual=residual,
             gamma=gamma,
         )
+
+    def finalize_reduce(self, handoff: MoeFinalizeHandoff) -> torch.Tensor:
+        assert self._workspace is not None
+        return self._workspace.moe_finalize_all_reduce(
+            routed_output=handoff.routed_output,
+            expert_weights=handoff.expert_weights,
+            permuted_indices=handoff.permuted_indices,
+            gated_shared_output=handoff.gated_shared_output,
+        )
+
+    def reduce(self, local_contribution: torch.Tensor) -> torch.Tensor:
+        assert self._workspace is not None
+        return self._workspace.all_reduce(local_contribution)
+
+
+def fusion_is_eligible(
+    *,
+    service: CuteDSLFusionService | None,
+    forward_batch: ForwardBatch,
+    m: int,
+    mlp_mode: ScatterMode,
+    tp_size: int,
+) -> bool:
+    """The parallelism and shape guards every fused pattern shares."""
+    parallel = get_parallel()
+    return bool(
+        service is not None
+        and is_supported_forward_mode(forward_batch.forward_mode)
+        and service.supports(m)
+        and not is_dp_attention_enabled()
+        and parallel.attn_cp_size == 1
+        and not get_attn_tp_context().input_scattered
+        and get_moe_a2a_backend().is_none()
+        and tp_size > 1
+        # Both branches of should_fuse_mlp_allreduce_with_next_layer() answer
+        # before delegating to the base, so its guards -- moe-cp allgather,
+        # MOE_FULL and SCATTERED -- are restated by requiring FULL here.
+        and mlp_mode is ScatterMode.FULL
+        # Skipping the post-experts reduction drops both the EP and the TP
+        # leg; one fused collective cannot restore both.
+        and not (parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1)
+    )
+
+
+def finalize_is_eligible(
+    *,
+    service: CuteDSLFusionService | None,
+    forward_batch: ForwardBatch,
+    m: int,
+    mlp_mode: ScatterMode,
+    tp_size: int,
+) -> bool:
+    """Deferring hands the experts' reduction to one TP-wide collective."""
+    return (
+        fusion_is_eligible(
+            service=service,
+            forward_batch=forward_batch,
+            m=m,
+            mlp_mode=mlp_mode,
+            tp_size=tp_size,
+        )
+        and get_parallel().moe_ep_size == 1
+    )
 
 
 class CuteDSLFusionLayerCommunicator(LayerCommunicator):
@@ -333,23 +403,12 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
         return self._should_use_finalize(forward_batch, m)
 
     def _common_eligible(self, forward_batch: ForwardBatch, m: int) -> bool:
-        parallel = get_parallel()
-        return bool(
-            self.fusion_service is not None
-            and is_supported_forward_mode(forward_batch.forward_mode)
-            and self.fusion_service.supports(m)
-            and not is_dp_attention_enabled()
-            and parallel.attn_cp_size == 1
-            and not get_attn_tp_context().input_scattered
-            and get_moe_a2a_backend().is_none()
-            and self._context.tp_size > 1
-            # Both branches of should_fuse_mlp_allreduce_with_next_layer() answer
-            # before delegating to the base, so its guards -- moe-cp allgather,
-            # MOE_FULL and SCATTERED -- are restated by requiring FULL here.
-            and self.layer_scatter_modes.mlp_mode is ScatterMode.FULL
-            # Skipping the post-experts reduction drops both the EP and the TP
-            # leg; one fused collective cannot restore both.
-            and not (parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1)
+        return fusion_is_eligible(
+            service=self.fusion_service,
+            forward_batch=forward_batch,
+            m=m,
+            mlp_mode=self.layer_scatter_modes.mlp_mode,
+            tp_size=self._context.tp_size,
         )
 
     def should_fuse_mlp_allreduce_with_next_layer(
@@ -363,15 +422,64 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
         return super().should_fuse_mlp_allreduce_with_next_layer(forward_batch)
 
 
+def fusion_communicator_types() -> tuple[type, ...]:
+    """Every communicator the installers may attach a service to."""
+    from sglang.srt.layers.moe.cutedsl_ar_fusion_mhc import (
+        CuteDSLFusionMHCLayerCommunicator,
+    )
+
+    return (CuteDSLFusionLayerCommunicator, CuteDSLFusionMHCLayerCommunicator)
+
+
 def model_installs_cutedsl_fusion(model: torch.nn.Module) -> bool:
     # Most modules carry no ``layer_communicator``, so ``__dict__.get`` stands
     # in for a defensive ``getattr`` over a heterogeneous module tree.
+    types = fusion_communicator_types()
     return any(
-        isinstance(
-            module.__dict__.get("layer_communicator"),
-            CuteDSLFusionLayerCommunicator,
-        )
+        isinstance(module.__dict__.get("layer_communicator"), types)
         for module in model.modules()
+    )
+
+
+def build_cutedsl_fusion_service(
+    fusion_layers: Sequence[torch.nn.Module],
+    *,
+    hidden_size: int,
+    top_k: int,
+    rms_epsilon: float,
+    folds_residual_norm: bool,
+    label: str,
+) -> CuteDSLFusionService | None:
+    """The one workspace handle a model shares, or None when it must not build one."""
+    if get_flags().moe.in_speculative_scope:
+        # A draft is built in the target's process, and each workspace
+        # rendezvouses its own NVLS region, so a second one is refused outright.
+        return None
+    if not fusion_layers:
+        return None
+
+    if folds_residual_norm:
+        # The kernel validates only the epsilon the service passes, so a family
+        # with a per-layer value would silently normalize with the wrong one.
+        for layer in fusion_layers:
+            for norm in (
+                layer.layer_communicator.input_layernorm,
+                layer.layer_communicator.post_attention_layernorm,
+            ):
+                if fused_norm_gamma(norm) is None:
+                    continue
+                if float(norm.variance_epsilon) != float(rms_epsilon):
+                    raise RuntimeError(
+                        f"{label} CuTe DSL fusion compiles one workspace for "
+                        f"rms_epsilon={rms_epsilon}, but a fused norm uses "
+                        f"{norm.variance_epsilon}"
+                    )
+
+    return CuteDSLFusionService(
+        hidden_size=hidden_size,
+        top_k=top_k,
+        rms_epsilon=rms_epsilon,
+        folds_residual_norm=folds_residual_norm,
     )
 
 
@@ -390,40 +498,21 @@ def install_cutedsl_fusion(
 
     Every entry of ``layers`` must carry a ``layer_communicator``.
     """
-    if get_flags().moe.in_speculative_scope:
-        # A draft is built in the target's process, and each workspace
-        # rendezvouses its own NVLS region, so a second one is refused outright.
-        return None
-
     fusion_layers = [
         layer
         for layer in layers
         if isinstance(layer.layer_communicator, CuteDSLFusionLayerCommunicator)
     ]
-    if not fusion_layers:
-        return None
-
-    # The kernel validates only the epsilon the service passes, so a family
-    # with a per-layer value would silently normalize with the wrong one.
-    for layer in fusion_layers:
-        for norm in (
-            layer.layer_communicator.input_layernorm,
-            layer.layer_communicator.post_attention_layernorm,
-        ):
-            if fused_norm_gamma(norm) is None:
-                continue
-            if float(norm.variance_epsilon) != float(rms_epsilon):
-                raise RuntimeError(
-                    f"{label} CuTe DSL fusion compiles one workspace for "
-                    f"rms_epsilon={rms_epsilon}, but a fused norm uses "
-                    f"{norm.variance_epsilon}"
-                )
-
-    service = CuteDSLFusionService(
+    service = build_cutedsl_fusion_service(
+        fusion_layers,
         hidden_size=hidden_size,
         top_k=top_k,
         rms_epsilon=rms_epsilon,
+        folds_residual_norm=True,
+        label=label,
     )
+    if service is None:
+        return None
     for index, layer in enumerate(layers):
         communicator = layer.layer_communicator
         if not isinstance(communicator, CuteDSLFusionLayerCommunicator):
