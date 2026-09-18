@@ -31,6 +31,7 @@ from sglang.srt.layers.communicator import (
     get_attn_tp_context,
 )
 from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
+from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -555,6 +556,10 @@ class Glm5NextLinearAttention(nn.Module):
         return self.o_proj(core_attn_out)[0]
 
 
+def _use_mnnvl_cutedsl_fusion() -> bool:
+    return _is_cuda and uses_cutedsl_ar_fusion()
+
+
 class Glm5NextDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -698,7 +703,15 @@ class Glm5NextDecoderLayer(nn.Module):
                 hc_ffn_pre=self.hc_ffn_pre,
                 hc_post=self.hc_post,
             )
-            self.layer_communicator = MHCLayerCommunicator(
+            if _use_mnnvl_cutedsl_fusion() and not is_nextn:
+                from sglang.srt.layers.moe.cutedsl_ar_fusion_mhc import (
+                    CuteDSLFusionMHCLayerCommunicator,
+                )
+
+                mhc_communicator_cls = CuteDSLFusionMHCLayerCommunicator
+            else:
+                mhc_communicator_cls = MHCLayerCommunicator
+            self.layer_communicator = mhc_communicator_cls(
                 **shared_kwargs,
                 **mhc_kwargs,
             )
@@ -822,9 +835,16 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             _mlp_ctx = nullcontext()
 
+        # mHC's postprocess_layer consumes any handoff, so deferring never
+        # implies fusing into the next layer.
+        may_defer_moe_finalize = self.layer_communicator.should_defer_moe_finalize(
+            forward_batch
+        )
+
         with get_forward().scoped(
             fuse_mlp_allreduce=should_allreduce_fusion,
             mlp_reduce_scatter=use_reduce_scatter,
+            defer_moe_finalize=may_defer_moe_finalize,
         ):
             with _mlp_ctx:
                 hidden_states = self.mlp(
@@ -940,6 +960,32 @@ class Glm5NextModel(nn.Module):
                     self.embed_tokens.embedding_dim,
                 )
             )
+        from sglang.srt.layers.moe.cutedsl_ar_fusion_mhc import (
+            install_cutedsl_mhc_fusion,
+        )
+
+        if _use_mnnvl_cutedsl_fusion() and self.pp_group.world_size != 1:
+            raise RuntimeError(
+                "FlashInfer MNNVL CuTe DSL fusion currently requires PP=1: the "
+                "workspace is built from a pre-capture hook on the last rank's "
+                "model, and every stage would need its own"
+            )
+        self.flashinfer_mnnvl_cutedsl_fusion = install_cutedsl_mhc_fusion(
+            # PP pads self.layers with PPMissingLayer, which has no communicator.
+            self.layers[self.start_layer : self.end_layer],
+            hidden_size=config.hidden_size,
+            top_k=config.num_experts_per_tok,
+            rms_epsilon=config.rms_norm_eps,
+            # A TP1-replicated shared expert is added after the all-reduce, so it
+            # cannot fold into the collective's shared-expert operand.
+            can_defer_finalize=lambda layer: (
+                isinstance(layer.mlp, Glm5NextMoE)
+                and layer.mlp.experts.supports_deferred_finalize
+                and not layer.mlp._shared_expert_tp1
+            ),
+            label="GLM-5.3-Flash",
+        )
+
         self.layers_to_capture = []
         self.dflash_capture = False
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
@@ -1190,6 +1236,19 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 "get_input_embeddings() is not available in encoder-only mode"
             )
         return self.model.embed_tokens
+
+    def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        # BaseRunner looks the hook up here; the handle lives on the inner model.
+        if self.model is None:
+            return
+        from sglang.srt.layers.moe.cutedsl_ar_fusion import prepare_cutedsl_fusion
+
+        prepare_cutedsl_fusion(
+            self.model.flashinfer_mnnvl_cutedsl_fusion,
+            server_args=model_runner.server_args,
+            max_running_requests=model_runner.max_running_requests,
+            label="GLM-5.3-Flash",
+        )
 
     @property
     def routed_experts_weights_of_layer(self):

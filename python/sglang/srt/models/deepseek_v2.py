@@ -669,6 +669,11 @@ class DeepseekV2MoE(nn.Module):
             ),
             swiglu_limit=getattr(config, "swiglu_limit", None),
             prefix=add_prefix("experts", prefix),
+            # GLM-5.3-Flash ships block-FP8; its handoff consumer is the mHC
+            # fusion, so the deferred output stays off without that backend.
+            enable_fp8_block_deferred_finalize=(
+                config.model_type == "glm5_next_text" and uses_cutedsl_ar_fusion()
+            ),
         )
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):

@@ -343,7 +343,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.RenormalizeNaive,
             num_fused_shared_experts=self.num_fused_shared_experts,
             inplace=not _needs_hidden_after_experts,
-            enable_qwen35_fp8_deferred_finalize=(
+            enable_fp8_block_deferred_finalize=(
                 config.model_type == "qwen3_5_moe_text" and uses_cutedsl_ar_fusion()
             ),
         )

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -161,6 +162,7 @@ def test_wrapper_calls_only_the_stable_unified_api():
     wrapper.max_m = 4
     wrapper.rms_epsilon = 1e-5
     wrapper.weight_bias = 0.0
+    wrapper.add_residual = True
     wrapper.device = torch.device("cpu")
     wrapper.workspace = object()
     wrapper.supports = lambda m: True
@@ -198,6 +200,43 @@ def test_wrapper_calls_only_the_stable_unified_api():
     assert calls[1]["launch_with_pdl"] is True
     assert "routed_scaling_factor" not in calls[1]
     assert "expanded_idx_to_permuted_idx" not in calls[1]
+
+
+def test_a_non_folding_workspace_passes_no_residual_in():
+    """FlashInfer raises "residual_in must be None for this compiled workspace",
+    so an mHC call that still sent one would fail only on a Blackwell node."""
+    calls = []
+    wrapper = object.__new__(FlashInferMNNVLCuteDSLARFusion)
+    wrapper.hidden_size = 8
+    wrapper.top_k = 2
+    wrapper.max_m = 4
+    wrapper.rms_epsilon = 1e-5
+    wrapper.weight_bias = 0.0
+    wrapper.add_residual = False
+    wrapper.device = torch.device("cpu")
+    wrapper.workspace = object()
+    wrapper.supports = lambda m: True
+    wrapper._discarded_gamma = torch.empty(8, dtype=torch.bfloat16)
+    wrapper._patterns = SimpleNamespace(
+        kARResidualRMSNorm=1,
+        kMoEFinalizeARResidualRMSNorm=7,
+    )
+    wrapper._allreduce_fusion = lambda **kwargs: calls.append(kwargs)
+
+    local = torch.empty(4, 8, dtype=torch.bfloat16)
+    wrapper.moe_finalize_all_reduce(
+        routed_output=torch.empty(8, 8, dtype=torch.bfloat16),
+        expert_weights=torch.empty(4, 2, dtype=torch.bfloat16),
+        permuted_indices=torch.empty(4, 2, dtype=torch.int32),
+        gated_shared_output=local,
+    )
+    wrapper.all_reduce(local)
+
+    assert [call["pattern"] for call in calls] == [7, 1]
+    for call in calls:
+        assert "residual_in" not in call
+        assert call["rms_gamma"] is wrapper._discarded_gamma
+        assert call["residual_out"].shape == (4, 8)
 
 
 def test_text_entry_wrapper_delegates_pre_capture_prepare():
@@ -490,6 +529,166 @@ def test_dual_stream_op_still_republishes_its_operand_flags():
 
 
 # ---------------------------------------------------------------------------
+# mHC family
+# ---------------------------------------------------------------------------
+
+
+def _mhc_communicator(**attrs):
+    from sglang.srt.layers.moe.cutedsl_ar_fusion_mhc import (
+        CuteDSLFusionMHCLayerCommunicator,
+    )
+
+    comm = CuteDSLFusionMHCLayerCommunicator.__new__(CuteDSLFusionMHCLayerCommunicator)
+    comm.layer_scatter_modes = SimpleNamespace(mlp_mode=ScatterMode.FULL)
+    comm._context = SimpleNamespace(tp_size=4, attn_dp_size=1, cache=None)
+    for name, value in attrs.items():
+        setattr(comm, name, value)
+    return comm
+
+
+def test_mhc_postprocess_materializes_the_handoff_before_hc_post():
+    """hc_post mixes hc_mult residual streams and cannot take a handoff; passing
+    one through would either raise inside the mix or, worse, skip the experts'
+    reduction entirely."""
+    from sglang.srt.layers.communicator_mhc import MHCLayerCommunicator
+    from sglang.srt.layers.moe.cutedsl_ar_fusion_mhc import (
+        CuteDSLFusionMHCLayerCommunicator,
+    )
+
+    reduced = torch.full((2, 8), 3.0)
+    comm = _mhc_communicator(
+        fusion_service=SimpleNamespace(finalize_reduce=lambda handoff: reduced)
+    )
+    handoff = MoeFinalizeHandoff(
+        routed_output=torch.zeros(4, 8),
+        expert_weights=torch.zeros(2, 2),
+        permuted_indices=torch.zeros(2, 2),
+        gated_shared_output=torch.zeros(2, 8),
+        m=2,
+    )
+    residual = torch.zeros(2, 32)
+    forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+    seen = []
+    with (
+        patch.object(
+            CuteDSLFusionMHCLayerCommunicator, "_should_use_finalize", return_value=True
+        ),
+        patch.object(
+            MHCLayerCommunicator,
+            "postprocess_layer",
+            lambda self, h, r, fb: seen.append((h, r)) or (h, r),
+        ),
+    ):
+        comm.postprocess_layer(handoff, residual, forward_batch)
+
+    assert len(seen) == 1
+    assert seen[0][0] is reduced
+
+
+def test_mhc_declines_the_fused_all_reduce_off_the_plain_gather_branch():
+    """The scatter and DP branches do more than reduce; standing in for them
+    with a bare all-reduce would silently drop their redistribution."""
+    from sglang.srt.layers.communicator_mhc import (
+        MHCCommunicateWithAllReduceAndLayerNormFn,
+    )
+
+    forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+    def _probe(communicate_fn):
+        comm = _mhc_communicator(
+            fusion_service=SimpleNamespace(supports=lambda m: True),
+            _communicate_with_all_reduce_and_layer_norm_fn=communicate_fn,
+        )
+        with (
+            patch(
+                "sglang.srt.layers.moe.cutedsl_ar_fusion.is_dp_attention_enabled",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.moe.cutedsl_ar_fusion.get_attn_tp_context",
+                return_value=SimpleNamespace(input_scattered=False),
+            ),
+            patch(
+                "sglang.srt.layers.moe.cutedsl_ar_fusion.get_moe_a2a_backend",
+                return_value=SimpleNamespace(is_none=lambda: True),
+            ),
+            patch(
+                "sglang.srt.layers.moe.cutedsl_ar_fusion.get_parallel",
+                return_value=SimpleNamespace(
+                    moe_ep_size=1,
+                    moe_tp_size=4,
+                    attn_cp_size=1,
+                    tp_size=4,
+                    attn_tp_size=4,
+                ),
+            ),
+            patch(
+                "sglang.srt.layers.moe.cutedsl_ar_fusion_mhc.get_parallel",
+                return_value=SimpleNamespace(tp_size=4, attn_tp_size=4),
+            ),
+            patch(
+                "sglang.srt.layers.moe.cutedsl_ar_fusion_mhc.get_exec",
+                return_value=SimpleNamespace(
+                    comm=SimpleNamespace(enable_quant_communications=False)
+                ),
+            ),
+        ):
+            return comm._should_reduce_attn_output(forward_batch, 8)
+
+    gather = partial(
+        MHCCommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
+        residual_input_mode=ScatterMode.TP_ATTN_FULL,
+    )
+    scatter = partial(
+        MHCCommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual,
+        residual_input_mode=ScatterMode.TP_ATTN_FULL,
+    )
+    assert _probe(gather) is True
+    assert _probe(scatter) is False
+    # Same branch, but a scattered residual the plain reduce would not restore.
+    assert (
+        _probe(
+            partial(
+                MHCCommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
+                residual_input_mode=ScatterMode.SCATTERED,
+            )
+        )
+        is False
+    )
+
+
+def test_mhc_install_builds_a_non_folding_workspace_for_every_layer():
+    """The kernel refuses a residual_in against a folding workspace and demands
+    one otherwise, so the mode is a compile-time contract; and an mHC layer's
+    handoff is consumed in place, so the last layer defers like any other."""
+    from sglang.srt.layers.moe.cutedsl_ar_fusion_mhc import install_cutedsl_mhc_fusion
+
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="test")
+    layers = [
+        SimpleNamespace(layer_communicator=_mhc_communicator(), sparse=sparse)
+        for sparse in (False, True, True)
+    ]
+
+    service = install_cutedsl_mhc_fusion(
+        layers,
+        hidden_size=4096,
+        top_k=8,
+        rms_epsilon=1e-5,
+        can_defer_finalize=lambda layer: layer.sparse,
+        label="test",
+    )
+
+    assert service.folds_residual_norm is False
+    assert [layer.layer_communicator.may_defer_moe_finalize for layer in layers] == [
+        False,
+        True,
+        True,
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Kernel-shape re-targeting
 # ---------------------------------------------------------------------------
 
@@ -513,6 +712,9 @@ _SHAPES = [
     ("GLM-5.3", 6144, 8, 4, True),
     ("GLM-5.3", 6144, 8, 8, True),
     ("GLM-5.3", 6144, 8, 16, False),
+    ("GLM-5.3-Flash", 4096, 8, 4, True),
+    ("GLM-5.3-Flash", 4096, 8, 8, True),
+    ("GLM-5.3-Flash", 4096, 8, 16, True),
 ]
 
 
