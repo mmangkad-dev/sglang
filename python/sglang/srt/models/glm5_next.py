@@ -966,9 +966,10 @@ class Glm5NextModel(nn.Module):
 
         if _use_mnnvl_cutedsl_fusion() and self.pp_group.world_size != 1:
             raise RuntimeError(
-                "FlashInfer MNNVL CuTe DSL fusion currently requires PP=1: the "
-                "workspace is built from a pre-capture hook on the last rank's "
-                "model, and every stage would need its own"
+                "FlashInfer MNNVL CuTe DSL fusion with PP is unvalidated for "
+                "mHC. Nothing here is known to break -- the handoff never "
+                "leaves its layer and each stage would rendezvous its own "
+                "workspace -- but no stage split has been run"
             )
         self.flashinfer_mnnvl_cutedsl_fusion = install_cutedsl_mhc_fusion(
             # PP pads self.layers with PPMissingLayer, which has no communicator.
@@ -983,7 +984,7 @@ class Glm5NextModel(nn.Module):
                 and layer.mlp.experts.supports_deferred_finalize
                 and not layer.mlp._shared_expert_tp1
             ),
-            label="GLM-5.3-Flash",
+            label="GLM-5-Next",
         )
 
         self.layers_to_capture = []
@@ -1247,7 +1248,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             self.model.flashinfer_mnnvl_cutedsl_fusion,
             server_args=model_runner.server_args,
             max_running_requests=model_runner.max_running_requests,
-            label="GLM-5.3-Flash",
+            label="GLM-5-Next",
         )
 
     @property

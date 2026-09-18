@@ -34,6 +34,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_parallel,
+    get_spec,
 )
 
 if TYPE_CHECKING:
@@ -53,25 +54,45 @@ def fused_norm_gamma(layernorm: torch.nn.Module) -> Optional[torch.Tensor]:
     return None
 
 
-def is_supported_forward_mode(forward_mode: ForwardMode) -> bool:
-    return forward_mode in (
-        ForwardMode.DECODE,
-        ForwardMode.EXTEND,
-        ForwardMode.TARGET_VERIFY,
-    )
+def is_supported_forward_mode(
+    forward_mode: ForwardMode, *, admits_extend: bool = True
+) -> bool:
+    if forward_mode is ForwardMode.EXTEND:
+        return admits_extend
+    return forward_mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY)
 
 
-def resolve_max_m(*, server_args: ServerArgs, max_running_requests: int | None) -> int:
+def _decode_tokens_per_request() -> int:
+    spec = get_spec()
+    if not spec.speculative_algorithm:
+        return 1
+    return spec.speculative_num_draft_tokens or 1
+
+
+def resolve_max_m(
+    *,
+    server_args: ServerArgs,
+    max_running_requests: int | None,
+    admits_extend: bool = True,
+) -> int:
     decode_config = get_exec().graph.cuda_graph_config.decode
     prefill_config = get_exec().graph.cuda_graph_config.prefill
-    candidates = [
-        cutedsl_moe_max_num_tokens(server_args),
-        max_running_requests,
-        decode_config.max_bs,
-        prefill_config.max_bs,
-        *(decode_config.bs or []),
-        *(prefill_config.bs or []),
-    ]
+    requests = [max_running_requests, decode_config.max_bs, *(decode_config.bs or [])]
+    if admits_extend:
+        candidates = [
+            cutedsl_moe_max_num_tokens(server_args),
+            prefill_config.max_bs,
+            *(prefill_config.bs or []),
+            *requests,
+        ]
+    else:
+        # A decode-shaped workspace still has to cover TARGET_VERIFY, which puts
+        # bs * draft tokens through one forward.
+        tokens_per_request = _decode_tokens_per_request()
+        candidates = [
+            None if value is None else int(value) * tokens_per_request
+            for value in requests
+        ]
     positive = [
         int(value) for value in candidates if value is not None and int(value) > 0
     ]
@@ -127,6 +148,10 @@ class CuteDSLFusionService:
         self.top_k = int(top_k)
         self.rms_epsilon = float(rms_epsilon)
         self.folds_residual_norm = bool(folds_residual_norm)
+        # A non-folding workspace still computes and writes a [M, hidden] norm
+        # it discards. That is noise at decode M and the dominant cost at a
+        # prefill chunk, so such a workspace is decode-shaped.
+        self.admits_extend = self.folds_residual_norm
         self.max_m: int | None = None
         self._workspace = None
 
@@ -214,7 +239,9 @@ def fusion_is_eligible(
     parallel = get_parallel()
     return bool(
         service is not None
-        and is_supported_forward_mode(forward_batch.forward_mode)
+        and is_supported_forward_mode(
+            forward_batch.forward_mode, admits_extend=service.admits_extend
+        )
         and service.supports(m)
         and not is_dp_attention_enabled()
         and parallel.attn_cp_size == 1
@@ -249,6 +276,33 @@ def finalize_is_eligible(
             tp_size=tp_size,
         )
         and get_parallel().moe_ep_size == 1
+    )
+
+
+def reduces_over_the_plain_tp_group(
+    communicate_fn,
+    *,
+    expected_gather_fn,
+    attn_dp_size: int,
+) -> bool:
+    """Whether prepare_mlp's step is a bare all-reduce the fusion can stand in for.
+
+    The other branches scatter, gather for DP, or take the input-scattered path,
+    and a plain reduction would drop their redistribution.
+    """
+    if isinstance(communicate_fn, functools.partial):
+        norm_fn = communicate_fn.func
+        residual_input_mode = communicate_fn.keywords.get("residual_input_mode")
+    else:
+        norm_fn = communicate_fn
+        residual_input_mode = None
+    parallel = get_parallel()
+    return (
+        norm_fn is expected_gather_fn
+        and residual_input_mode is ScatterMode.TP_ATTN_FULL
+        and attn_dp_size == 1
+        and parallel.attn_tp_size == parallel.tp_size
+        and not get_exec().comm.enable_quant_communications
     )
 
 
@@ -347,24 +401,17 @@ class CuteDSLFusionLayerCommunicator(LayerCommunicator):
         m: int,
         residual: Optional[torch.Tensor],
     ) -> bool:
-        communicate_fn = self._communicate_with_all_reduce_and_layer_norm_fn
-        if isinstance(communicate_fn, functools.partial):
-            norm_fn = communicate_fn.func
-            residual_input_mode = communicate_fn.keywords.get("residual_input_mode")
-        else:
-            norm_fn = communicate_fn
-            residual_input_mode = None
-        parallel = get_parallel()
         return (
             self._common_eligible(forward_batch, m)
             and residual is not None
             and fused_norm_gamma(self.post_attention_layernorm) is not None
-            and norm_fn
-            is CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual
-            and residual_input_mode is ScatterMode.TP_ATTN_FULL
-            and self._context.attn_dp_size == 1
-            and parallel.attn_tp_size == parallel.tp_size
-            and not get_exec().comm.enable_quant_communications
+            and reduces_over_the_plain_tp_group(
+                self._communicate_with_all_reduce_and_layer_norm_fn,
+                expected_gather_fn=(
+                    CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual
+                ),
+                attn_dp_size=self._context.attn_dp_size,
+            )
         )
 
     def _should_use_finalize(self, forward_batch: ForwardBatch, m: int) -> bool:
@@ -561,7 +608,9 @@ def prepare_cutedsl_fusion(
         )
     service.prepare(
         max_m=resolve_max_m(
-            server_args=server_args, max_running_requests=max_running_requests
+            server_args=server_args,
+            max_running_requests=max_running_requests,
+            admits_extend=service.admits_extend,
         )
     )
     logger.info(
