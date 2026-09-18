@@ -9,9 +9,12 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 # FlashKDA chunk size. Sequences shorter than this fall back to Triton.
 _FLASHKDA_CHUNK_SIZE = 64
 
-# FlashKDA's max sequence length, Batches whose longest sequence exceeds this
-# fall back to Triton for the whole batch.
-_FLASHKDA_MAX_SEQ_LEN = 2048
+# Length below which FlashKDA wins at any head count measured.
+_FLASHKDA_SHORT_SEQ_LEN = 2048
+
+# CTAs (longest-sequence equivalents x per-rank heads) FlashKDA needs to beat
+# Triton past _FLASHKDA_SHORT_SEQ_LEN. Measured on GB300, D=128, bf16.
+_FLASHKDA_MIN_LONG_SEQ_CTAS = 32
 
 
 def _load_flash_kda():
@@ -133,7 +136,12 @@ class FlashKDAKernel(LinearAttnKernelBase):
         # the Triton chunk_kda fallback instead of silently skipping the
         # snapshot (that would corrupt prefix-cache restores).
         if return_intermediate_states or self._should_fall_back(
-            lower_bound, is_spec_decode, query_start_loc, extend_seq_lens_cpu
+            lower_bound=lower_bound,
+            is_spec_decode=is_spec_decode,
+            query_start_loc=query_start_loc,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            # q is [1, packed_seq, H, K].
+            num_heads=q.shape[2],
         ):
             return _triton_fallback(
                 q,
@@ -153,22 +161,21 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 track_chunk_idx=kwargs.get("track_chunk_idx"),
             )
 
-        return (
-            self._flashkda_extend(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                lower_bound=lower_bound,
-                beta_is_raw=beta_is_raw,
-            ),
-            None,
+        # Bare tensor like chunk_kda and the other KDA extend kernels: the caller
+        # unpacks (output, h) only when it asked for intermediate states.
+        return self._flashkda_extend(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            beta_is_raw=beta_is_raw,
         )
 
     @staticmethod
@@ -177,6 +184,7 @@ class FlashKDAKernel(LinearAttnKernelBase):
         is_spec_decode: bool,
         query_start_loc: torch.Tensor,
         extend_seq_lens_cpu: Optional[list],
+        num_heads: int,
     ) -> bool:
         """Whether to use the Triton chunk_kda path instead of the fused kernel."""
         # Safe-gate only: the fused kernel does not support the unbounded gate
@@ -189,23 +197,31 @@ class FlashKDAKernel(LinearAttnKernelBase):
         # gate them here rather than relying on the decode/target_verify stubs.
         if is_spec_decode:
             return True
-        # Short sequences (< chunk size) and long sequences (> the crossover
-        # where Triton's chunked prefill wins) are faster on Triton. Read the
-        # per-request lengths from the CPU-side extend_seq_lens to avoid a
-        # GPU->CPU sync on every layer; derive from query_start_loc (one sync)
-        # only if they are unavailable.
+        # Read the per-request lengths from the CPU-side extend_seq_lens to
+        # avoid a GPU->CPU sync on every layer; derive from query_start_loc
+        # (one sync) only if they are unavailable.
         if extend_seq_lens_cpu is not None:
             if torch.is_tensor(extend_seq_lens_cpu):
                 lo = int(extend_seq_lens_cpu.min())
                 hi = int(extend_seq_lens_cpu.max())
+                total = int(extend_seq_lens_cpu.sum())
             else:
                 lo = min(extend_seq_lens_cpu)
                 hi = max(extend_seq_lens_cpu)
+                total = sum(extend_seq_lens_cpu)
         else:
             seq_lens = query_start_loc[1:] - query_start_loc[:-1]
             lo_t, hi_t = torch.aminmax(seq_lens)
-            lo, hi = int(lo_t), int(hi_t)
-        return lo < _FLASHKDA_CHUNK_SIZE or hi > _FLASHKDA_MAX_SEQ_LEN
+            lo, hi, total = (
+                int(x) for x in torch.stack((lo_t, hi_t, seq_lens.sum())).tolist()
+            )
+        if lo < _FLASHKDA_CHUNK_SIZE:
+            return True
+        if hi <= _FLASHKDA_SHORT_SEQ_LEN:
+            return False
+        # FlashKDA's grid is (sequences x heads) so its cost tracks the longest
+        # sequence; total/hi keeps short-request padding from counting as full.
+        return total * num_heads < _FLASHKDA_MIN_LONG_SEQ_CTAS * hi
 
     def _flashkda_extend(
         self,

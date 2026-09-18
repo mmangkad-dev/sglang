@@ -80,7 +80,7 @@ def _chunk_kda_ref(d, lower_bound):
     """Triton chunk_kda reference. chunk_kda mutates g/v and the state in place,
     so feed clones; returns (output, updated_state_slots)."""
     st = d["pool"].clone()
-    out, _ = chunk_kda(
+    out = chunk_kda(
         q=d["q"].clone(),
         k=d["k"].clone(),
         v=d["v"].clone(),
@@ -105,7 +105,7 @@ def test_flashkda_matches_triton_safe_gate(seq_lens):
     ref_out, ref_state = _chunk_kda_ref(d, LOWER_BOUND)
 
     st_fk = d["pool"].clone()
-    out, h = FlashKDAKernel().extend(
+    out = FlashKDAKernel().extend(
         d["q"].clone(),
         d["k"].clone(),
         d["v"].clone(),
@@ -121,7 +121,8 @@ def test_flashkda_matches_triton_safe_gate(seq_lens):
     )
     torch.cuda.synchronize()
 
-    assert h is None
+    # kda_backend indexes this result directly; a tuple reaches the model as one.
+    assert isinstance(out, torch.Tensor), f"extend returned {type(out).__name__}"
     assert torch.isfinite(out).all(), "FlashKDA output has non-finite values"
     assert torch.isfinite(st_fk).all(), "FlashKDA final state has non-finite values"
     # bf16 cross-implementation noise (chunk=16 CUTLASS vs chunk=64 Triton);
@@ -141,7 +142,7 @@ def test_flashkda_falls_back_without_lower_bound():
     ref_out, _ = _chunk_kda_ref(d, None)
 
     st_fk = d["pool"].clone()
-    out, _ = FlashKDAKernel().extend(
+    out = FlashKDAKernel().extend(
         d["q"].clone(),
         d["k"].clone(),
         d["v"].clone(),
@@ -171,7 +172,7 @@ def test_flashkda_spec_verify_falls_back():
     ref_out, _ = _chunk_kda_ref(d, LOWER_BOUND)
 
     st_fk = d["pool"].clone()
-    out, _ = FlashKDAKernel().extend(
+    out = FlashKDAKernel().extend(
         d["q"].clone(),
         d["k"].clone(),
         d["v"].clone(),
@@ -194,6 +195,50 @@ def test_flashkda_spec_verify_falls_back():
     assert _cos(ref_out, out) > 0.999, (
         f"spec-decode did not fall back: {_cos(ref_out, out):.4f}"
     )
+
+
+@pytest.mark.parametrize(
+    "seq_lens,num_heads,expect_fallback",
+    [
+        # Below the chunk size, and short sequences (win at any head count).
+        ([32], 16, True),
+        ([256], 16, False),
+        ([2048], 16, False),
+        ([2048], 4, False),  # short: no occupancy requirement
+        # Long sequences: the gate needs seqs x heads >= 32 CTAs, where "seqs"
+        # is total/longest so a batch padded with short requests does not count
+        # as full. Measured speedups are in the comment on the gate itself.
+        ([8192], 16, True),  # 16 CTAs -> 0.83x
+        ([8192, 1024], 16, True),  # 1.1 equivalents -> 0.85x
+        ([8192, 8192], 16, False),  # 32 CTAs -> 1.13x
+        ([8192, 4096, 4096], 16, False),  # 32 CTAs -> 1.12x
+        ([4096, 2048], 16, True),  # 1.5 equivalents, 24 CTAs
+        # Same batches, different per-rank head counts: the crossover moves.
+        ([8192, 8192], 8, True),  # 16 CTAs -> 0.77x, must not run FlashKDA
+        ([8192] * 4, 8, False),  # 32 CTAs -> 1.06x
+        ([8192] * 4, 4, True),  # 16 CTAs -> 0.82x
+        ([8192] * 8, 4, False),  # 32 CTAs -> 1.14x
+        ([8192], 32, False),  # 32 CTAs -> 1.07x, wins on one sequence
+    ],
+)
+def test_flashkda_batch_fill_gate(seq_lens, num_heads, expect_fallback):
+    """A gate that reads batch shape without the per-rank head count sends thin
+    long-sequence batches to FlashKDA, where it is slower than Triton."""
+    cu = torch.zeros(len(seq_lens) + 1, device="cuda", dtype=torch.int32)
+    cu[1:] = torch.tensor(seq_lens, device="cuda").cumsum(0)
+
+    # Both the CPU-list and the query_start_loc-derived paths must agree.
+    for lens_cpu in (seq_lens, None):
+        assert (
+            FlashKDAKernel._should_fall_back(
+                lower_bound=LOWER_BOUND,
+                is_spec_decode=False,
+                query_start_loc=cu,
+                extend_seq_lens_cpu=lens_cpu,
+                num_heads=num_heads,
+            )
+            is expect_fallback
+        ), f"seq_lens={seq_lens} heads={num_heads} extend_seq_lens_cpu={lens_cpu}"
 
 
 if __name__ == "__main__":
