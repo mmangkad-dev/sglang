@@ -16,30 +16,27 @@ rather than the next layer's input norm.
 
 from __future__ import annotations
 
-import functools
 import logging
-from typing import Callable, Optional, Sequence
+from typing import Optional, Sequence
 
 import torch
 
-from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.communicator_mhc import (
     MHCCommunicateWithAllReduceAndLayerNormFn,
     MHCLayerCommunicator,
 )
 from sglang.srt.layers.moe.cutedsl_ar_fusion import (
     CuteDSLFusionService,
+    LayerPredicate,
     MoeFinalizeHandoff,
     build_cutedsl_fusion_service,
     finalize_is_eligible,
     fusion_is_eligible,
+    reduces_over_the_plain_tp_group,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_exec, get_parallel
 
 logger = logging.getLogger(__name__)
-
-LayerPredicate = Callable[[torch.nn.Module], bool]
 
 
 class CuteDSLFusionMHCLayerCommunicator(MHCLayerCommunicator):
@@ -97,30 +94,18 @@ class CuteDSLFusionMHCLayerCommunicator(MHCLayerCommunicator):
 
     def _should_reduce_attn_output(self, forward_batch: ForwardBatch, m: int) -> bool:
         """Whether the fused collective may stand in for the post-attention AR."""
-        communicate_fn = self._communicate_with_all_reduce_and_layer_norm_fn
-        if isinstance(communicate_fn, functools.partial):
-            norm_fn = communicate_fn.func
-            residual_input_mode = communicate_fn.keywords.get("residual_input_mode")
-        else:
-            norm_fn = communicate_fn
-            residual_input_mode = None
-        parallel = get_parallel()
-        return (
-            fusion_is_eligible(
-                service=self.fusion_service,
-                forward_batch=forward_batch,
-                m=m,
-                mlp_mode=self.layer_scatter_modes.mlp_mode,
-                tp_size=self._context.tp_size,
-            )
-            # Only this branch reduces over the plain attn-tp group; the others
-            # scatter, gather for DP, or take the input-scattered path.
-            and norm_fn
-            is MHCCommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual
-            and residual_input_mode is ScatterMode.TP_ATTN_FULL
-            and self._context.attn_dp_size == 1
-            and parallel.attn_tp_size == parallel.tp_size
-            and not get_exec().comm.enable_quant_communications
+        return fusion_is_eligible(
+            service=self.fusion_service,
+            forward_batch=forward_batch,
+            m=m,
+            mlp_mode=self.layer_scatter_modes.mlp_mode,
+            tp_size=self._context.tp_size,
+        ) and reduces_over_the_plain_tp_group(
+            self._communicate_with_all_reduce_and_layer_norm_fn,
+            expected_gather_fn=(
+                MHCCommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual
+            ),
+            attn_dp_size=self._context.attn_dp_size,
         )
 
 

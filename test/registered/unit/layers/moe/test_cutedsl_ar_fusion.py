@@ -18,6 +18,7 @@ from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.moe.cutedsl_ar_fusion import (
     CuteDSLFusionLayerCommunicator,
+    CuteDSLFusionService,
     MoeFinalizeHandoff,
     is_supported_forward_mode,
     resolve_max_m,
@@ -72,6 +73,56 @@ class _TestConfig:
 )
 def test_supported_forward_modes(forward_mode, expected):
     assert is_supported_forward_mode(forward_mode) is expected
+
+
+def test_a_non_folding_workspace_is_decode_shaped():
+    """It writes a [M, hidden] norm it discards on every call. At a 16384-token
+    prefill chunk that write, and the workspace sized to hold it, dwarf what the
+    fused collective saves; at decode M it is noise."""
+    folding = CuteDSLFusionService(hidden_size=8, top_k=2, rms_epsilon=1e-6)
+    non_folding = CuteDSLFusionService(
+        hidden_size=8, top_k=2, rms_epsilon=1e-6, folds_residual_norm=False
+    )
+
+    assert folding.admits_extend is True
+    assert non_folding.admits_extend is False
+    assert is_supported_forward_mode(ForwardMode.EXTEND, admits_extend=False) is False
+    # TARGET_VERIFY is decode-shaped and stays in scope either way.
+    assert (
+        is_supported_forward_mode(ForwardMode.TARGET_VERIFY, admits_extend=False)
+        is True
+    )
+
+
+def test_a_decode_shaped_bound_drops_the_prefill_candidates():
+    """Covering max_prefill_tokens would size the NVLS region for a chunk the
+    fusion now declines, and carry its Lamport mailbox for the process's life."""
+    reset_context()
+    publish(
+        ServerArgs(
+            model_path="dummy",
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(max_bs=512, bs=[1, 64, 512]),
+                prefill=PhaseConfig(max_bs=4096, bs=[1024, 4096]),
+            ),
+        ),
+        role="test",
+    )
+    server_args = SimpleNamespace()
+
+    with patch(
+        "sglang.srt.layers.moe.cutedsl_ar_fusion.cutedsl_moe_max_num_tokens",
+        return_value=16384,
+    ):
+        assert resolve_max_m(server_args=server_args, max_running_requests=434) == 16384
+        assert (
+            resolve_max_m(
+                server_args=server_args,
+                max_running_requests=434,
+                admits_extend=False,
+            )
+            == 512
+        )
 
 
 @patch(
@@ -344,7 +395,7 @@ def test_hybrid_ep_tp_is_refused_like_the_base_communicator():
     """Skipping the post-experts reduction drops both legs; one fused
     collective cannot restore them."""
     comm = _eligible_communicator(successor=True)
-    comm.fusion_service = SimpleNamespace(supports=lambda m: True)
+    comm.fusion_service = SimpleNamespace(supports=lambda m: True, admits_extend=True)
     comm._context = SimpleNamespace(tp_size=4, attn_dp_size=1)
     comm.layer_scatter_modes = SimpleNamespace(mlp_mode=ScatterMode.FULL)
     forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
@@ -597,7 +648,7 @@ def test_mhc_declines_the_fused_all_reduce_off_the_plain_gather_branch():
 
     def _probe(communicate_fn):
         comm = _mhc_communicator(
-            fusion_service=SimpleNamespace(supports=lambda m: True),
+            fusion_service=SimpleNamespace(supports=lambda m: True, admits_extend=True),
             _communicate_with_all_reduce_and_layer_norm_fn=communicate_fn,
         )
         with (
@@ -624,11 +675,7 @@ def test_mhc_declines_the_fused_all_reduce_off_the_plain_gather_branch():
                 ),
             ),
             patch(
-                "sglang.srt.layers.moe.cutedsl_ar_fusion_mhc.get_parallel",
-                return_value=SimpleNamespace(tp_size=4, attn_tp_size=4),
-            ),
-            patch(
-                "sglang.srt.layers.moe.cutedsl_ar_fusion_mhc.get_exec",
+                "sglang.srt.layers.moe.cutedsl_ar_fusion.get_exec",
                 return_value=SimpleNamespace(
                     comm=SimpleNamespace(enable_quant_communications=False)
                 ),
@@ -656,6 +703,26 @@ def test_mhc_declines_the_fused_all_reduce_off_the_plain_gather_branch():
         )
         is False
     )
+
+
+def test_mhc_never_hands_its_all_reduce_to_the_next_layer():
+    """Deferring and fusing-onward are exclusive here: the decoder skips
+    postprocess_layer when it fuses, and postprocess_layer is where hc_post runs
+    and where the handoff is consumed. A True here drops both silently."""
+    from sglang.srt.layers.moe.cutedsl_ar_fusion_mhc import (
+        CuteDSLFusionMHCLayerCommunicator,
+    )
+
+    comm = _mhc_communicator(may_defer_moe_finalize=True)
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE, input_ids=torch.zeros(8)
+    )
+
+    with patch.object(
+        CuteDSLFusionMHCLayerCommunicator, "_should_use_finalize", return_value=True
+    ):
+        assert comm.should_defer_moe_finalize(forward_batch) is True
+        assert comm.should_fuse_mlp_allreduce_with_next_layer(forward_batch) is False
 
 
 def test_mhc_install_builds_a_non_folding_workspace_for_every_layer():
