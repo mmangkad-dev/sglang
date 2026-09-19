@@ -10,14 +10,15 @@ entries live in is placed.
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=57, suite="base-a-test-cpu")
-register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=70, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
+import functools
 import multiprocessing
 import os
 import tempfile
 import traceback
 import unittest
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -189,29 +190,55 @@ class TestAutotuneStoreRoot(CustomTestCase):
         self.addCleanup(_autotune_store_root.cache_clear)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        self.custom = str(Path(self.tmp.name) / "custom")
 
     def test_reuse_root_is_stable_across_contexts(self):
         with autotune.envs.SGLANG_CACHE_DIR.override(self.tmp.name):
-            root = _autotune_store_root(True)
-            self.assertEqual(root, _autotune_store_root(True))
+            root = _autotune_store_root(True, frozenset())
+            self.assertEqual(root, _autotune_store_root(True, frozenset()))
             self.assertEqual(root, Path(self.tmp.name) / "flashinfer" / "autotune")
 
     def test_fresh_run_root_is_scoped_but_stable_within_the_process(self):
         # Every context in a process must publish to one store, or the
         # finalize reload cannot see an earlier context's winners.
         with autotune.envs.SGLANG_CACHE_DIR.override(self.tmp.name):
-            root = _autotune_store_root(False)
-            self.assertEqual(root, _autotune_store_root(False))
-            self.assertNotEqual(root, _autotune_store_root(True))
+            root = _autotune_store_root(False, frozenset())
+            self.assertEqual(root, _autotune_store_root(False, frozenset()))
+            self.assertNotEqual(root, _autotune_store_root(True, frozenset()))
             self.assertEqual(root.parent.name, "runs")
 
-    def test_flashinfer_override_wins(self):
-        # An explicit FlashInfer root asks for FlashInfer's own placement.
+    def test_flashinfer_override_places_the_store(self):
         with (
             autotune.envs.SGLANG_CACHE_DIR.override(self.tmp.name),
-            patch.dict(os.environ, {"FLASHINFER_AUTOTUNE_CACHE_DIR": self.tmp.name}),
+            patch.dict(os.environ, {"FLASHINFER_AUTOTUNE_CACHE_DIR": self.custom}),
         ):
-            self.assertIsNone(_autotune_store_root(True))
+            self.assertEqual(_autotune_store_root(True, frozenset()), Path(self.custom))
+
+    def test_a_custom_root_still_isolates_a_fresh_run(self):
+        # Reuse off must not read or overwrite the reusable store, wherever it
+        # was placed; a custom root is placement, never a reuse decision.
+        with (
+            autotune.envs.SGLANG_CACHE_DIR.override(self.tmp.name),
+            patch.dict(os.environ, {"FLASHINFER_AUTOTUNE_CACHE_DIR": self.custom}),
+        ):
+            reusable = _autotune_store_root(True, frozenset())
+            _autotune_store_root.cache_clear()
+            fresh = _autotune_store_root(False, frozenset())
+        self.assertNotEqual(fresh, reusable)
+        self.assertIn("runs", fresh.parts)
+        self.assertIn(Path(self.custom), fresh.parents)
+
+    def test_a_skip_policy_gets_its_own_subtree(self):
+        # The store is shared and the skip only applies while tuning, so a
+        # skipping deployment must not be able to read an entry that a
+        # non-skipping one published for the op it excludes.
+        with autotune.envs.SGLANG_CACHE_DIR.override(self.tmp.name):
+            plain = _autotune_store_root(True, frozenset())
+            skipping = _autotune_store_root(True, frozenset({"mxfp8_gemm"}))
+            other = _autotune_store_root(True, frozenset({"fp4_gemm"}))
+        self.assertNotEqual(skipping, plain)
+        self.assertNotEqual(skipping, other)
+        self.assertIn(plain, skipping.parents)
 
 
 class TestAutotuneMeasurementPolicy(CustomTestCase):
@@ -321,7 +348,7 @@ class TestAutotuneStoreLifecycle(CustomTestCase):
         from flashinfer.autotuner import _collect_metadata
 
         return _managed_autotune_store(
-            _autotune_store_root(reuse_cache), _collect_metadata()
+            _autotune_store_root(reuse_cache, frozenset()), _collect_metadata()
         )
 
     def test_target_tactics_survive_the_draft_pass_and_stay_attached(self):
@@ -356,6 +383,190 @@ class TestAutotuneStoreLifecycle(CustomTestCase):
             self.assertNotEqual(fresh.env_dir, reused.env_dir)
             self.assertIsNone(fresh.lookup("target_prefill"))
             self.assertEqual(self.tuner._managed_cache.env_dir, fresh.env_dir)
+
+
+# Forward calls made by the probe runner, kept module-level on purpose:
+# TunableRunner.__hash__ folds in the instance __dict__, so counting on the
+# runner would change its identity mid-tune.
+PROBE_CALLS: list = []
+
+
+@functools.lru_cache(maxsize=1)
+def probe_runner_cls():
+    """Minimal tunable runner, so a test can count real profiling work.
+
+    Built on first use: the module is collected on CPU runners too, and the
+    base class only exists to subclass once FlashInfer is importable.
+    """
+    from flashinfer.autotuner import TunableRunner
+
+    class ProbeRunner(TunableRunner):
+        def __init__(self, tactics=(0, 1, 2)):
+            self.tactics = tactics
+
+        def get_valid_tactics(self, inputs, profile, **kwargs):
+            return list(self.tactics)
+
+        def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+            PROBE_CALLS.append(tactic)
+            return inputs[0] * 1.0
+
+    return ProbeRunner
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "FlashInfer requires CUDA")
+class TestAutotuneTacticSelection(CustomTestCase):
+    """What warmup decides, not just where it stores it: which tactic serving
+    runs, and how much profiling a restart pays for."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self._restart)
+        self.runner = SimpleNamespace(
+            device="cuda",
+            forward_stream=torch.cuda.Stream(),
+            tp_group=SimpleNamespace(world_size=1),
+        )
+        self._restart()
+
+    def _restart(self):
+        """Drop every in-process tuning result, as a server restart would."""
+        from flashinfer.autotuner import AutoTuner
+
+        AutoTuner.get().clear_cache()
+        _autotune_store_root.cache_clear()
+        PROBE_CALLS.clear()
+
+    def _config(self, cold_l2=False):
+        from flashinfer.autotuner import DynamicTensorSpec, TuningConfig
+
+        return TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    input_idx=(0,),
+                    dim_idx=(0,),
+                    gen_tuning_buckets=(8,),
+                    map_to_tuning_buckets=lambda x: 8,
+                ),
+            ),
+            use_cold_l2_cache=cold_l2,
+        )
+
+    def _choose(self, op, config=None):
+        from flashinfer.autotuner import AutoTuner
+
+        inputs = [torch.randn(8, 16, device="cuda", dtype=torch.bfloat16)]
+        return AutoTuner.get().choose_one(
+            op, [probe_runner_cls()()], config or self._config(), inputs
+        )
+
+    @contextmanager
+    def _warmup(self, skip_ops=frozenset()):
+        with (
+            autotune.envs.SGLANG_CACHE_DIR.override(self.tmp.name),
+            patch.object(
+                autotune,
+                "get_flashinfer_autotune_skip_ops",
+                return_value=set(skip_ops),
+            ),
+        ):
+            with autotune.flashinfer_autotune_context(self.runner, run_lm_head=False):
+                yield
+
+    def _store(self, skip_ops=frozenset()):
+        from flashinfer.autotuner import _collect_metadata
+
+        with autotune.envs.SGLANG_CACHE_DIR.override(self.tmp.name):
+            root = _autotune_store_root(True, frozenset(skip_ops))
+        return _managed_autotune_store(root, _collect_metadata())
+
+    def test_a_restart_reuses_published_tactics_without_profiling(self):
+        with self._warmup():
+            self._choose("probe_reuse")
+        tuned_calls = len(PROBE_CALLS)
+        _, first = self._choose("probe_reuse")
+        self.assertGreater(tuned_calls, 0, "nothing was profiled, so nothing is proven")
+
+        self._restart()
+        with self._warmup():
+            self._choose("probe_reuse")
+        self.assertEqual(
+            PROBE_CALLS, [], "a warm store must cost no profiling on restart"
+        )
+        _, second = self._choose("probe_reuse")
+        self.assertEqual(second, first)
+
+    def test_a_peer_publish_during_tuning_is_not_observed(self):
+        # Tuning is collective: a hit skips a profile, so a rank that picked up
+        # a peer's entry mid-tune would stop reducing while its peers wait.
+        with self._warmup():
+            self._choose("probe_peer")
+        donated = sorted(self._store().entries_dir.glob("*.json"))
+        self.assertTrue(donated, "the tune published nothing to donate")
+        entry = donated[0].read_text()
+
+        self.tmp.cleanup()
+        self.tmp = tempfile.TemporaryDirectory()
+        self._restart()
+        with self._warmup():
+            store = self._store()
+            store._ensure_dirs()
+            (store.entries_dir / donated[0].name).write_text(entry)
+            PROBE_CALLS.clear()
+            self._choose("probe_peer")
+        self.assertGreater(
+            len(PROBE_CALLS),
+            0,
+            "an entry published after attach was served, so ranks can disagree",
+        )
+
+    def test_a_skipped_op_keeps_the_fallback_outside_the_warmup_context(self):
+        # --flashinfer-autotune-skip-ops documents a heuristic fallback, and the
+        # op is skipped because it faults. The skip only applies inside the
+        # tuning context, so the store must not hand serving a tactic for it.
+        with self._warmup():
+            self._choose("probe_skipped")
+        self.assertGreater(len(PROBE_CALLS), 0)
+        self.assertTrue(list(self._store().entries_dir.glob("*.json")))
+
+        self._restart()
+        skipping = frozenset({"probe_skipped"})
+        with self._warmup(skip_ops=skipping):
+            self._choose("probe_skipped")
+        self.assertEqual(PROBE_CALLS, [], "a skipped op must not be profiled")
+        with autotune.envs.SGLANG_CACHE_DIR.override(self.tmp.name):
+            _, serving_tactic = self._choose("probe_skipped")
+        self.assertEqual(
+            serving_tactic, -1, "serving replayed a tactic for a skipped op"
+        )
+
+    def test_cold_l2_entries_are_not_reused_on_this_flashinfer_build(self):
+        """Known limitation of the pinned FlashInfer, pinned here so it is
+        visible rather than silent.
+
+        ``AutoTuner.search_cache`` skips every file-backed source while tuning
+        whenever the requested profiling policy differs from the legacy default
+        -- a rule meant for v1 entries, which record no per-entry L2
+        provenance. Managed v2 entries do record it, in the environment hash,
+        so they should be exempt. Until they are, every cold-L2 operation
+        (the FlashInfer MoE runners request it themselves) re-profiles on each
+        start. Invert this assertion when the pinned build separates the two.
+        """
+        cold = self._config(cold_l2=True)
+        with self._warmup():
+            self._choose("probe_cold", cold)
+        self.assertGreater(len(PROBE_CALLS), 0)
+        self.assertTrue(list(self._store().entries_dir.glob("*.json")))
+
+        self._restart()
+        with self._warmup():
+            self._choose("probe_cold", cold)
+        self.assertGreater(
+            len(PROBE_CALLS),
+            0,
+            "cold-L2 reuse now works; update the docs and this test",
+        )
 
 
 if __name__ == "__main__":

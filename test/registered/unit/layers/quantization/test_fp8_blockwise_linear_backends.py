@@ -428,7 +428,7 @@ class TestBlockFp8AsMxfp8PrefillAutotune(_LinearBackendCheck):
     def test_prefill_tuning_leaves_decode_bit_identical(self):
         """Tuning the prefill buckets must not move the decode tactic: below the
         stamped min_tokens the output has to stay bit-for-bit what it was."""
-        from flashinfer.autotuner import autotune
+        from flashinfer import autotune_v2
 
         from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 
@@ -448,7 +448,10 @@ class TestBlockFp8AsMxfp8PrefillAutotune(_LinearBackendCheck):
             config=SimpleNamespace(model_type="deepseek_v41"),
             model=torch.nn.ModuleList([layer]),
         )
-        with autotune(True):
+        # v2 races the heuristic fallback as a candidate, so only a v2 context
+        # selects the tactics serving will run. persistent_cache=False keeps
+        # the selection in memory and off the developer's store.
+        with autotune_v2(persistent_cache=False):
             DeepseekV4ForCausalLM.autotune_prefill_kernels(
                 model, 4096, dtype=torch.bfloat16
             )

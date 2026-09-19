@@ -28,7 +28,7 @@ import torch
 
 # ---- FlashInfer ----
 from flashinfer import __version__ as flashinfer_version
-from flashinfer.autotuner import autotune
+from flashinfer import autotune_v2
 from flashinfer.fused_moe import (
     cutlass_fused_moe,
     interleave_moe_scales_for_sm90_mixed_gemm,
@@ -240,8 +240,9 @@ def make_flashinfer_runner(
         )
 
     if autotuned:
-        # Populate FlashInfer's tactic cache once before timing.
-        with autotune(True):
+        # Populate FlashInfer's tactic cache once before timing, selecting the
+        # way serving does (v2 races the heuristic fallback as a candidate).
+        with autotune_v2(persistent_cache=False):
             _call()
 
     return _call

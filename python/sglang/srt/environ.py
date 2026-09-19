@@ -1094,6 +1094,13 @@ class Envs:
     SGLANG_FLASHINFER_AUTOTUNE_MEASURE = EnvStr("auto")
     # Force cold-/hot-L2 profiling during autotune. None inherits FlashInfer's
     # per-op default. Also part of the store identity.
+    #
+    # Through flashinfer 0.7.0rc3, any op profiled cold-L2 bypasses the managed
+    # store while tuning (search_cache applies a check meant for v1 entries,
+    # which carry no per-entry L2 provenance, to v2 entries whose environment
+    # hash already records it). Setting this True therefore costs warm-start
+    # reuse for every op; the MoE runners that request cold L2 themselves
+    # already pay it. Drop this note once the pinned build separates the two.
     SGLANG_FLASHINFER_AUTOTUNE_COLD_L2 = EnvBool(None)
     # Also autotune one EXTEND-shaped dummy at max_prefill_tokens during
     # warmup. Opt-in: the extra forward needs transient activation headroom

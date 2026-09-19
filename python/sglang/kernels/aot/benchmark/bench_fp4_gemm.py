@@ -6,8 +6,7 @@ from typing import List, Tuple
 
 import torch
 import triton
-from flashinfer import fp4_quantize, mm_fp4
-from flashinfer.autotuner import autotune
+from flashinfer import autotune_v2, fp4_quantize, mm_fp4
 from flashinfer.jit.core import logger as flashinfer_logger
 from flashinfer.testing import bench_gpu_time
 
@@ -220,7 +219,7 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
     res_fi = torch.empty((M, N), dtype=dtype, device="cuda")
 
     if provider == "cutlass":
-        with autotune():
+        with autotune_v2(persistent_cache=False):
             _run_mm_fp4(
                 a_fp4,
                 b_fp4_T,
@@ -245,7 +244,7 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
             use_cuda_graph=True,
         )
     elif provider == "cudnn":
-        with autotune():
+        with autotune_v2(persistent_cache=False):
             _run_mm_fp4(
                 a_fp4,
                 b_fp4_T,
@@ -272,7 +271,7 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
     elif provider == "trtllm":
         a_sf_u8 = a_scale_interleaved.to(torch.uint8)
         b_sf_u8_T = b_sf_T.to(torch.uint8)
-        with autotune():
+        with autotune_v2(persistent_cache=False):
             _run_mm_fp4(
                 a_fp4,
                 b_fp4_T,
@@ -289,7 +288,7 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
             use_cuda_graph=True,
         )
     elif provider == "cute-dsl":
-        with autotune():
+        with autotune_v2(persistent_cache=False):
             _run_mm_fp4(
                 a_fp4,
                 b_fp4_T,
@@ -314,7 +313,7 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
             use_cuda_graph=True,
         )
     elif provider == "auto":
-        with autotune():
+        with autotune_v2(persistent_cache=False):
             _run_mm_fp4(
                 a_fp4,
                 b_fp4_T,

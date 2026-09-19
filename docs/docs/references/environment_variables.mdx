@@ -174,7 +174,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_FLASHINFER_AUTOTUNE_COLD_L2`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force cold- or hot-L2 profiling during autotune. Unset inherits FlashInfer's per-op default. Also part of the store identity.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force cold- or hot-L2 profiling during autotune. Unset inherits FlashInfer's per-op default. Also part of the store identity. Note: through flashinfer 0.7.0rc3, cold-L2 profiling bypasses the managed store while tuning, so setting this to `1` costs warm-start reuse for every operation.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>unset</td>
     </tr>
     <tr>
