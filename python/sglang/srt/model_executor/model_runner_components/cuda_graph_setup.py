@@ -48,7 +48,6 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.utils import (
-    ceil_align,
     get_available_gpu_memory,
     get_cuda_graph_batch_size_alignment,
     log_info_on_rank0,
@@ -70,14 +69,18 @@ def _resolve_prefill_capture_num_tokens(
     # An unaligned bucket shards unequally across attn_tp,
     # and the attn->MLP reduce-scatter deadlocks on the mismatch.
     alignment = get_cuda_graph_batch_size_alignment()
-    # Bound after rounding; rounding up can exceed what the capture batch holds.
-    return sorted(
-        {
-            aligned
-            for num_tokens in capture_num_tokens
-            if (aligned := ceil_align(num_tokens, alignment)) <= max_capture_tokens
-        }
-    )
+    configured = sorted(set(capture_num_tokens))
+    # Drop rather than round up; attention backends size fixed graph buffers
+    # from the configured list before capture, so a grown bucket overruns them.
+    aligned = [num_tokens for num_tokens in configured if num_tokens % alignment == 0]
+    if aligned != configured:
+        logger.info(
+            "Prefill CUDA graph buckets must be multiples of %d for the attn-TP "
+            "reduce-scatter; dropping %s.",
+            alignment,
+            [num_tokens for num_tokens in configured if num_tokens % alignment],
+        )
+    return [num_tokens for num_tokens in aligned if num_tokens <= max_capture_tokens]
 
 
 def _align_pipeline_layers(layers: list, layer_model) -> list:

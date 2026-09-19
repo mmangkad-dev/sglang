@@ -593,21 +593,18 @@ class TestResolvePrefillCaptureNumTokens(CustomTestCase):
                 ),
             )
 
-    def test_unaligned_buckets_round_up_and_collide(self):
-        # 4 and 8 both land on 8, so rounding must also dedupe.
+    def test_unaligned_buckets_are_dropped(self):
         self.assertEqual(
             self._resolve([4, 8, 12, 16, 20, 24, 28, 32], 8), [8, 16, 24, 32]
         )
 
-    def test_a_lone_unaligned_bucket_rounds_up_instead_of_being_dropped(self):
-        # Filtering would pass the case above too, but leaves
-        # --cuda-graph-bs-prefill 28 with no bucket at all.
-        self.assertEqual(self._resolve([28], 8), [32])
+    def test_no_bucket_grows_past_the_configured_maximum(self):
+        # Attention backends size fixed graph buffers from the configured list
+        # before capture, so rounding 1000 up to 1008 would overrun them.
+        self.assertEqual(self._resolve([1000], 16), [])
 
-    def test_the_capacity_bound_applies_after_rounding(self):
-        # 28 fits a 28-token capacity unrounded; rounded to 32 it does not.
-        self.assertEqual(self._resolve([28], 8, max_capture_tokens=28), [])
-        self.assertEqual(self._resolve([28], 1, max_capture_tokens=28), [28])
+    def test_the_capacity_bound_still_applies(self):
+        self.assertEqual(self._resolve([8, 64], 8, max_capture_tokens=32), [8])
 
 
 if __name__ == "__main__":
