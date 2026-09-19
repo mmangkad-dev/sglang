@@ -17,6 +17,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+    _resolve_prefill_capture_num_tokens,
     capture_prefill_graph,
 )
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
@@ -200,6 +201,52 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             )
 
         self.assertIs(capture.runner, prefill_runner)
+
+    def test_no_fitting_bucket_still_returns_a_graph_capture(self):
+        """Callers read .runner / .memory_usage / .time_usage off the result, so
+        the no-bucket exit must hand back a GraphCapture like every other one.
+        """
+        eager_runner = object()
+        override = get_context().override_server_args(
+            enable_lora=False,
+            enable_prefill_cp=False,
+            pp_size=1,
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(bs=[4096], backend=Backend.BREAKABLE)
+            ),
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        model_runner = SimpleNamespace(
+            device="cuda",
+            gpu_id=0,
+            is_draft_worker=False,
+            lora_manager=None,
+            spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
+            server_args=SimpleNamespace(),
+            model=SimpleNamespace(),
+            # 1 request slot x 8-token context => nothing as large as 4096 fits.
+            model_config=SimpleNamespace(context_len=8, num_hidden_layers=1),
+            layer_info=SimpleNamespace(start_layer=0, end_layer=1),
+            req_to_token_pool=SimpleNamespace(size=1),
+        )
+        language_model = SimpleNamespace(layers=[object()])
+
+        with (
+            patch.object(graph_setup, "check_cuda_graph_backend", return_value=False),
+            patch.object(
+                graph_setup, "resolve_language_model", return_value=language_model
+            ),
+        ):
+            capture = capture_prefill_graph(
+                model_runner=model_runner,
+                eager_runner=eager_runner,
+            )
+
+        self.assertIsInstance(capture, graph_setup.GraphCapture)
+        self.assertIs(capture.runner, eager_runner)
+        self.assertEqual(capture.memory_usage, {"prefill": 0})
+        self.assertEqual(capture.time_usage, {"prefill": 0})
 
     def test_eagle_target_tc_piecewise_skips_last_mode_capture(self):
         eager_runner = object()
@@ -526,6 +573,41 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
         forward_batch.extend_prefix_lens_cpu = [9, 1]
         self.assertFalse(runner.can_run_graph(forward_batch))
+
+
+class TestResolvePrefillCaptureNumTokens(CustomTestCase):
+    """A prefill bucket that does not divide across the attention TP group
+    shards unequally and deadlocks capture in the reduce-scatter.
+    """
+
+    NO_LIMIT = 1 << 30
+
+    def _resolve(self, buckets, alignment, max_capture_tokens=None):
+        with patch.object(
+            graph_setup, "get_cuda_graph_batch_size_alignment", return_value=alignment
+        ):
+            return _resolve_prefill_capture_num_tokens(
+                capture_num_tokens=list(buckets),
+                max_capture_tokens=(
+                    self.NO_LIMIT if max_capture_tokens is None else max_capture_tokens
+                ),
+            )
+
+    def test_unaligned_buckets_round_up_and_collide(self):
+        # 4 and 8 both land on 8, so rounding must also dedupe.
+        self.assertEqual(
+            self._resolve([4, 8, 12, 16, 20, 24, 28, 32], 8), [8, 16, 24, 32]
+        )
+
+    def test_a_lone_unaligned_bucket_rounds_up_instead_of_being_dropped(self):
+        # Filtering would pass the case above too, but leaves
+        # --cuda-graph-bs-prefill 28 with no bucket at all.
+        self.assertEqual(self._resolve([28], 8), [32])
+
+    def test_the_capacity_bound_applies_after_rounding(self):
+        # 28 fits a 28-token capacity unrounded; rounded to 32 it does not.
+        self.assertEqual(self._resolve([28], 8, max_capture_tokens=28), [])
+        self.assertEqual(self._resolve([28], 1, max_capture_tokens=28), [28])
 
 
 if __name__ == "__main__":
