@@ -74,11 +74,11 @@ def _resolve_prefill_capture_num_tokens(
     # from the configured list before capture, so a grown bucket overruns them.
     aligned = [num_tokens for num_tokens in configured if num_tokens % alignment == 0]
     if aligned != configured:
-        logger.info(
-            "Prefill CUDA graph buckets must be multiples of %d for the attn-TP "
-            "reduce-scatter; dropping %s.",
-            alignment,
-            [num_tokens for num_tokens in configured if num_tokens % alignment],
+        dropped = [num_tokens for num_tokens in configured if num_tokens % alignment]
+        log_info_on_rank0(
+            logger,
+            f"Prefill CUDA graph buckets must be multiples of {alignment} for "
+            f"the attn-TP reduce-scatter; dropping {dropped}.",
         )
     return [num_tokens for num_tokens in aligned if num_tokens <= max_capture_tokens]
 
