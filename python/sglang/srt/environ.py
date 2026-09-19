@@ -1083,7 +1083,18 @@ class Envs:
     SGLANG_OPT_SM120_DIRECT_SWA_KV = EnvBool(False)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
+    # Reuse previously tuned tactics from FlashInfer's managed (autotune_v2)
+    # store. 0 tunes from scratch into a run-scoped store instead, so a
+    # benchmark measures tuning as well as serving.
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
+    # How FlashInfer measures candidate tactics, matched to how sglang serves
+    # them: "auto" (FlashInfer's own default, per-op), "cuda_graph" (profile
+    # under capture + replay, host cost excluded) or "eager". Part of the
+    # store identity, so entries tuned under different modes never mix.
+    SGLANG_FLASHINFER_AUTOTUNE_MEASURE = EnvStr("auto")
+    # Force cold-/hot-L2 profiling during autotune. None inherits FlashInfer's
+    # per-op default. Also part of the store identity.
+    SGLANG_FLASHINFER_AUTOTUNE_COLD_L2 = EnvBool(None)
     # Also autotune one EXTEND-shaped dummy at max_prefill_tokens during
     # warmup. Opt-in: the extra forward needs transient activation headroom
     # that small-VRAM or tightly-packed configs may not have.

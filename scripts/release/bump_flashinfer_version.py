@@ -10,6 +10,7 @@ from utils import compare_versions, get_repo_root, normalize_version, validate_v
 FILES_TO_UPDATE = [
     Path("python/pyproject.toml"),
     Path("docker/Dockerfile"),
+    Path("docker/Dockerfile.cu134"),
     Path("python/sglang/srt/entrypoints/engine.py"),
     Path("python/sglang/srt/utils/common.py"),
 ]
@@ -48,7 +49,7 @@ def replace_flashinfer_version(
         new_content = new_content.replace(
             f"flashinfer_cubin=={old_version}", f"flashinfer_cubin=={new_version}"
         )
-    elif name == "Dockerfile":
+    elif name.startswith("Dockerfile"):
         new_content = re.sub(
             rf"(ARG FLASHINFER_VERSION=){re.escape(old_version)}",
             rf"\g<1>{new_version}",

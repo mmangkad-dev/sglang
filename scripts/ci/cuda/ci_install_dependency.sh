@@ -438,7 +438,10 @@ uninstall_stale_flashinfer() {
 
     FLASHINFER_UNINSTALL="flashinfer-python"
     [ "$UNINSTALL_CUBIN" = true ] && FLASHINFER_UNINSTALL="$FLASHINFER_UNINSTALL flashinfer-cubin"
-    [ "$UNINSTALL_JIT_CACHE" = true ] && FLASHINFER_UNINSTALL="$FLASHINFER_UNINSTALL flashinfer-jit-cache"
+    # The per-arch providers install into the shim's own package tree, so one left
+    # behind would serve cubins from the wrong flashinfer version.
+    FLASHINFER_JIT_PROVIDERS=$(pip list --format=freeze 2>/dev/null | grep -Po '^flashinfer-jit-cache-sm[0-9a-z]+(?==)' | tr '\n' ' ' || true)
+    [ "$UNINSTALL_JIT_CACHE" = true ] && FLASHINFER_UNINSTALL="$FLASHINFER_UNINSTALL flashinfer-jit-cache $FLASHINFER_JIT_PROVIDERS"
     $PIP_UNINSTALL_CMD $FLASHINFER_UNINSTALL $PIP_UNINSTALL_SUFFIX || true
     $PIP_UNINSTALL_CMD opencv-python opencv-python-headless $PIP_UNINSTALL_SUFFIX || true
 

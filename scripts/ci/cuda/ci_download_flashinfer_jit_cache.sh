@@ -1,6 +1,9 @@
 #!/bin/bash
 # Install flashinfer-jit-cache with caching and retry logic (flashinfer.ai can have transient DNS issues).
-# The jit-cache wheel is 1.2+ GB, so we skip the download entirely if already installed.
+# The jit-cache is 1.2+ GB, so we skip the download entirely if already installed.
+# Since 0.7.0 flashinfer-jit-cache is a shim over one distribution per SM arch;
+# `pip download` fetches those alongside it, and --find-links resolves them from
+# the cache dir instead of PyPI, which does not carry them.
 #
 # Required environment (caller must export or set):
 #   UNINSTALL_JIT_CACHE          — literal true/false (skip download when false)
@@ -30,7 +33,7 @@ if [ "$FLASHINFER_JIT_CACHE_INSTALLED" = false ]; then
 
     if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
         echo "Found cached flashinfer wheel: $CACHED_WHEEL"
-        if $PIP_CMD install "$CACHED_WHEEL" $PIP_INSTALL_SUFFIX; then
+        if $PIP_CMD install "$CACHED_WHEEL" --find-links "${FLASHINFER_CACHE_DIR}" $PIP_INSTALL_SUFFIX; then
             FLASHINFER_JIT_CACHE_INSTALLED=true
             echo "Successfully installed flashinfer-jit-cache from cache"
         else
@@ -48,7 +51,7 @@ if [ "$FLASHINFER_JIT_CACHE_INSTALLED" = false ]; then
 
                 CACHED_WHEEL=$(find "${FLASHINFER_CACHE_DIR}" -name "${FLASHINFER_WHEEL_PATTERN}" -type f 2>/dev/null | head -n 1)
                 if [ -n "$CACHED_WHEEL" ] && [ -f "$CACHED_WHEEL" ]; then
-                    if $PIP_CMD install "$CACHED_WHEEL" $PIP_INSTALL_SUFFIX; then
+                    if $PIP_CMD install "$CACHED_WHEEL" --find-links "${FLASHINFER_CACHE_DIR}" $PIP_INSTALL_SUFFIX; then
                         FLASHINFER_JIT_CACHE_INSTALLED=true
                         echo "Successfully downloaded and installed flashinfer-jit-cache"
                         break
