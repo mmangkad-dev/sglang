@@ -19,11 +19,9 @@ class TestLlama8BNVFP4KVCacheSM120(GSM8KMixin, DefaultServerBase):
     """Llama-3.1-8B-Instruct-NVFP4 with NVFP4 KV cache on SM120."""
 
     model = "nvidia/Llama-3.1-8B-Instruct-NVFP4"
-    # Full GSM8K measured locally with 1319 requested / 1314 scored:
-    # - FP8 KV: 0.6461187214611872
-    # - NVFP4 KV: 0.632420091324201
-    # Keep the threshold 0.015 below the NVFP4 KV score.
-    gsm8k_accuracy_thres = 0.632420091324201 - 0.015
+    # Measured over 13 greedy runs on one RTX 5090: mean 0.62077, stdev 0.00895.
+    # 0.59 is 3.4 stdev below the mean; do not re-derive it from a single run.
+    gsm8k_accuracy_thres = 0.59
     gsm8k_num_questions = 1319
     gsm8k_num_threads = 200
 
