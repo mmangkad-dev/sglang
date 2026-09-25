@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 )
 
 # MLA FP8 KV cache test with MGSM evaluation
-register_cuda_ci(est_time=106, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=197, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=800, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -28,6 +28,11 @@ class TestMLA(CustomTestCase, MGSMEnMixin):
             "--trust-remote-code",
             "--kv-cache-dtype",
             "fp8_e5m2",
+            # Bound the Triton MLA decode buffers (sized by batch) on a 32 GB card.
+            "--mem-fraction-static",
+            "0.7",
+            "--max-running-requests",
+            "64",
             # Pin MoE expert dispatch and kernel reduction order so MGSM
             # scores don't drift across runs. The eval already uses greedy
             # decoding, but FP8 dequant + non-deterministic MoE top-k

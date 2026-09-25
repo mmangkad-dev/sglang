@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(est_time=276, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=276, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=261, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -122,7 +122,7 @@ class TestSRTEngine(CustomTestCase):
         )
         bench_args = BenchArgs(num_prompts=10)
         result = throughput_test(server_args=server_args, bench_args=bench_args)
-        self.assertGreater(result["total_throughput"], 3000)
+        self.assertGreater(result["total_throughput"], 2500)
 
     def test_8_engine_async_encode_consistency(self):
         prompt = "Today is a sunny day and I like"
