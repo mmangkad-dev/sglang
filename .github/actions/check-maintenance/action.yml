@@ -22,6 +22,10 @@ runs:
         PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ env.PR_TEST_BYPASS_MAINTENANCE_ON_MAIN }}
       with:
         github-token: ${{ inputs.github-token }}
+        # Retry transient API failures (5xx, dropped connections) so a blip
+        # does not fail the gate open. 4xx responses such as a 404 for an
+        # unknown MIN_BASE_SHA are exempt by default and fail fast.
+        retries: 2
         script: |
           const MAINTENANCE_ISSUE = 21065;
           const { owner, repo } = context.repo;
@@ -40,8 +44,8 @@ runs:
             return;
           }
 
-          // Fail-open only when the API call itself fails (network blip,
-          // missing token scope): CI proceeds, loudly.
+          // Fail-open only when the API call itself fails after retries
+          // (outage, missing token scope): CI proceeds, loudly.
           let issue;
           try {
             ({ data: issue } = await github.rest.issues.get({ owner, repo, issue_number: MAINTENANCE_ISSUE }));
