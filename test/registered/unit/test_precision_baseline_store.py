@@ -106,127 +106,356 @@ class TestRowRecencyKey(CustomTestCase):
         self.assertEqual(hfs._row_recency_key(row, 5), (-1, 5))
 
 
-class TestSelectLatestRun(CustomTestCase):
-    def test_picks_highest_recency(self):
+def _row(run_path, idx, *, label="passed", runner=None, trust=None, **extra):
+    row = {"model": "org/m", "run_path": run_path, "push_index": idx}
+    if label is not None:
+        row["pass_label"] = label
+    if runner is not None:
+        row["runner_name"] = runner
+    if trust is not None:
+        row["trust"] = trust
+    row.update(extra)
+    return row
+
+
+def _paths(refs):
+    return [r.run_path for r in refs]
+
+
+class TestRowTrust(CustomTestCase):
+    def test_explicit_trust_wins(self):
+        self.assertEqual(
+            hfs.row_trust({"pass_label": "passed", "trust": "unconfirmed"}),
+            hfs.TRUST_UNCONFIRMED,
+        )
+
+    def test_legacy_passed_is_confirmed(self):
+        self.assertEqual(hfs.row_trust({"pass_label": "passed"}), hfs.TRUST_CONFIRMED)
+
+    def test_legacy_established_is_unconfirmed(self):
+        # A forced refresh was never compared against anything.
+        self.assertEqual(
+            hfs.row_trust({"pass_label": "baseline_established"}),
+            hfs.TRUST_UNCONFIRMED,
+        )
+
+    def test_missing_label_is_unconfirmed(self):
+        self.assertEqual(hfs.row_trust({}), hfs.TRUST_UNCONFIRMED)
+
+
+class TestSelectBaselines(CustomTestCase):
+    def test_picks_latest_confirmed(self):
         rows = _make_rows(3)
-        result = hfs._select_latest_run(rows, model="org/model")
-        self.assertEqual(result, rows[-1]["run_path"])
+        for r in rows:
+            r["pass_label"] = "passed"
+        refs = hfs._select_baselines(rows, model="org/model")
+        self.assertEqual(_paths(refs), [rows[-1]["run_path"]])
+        self.assertTrue(refs[0].confirmed)
 
     def test_filters_by_model(self):
         rows = [
             {"model": "a/model", "run_path": "a", "push_index": 1},
             {"model": "b/model", "run_path": "b", "push_index": 2},
         ]
-        self.assertEqual(hfs._select_latest_run(rows, model="a/model"), "a")
+        self.assertEqual(_paths(hfs._select_baselines(rows, model="a/model")), ["a"])
 
     def test_filters_by_capture_signature(self):
         rows = [
-            {
-                "model": "org/m",
-                "run_path": "old",
-                "capture_signature": "abc123",
-                "push_index": 1,
-            },
-            {
-                "model": "org/m",
-                "run_path": "new",
-                "capture_signature": "def456",
-                "push_index": 2,
-            },
+            _row("old", 1, capture_signature="abc123"),
+            _row("new", 2, capture_signature="def456"),
         ]
-        self.assertEqual(
-            hfs._select_latest_run(rows, model="org/m", capture_signature="def456"),
-            "new",
-        )
+        refs = hfs._select_baselines(rows, model="org/m", capture_signature="def456")
+        self.assertEqual(_paths(refs), ["new"])
 
-    def test_returns_none_on_empty(self):
-        self.assertIsNone(hfs._select_latest_run([], model="org/m"))
+    def test_returns_empty_on_empty(self):
+        self.assertEqual(hfs._select_baselines([], model="org/m"), [])
 
     def test_skips_rows_without_run_path(self):
-        rows = [
-            {"model": "org/m", "push_index": 1},
-            {"model": "org/m", "run_path": "good", "push_index": 2},
-        ]
-        self.assertEqual(hfs._select_latest_run(rows, model="org/m"), "good")
+        rows = [{"model": "org/m", "push_index": 1}, _row("good", 2)]
+        self.assertEqual(_paths(hfs._select_baselines(rows, model="org/m")), ["good"])
 
-    def test_returns_none_when_signature_mismatch(self):
-        rows = [
-            {
-                "model": "org/m",
-                "run_path": "old",
-                "capture_signature": "abc123",
-                "push_index": 1,
-            },
-        ]
-        self.assertIsNone(
-            hfs._select_latest_run(rows, model="org/m", capture_signature="zzz")
+    def test_returns_empty_when_signature_mismatch(self):
+        rows = [_row("old", 1, capture_signature="abc123")]
+        self.assertEqual(
+            hfs._select_baselines(rows, model="org/m", capture_signature="zzz"), []
         )
 
     def test_prefers_older_passed_over_newer_failed(self):
         # A failed run must not shadow an older good baseline, or a persistent
         # regression is masked after one night.
-        rows = [
-            {
-                "model": "org/m",
-                "run_path": "good",
-                "pass_label": "passed",
-                "push_index": 1,
-            },
-            {
-                "model": "org/m",
-                "run_path": "bad",
-                "pass_label": "failed",
-                "push_index": 2,
-            },
-        ]
-        self.assertEqual(hfs._select_latest_run(rows, model="org/m"), "good")
+        rows = [_row("good", 1), _row("bad", 2, label="failed")]
+        self.assertEqual(_paths(hfs._select_baselines(rows, model="org/m")), ["good"])
 
     def test_prefers_baseline_established_over_newer_failed(self):
         rows = [
-            {
-                "model": "org/m",
-                "run_path": "seed",
-                "pass_label": "baseline_established",
-                "push_index": 1,
-            },
-            {
-                "model": "org/m",
-                "run_path": "bad",
-                "pass_label": "failed",
-                "push_index": 2,
-            },
+            _row("seed", 1, label="baseline_established"),
+            _row("bad", 2, label="failed"),
         ]
-        self.assertEqual(hfs._select_latest_run(rows, model="org/m"), "seed")
+        refs = hfs._select_baselines(rows, model="org/m")
+        self.assertEqual(_paths(refs), ["seed"])
+        self.assertFalse(refs[0].confirmed)
 
     def test_falls_back_to_failed_when_only_failed(self):
-        rows = [
-            {
-                "model": "org/m",
-                "run_path": "bad1",
-                "pass_label": "failed",
-                "push_index": 1,
-            },
-            {
-                "model": "org/m",
-                "run_path": "bad2",
-                "pass_label": "failed",
-                "push_index": 2,
-            },
-        ]
-        self.assertEqual(hfs._select_latest_run(rows, model="org/m"), "bad2")
+        rows = [_row("bad1", 1, label="failed"), _row("bad2", 2, label="failed")]
+        refs = hfs._select_baselines(rows, model="org/m")
+        self.assertEqual(_paths(refs), ["bad2"])
+        self.assertFalse(refs[0].confirmed)
 
     def test_missing_pass_label_treated_as_usable(self):
         # Legacy rows without pass_label stay usable as baselines.
+        rows = [_row("legacy", 1, label=None), _row("bad", 2, label="failed")]
+        self.assertEqual(_paths(hfs._select_baselines(rows, model="org/m")), ["legacy"])
+
+    def test_newer_unconfirmed_candidate_is_compared_before_confirmed(self):
         rows = [
-            {"model": "org/m", "run_path": "legacy", "push_index": 1},
-            {
-                "model": "org/m",
-                "run_path": "bad",
-                "pass_label": "failed",
-                "push_index": 2,
-            },
+            _row("good", 1, runner="A"),
+            _row("forced", 2, label="baseline_established", runner="B"),
         ]
-        self.assertEqual(hfs._select_latest_run(rows, model="org/m"), "legacy")
+        refs = hfs._select_baselines(rows, model="org/m")
+        self.assertEqual(_paths(refs), ["forced", "good"])
+        self.assertEqual([r.confirmed for r in refs], [False, True])
+
+    def test_older_unconfirmed_candidate_is_dropped(self):
+        rows = [
+            _row("forced", 1, label="baseline_established", runner="B"),
+            _row("good", 2, runner="A", trust="confirmed"),
+        ]
+        self.assertEqual(_paths(hfs._select_baselines(rows, model="org/m")), ["good"])
+
+    def test_keeps_newest_candidate_per_runner(self):
+        rows = [
+            _row("good", 1, runner="A"),
+            _row("b1", 2, label="baseline_established", runner="B"),
+            _row("c1", 3, label="baseline_established", runner="C"),
+            _row("b2", 4, runner="B", trust="unconfirmed"),
+        ]
+        refs = hfs._select_baselines(rows, model="org/m")
+        self.assertEqual(_paths(refs), ["b2", "c1", "good"])
+
+    def test_caps_unconfirmed_candidates(self):
+        rows = [_row("good", 0, runner="A")] + [
+            _row(f"c{i}", i, label="baseline_established", runner=f"R{i}")
+            for i in range(1, 6)
+        ]
+        refs = hfs._select_baselines(rows, model="org/m", max_unconfirmed=2)
+        self.assertEqual(_paths(refs), ["c5", "c4", "good"])
+
+    def test_carries_runner_name(self):
+        rows = [_row("good", 1, runner="runner-good-a")]
+        self.assertEqual(
+            hfs._select_baselines(rows, model="org/m")[0].runner_name,
+            "runner-good-a",
+        )
+
+
+def _ref(path, *, runner, confirmed):
+    return hfs.BaselineRef(run_path=path, runner_name=runner, confirmed=confirmed)
+
+
+def _cmp(ref, *, passed, exact=False, summary="s"):
+    return hfs.Comparison(baseline=ref, passed=passed, exact=exact, summary=summary)
+
+
+class TestDecideVerdict(CustomTestCase):
+    def setUp(self):
+        self.good = _ref("good", runner="A", confirmed=True)
+        self.cand = _ref("cand", runner="B", confirmed=False)
+
+    def test_exact_match_on_other_runner_confirms(self):
+        v = hfs.decide_verdict(
+            [_cmp(self.cand, passed=True, exact=True), _cmp(self.good, passed=False)],
+            runner_name="C",
+        )
+        self.assertTrue(v.passed)
+        self.assertEqual(v.trust, hfs.TRUST_CONFIRMED)
+        self.assertEqual(v.confirms, self.cand)
+        self.assertEqual(v.baseline, self.cand)
+
+    def test_same_runner_cannot_confirm_itself(self):
+        v = hfs.decide_verdict(
+            [_cmp(self.cand, passed=True, exact=True), _cmp(self.good, passed=False)],
+            runner_name="B",
+        )
+        self.assertTrue(v.passed)
+        self.assertEqual(v.trust, hfs.TRUST_UNCONFIRMED)
+        self.assertIsNone(v.confirms)
+
+    def test_unknown_runner_cannot_confirm(self):
+        v = hfs.decide_verdict(
+            [_cmp(self.cand, passed=True, exact=True)], runner_name=None
+        )
+        self.assertEqual(v.trust, hfs.TRUST_UNCONFIRMED)
+        unknown = _ref("cand", runner=None, confirmed=False)
+        v = hfs.decide_verdict(
+            [_cmp(unknown, passed=True, exact=True)], runner_name="C"
+        )
+        self.assertEqual(v.trust, hfs.TRUST_UNCONFIRMED)
+
+    def test_inexact_pass_on_other_runner_does_not_confirm(self):
+        # Within threshold is not agreement: good runners reproduce exactly.
+        v = hfs.decide_verdict(
+            [_cmp(self.cand, passed=True, exact=False), _cmp(self.good, passed=False)],
+            runner_name="C",
+        )
+        self.assertTrue(v.passed)
+        self.assertEqual(v.trust, hfs.TRUST_UNCONFIRMED)
+
+    def test_confirmed_pass_supersedes_unreproduced_candidate(self):
+        v = hfs.decide_verdict(
+            [_cmp(self.cand, passed=False), _cmp(self.good, passed=True, exact=True)],
+            runner_name="A",
+        )
+        self.assertTrue(v.passed)
+        self.assertEqual(v.trust, hfs.TRUST_CONFIRMED)
+        self.assertEqual(v.baseline, self.good)
+        self.assertIn("superseded unconfirmed baseline cand (runner B)", v.detail)
+
+    def test_plain_confirmed_pass(self):
+        v = hfs.decide_verdict(
+            [_cmp(self.good, passed=True, exact=True)], runner_name="A"
+        )
+        self.assertEqual(
+            (v.passed, v.trust, v.baseline), (True, "confirmed", self.good)
+        )
+
+    def test_nothing_matches_fails_and_names_runners(self):
+        v = hfs.decide_verdict(
+            [
+                _cmp(self.cand, passed=False, summary="rel_diff=0.5"),
+                _cmp(self.good, passed=False, summary="rel_diff=0.1"),
+            ],
+            runner_name="C",
+        )
+        self.assertFalse(v.passed)
+        self.assertIsNone(v.trust)
+        self.assertEqual(v.baseline, self.good)
+        self.assertIn("vs unconfirmed baseline cand (runner B): rel_diff=0.5", v.detail)
+        self.assertIn("vs confirmed baseline good (runner A): rel_diff=0.1", v.detail)
+        self.assertIn("this run on runner C", v.detail)
+
+    def test_failure_flags_runner_that_never_confirmed(self):
+        history = hfs.RunnerHistory("bad", 0, 3, ("good-a", "good-b"))
+        v = hfs.decide_verdict(
+            [_cmp(self.good, passed=False)], runner_name="bad", history=history
+        )
+        self.assertIn("suspect the machine", v.detail)
+        self.assertIn("3 earlier failure(s)", v.detail)
+
+    def test_failure_does_not_blame_runner_with_confirmed_history(self):
+        history = hfs.RunnerHistory("good-a", 5, 1, ("good-b",))
+        v = hfs.decide_verdict(
+            [_cmp(self.good, passed=False)], runner_name="good-a", history=history
+        )
+        self.assertNotIn("suspect the machine", v.detail)
+
+
+class TestRunnerHistory(CustomTestCase):
+    def test_counts_per_runner(self):
+        rows = [
+            _row("p1", 1, runner="good-a", trust="confirmed"),
+            _row("p2", 2, runner="good-b", trust="confirmed"),
+            _row("f1", 3, label="failed", runner="bad"),
+            _row("f2", 4, label="failed", runner="bad"),
+            _row("e1", 5, label="baseline_established", runner="bad"),
+            _row("u1", 6, runner="bad", trust="unconfirmed"),
+        ]
+        h = hfs._runner_history(
+            rows, model="org/m", capture_signature=None, runner_name="bad"
+        )
+        self.assertEqual((h.num_confirmed, h.num_failed), (0, 2))
+        self.assertEqual(h.confirmed_elsewhere, ("good-a", "good-b"))
+
+
+class TestPoisonedBaseline(CustomTestCase):
+    """A forced refresh lands on a runner whose numerics diverge; every other
+    runner would then fail against it with the same rel_diff."""
+
+    def setUp(self):
+        self.rows = [
+            _row("run-good", 1, runner=None),  # legacy good-runner pass
+            _row("run-bad-failed", 2, label="failed", runner="runner-bad"),
+            _row(
+                "run-bad-forced",
+                3,
+                label="baseline_established",
+                runner="runner-bad",
+                trust="unconfirmed",
+            ),
+        ]
+
+    def test_good_runner_still_compares_against_pre_poison_baseline(self):
+        refs = hfs._select_baselines(self.rows, model="org/m")
+        self.assertEqual(_paths(refs), ["run-bad-forced", "run-good"])
+
+    def test_good_runner_matching_old_baseline_heals_the_store(self):
+        refs = hfs._select_baselines(self.rows, model="org/m")
+        bad, good = refs
+        v = hfs.decide_verdict(
+            [_cmp(bad, passed=False), _cmp(good, passed=True, exact=True)],
+            runner_name="runner-good-a",
+        )
+        self.assertTrue(v.passed)
+        self.assertEqual(v.trust, hfs.TRUST_CONFIRMED)
+        healed = self.rows + [
+            _row("run-next", 4, runner="runner-good-a", trust=v.trust)
+        ]
+        self.assertEqual(
+            _paths(hfs._select_baselines(healed, model="org/m")), ["run-next"]
+        )
+
+    def test_bad_runner_agreeing_with_itself_never_confirms(self):
+        refs = hfs._select_baselines(self.rows, model="org/m")
+        bad, good = refs
+        v = hfs.decide_verdict(
+            [_cmp(bad, passed=True, exact=True), _cmp(good, passed=False)],
+            runner_name="runner-bad",
+        )
+        self.assertTrue(v.passed)
+        self.assertEqual(v.trust, hfs.TRUST_UNCONFIRMED)
+        # The good baseline stays in every later plan.
+        rows = self.rows + [
+            _row("run-bad-again", 4, runner="runner-bad", trust=v.trust)
+        ]
+        self.assertEqual(
+            _paths(hfs._select_baselines(rows, model="org/m")),
+            ["run-bad-again", "run-good"],
+        )
+
+
+class TestAllocateRunPath(CustomTestCase):
+    def test_fresh_path(self):
+        self.assertEqual(
+            hfs._allocate_run_path([], "m/run-abc", {}), ("m/run-abc", False)
+        )
+
+    def test_reuses_for_same_producer(self):
+        rows = [{"run_path": "m/run-abc", "runner_name": "A", "pass_label": "passed"}]
+        meta = {"runner_name": "A", "pass_label": "passed"}
+        self.assertEqual(
+            hfs._allocate_run_path(rows, "m/run-abc", meta), ("m/run-abc", True)
+        )
+
+    def test_other_runner_gets_its_own_path(self):
+        # Otherwise a good runner's row would point at a bad runner's tensors.
+        rows = [
+            {
+                "run_path": "m/run-abc",
+                "runner_name": "A",
+                "pass_label": "baseline_established",
+            },
+            {"run_path": "m/run-abc-2", "runner_name": "C", "pass_label": "passed"},
+        ]
+        meta = {"runner_name": "B", "pass_label": "passed", "trust": "confirmed"}
+        self.assertEqual(
+            hfs._allocate_run_path(rows, "m/run-abc", meta), ("m/run-abc-3", False)
+        )
+
+    def test_same_runner_different_label_gets_its_own_path(self):
+        rows = [{"run_path": "m/run-abc", "runner_name": "A", "pass_label": "failed"}]
+        meta = {"runner_name": "A", "pass_label": "passed", "trust": "confirmed"}
+        self.assertEqual(
+            hfs._allocate_run_path(rows, "m/run-abc", meta), ("m/run-abc-2", False)
+        )
 
 
 class TestReadManifest(CustomTestCase):
@@ -273,19 +502,9 @@ class TestReadManifest(CustomTestCase):
         self.assertEqual(text, "")
 
 
-class TestFetchLatestBaseline(CustomTestCase):
+class TestDownloadBaseline(CustomTestCase):
     @patch("sglang.test.precision_baseline_store.snapshot_download")
-    @patch.object(hfs, "_read_manifest")
-    def test_downloads_and_copies_tensors(self, mock_manifest, mock_snapshot):
-        rows = [
-            {
-                "model": "org/m",
-                "run_path": "org__m/2025/01/01/run-abc",
-                "push_index": 1,
-            }
-        ]
-        mock_manifest.return_value = (rows, "")
-
+    def test_downloads_and_copies_tensors(self, mock_snapshot):
         with tempfile.TemporaryDirectory() as snap_dir:
             tensors = Path(snap_dir) / "org__m/2025/01/01/run-abc/tensors"
             tensors.mkdir(parents=True)
@@ -296,63 +515,67 @@ class TestFetchLatestBaseline(CustomTestCase):
                 target = Path(target_root) / "tensors"
                 target.mkdir()
                 (target / "stale.pt").write_bytes(b"\xff")
-                result = hfs.fetch_latest_baseline(
+                found = hfs.download_baseline(
                     config=_make_config(),
-                    model="org/m",
+                    run_path="org__m/2025/01/01/run-abc",
                     target_tensors_dir=target,
                 )
                 self.assertEqual((target / "layer0.pt").read_bytes(), b"\x00")
                 self.assertFalse((target / "stale.pt").exists())
-            self.assertEqual(result, "org__m/2025/01/01/run-abc")
-
-    @patch.object(hfs, "_read_manifest")
-    def test_returns_none_when_no_runs(self, mock_manifest):
-        mock_manifest.return_value = ([], "")
-        with tempfile.TemporaryDirectory() as target_root:
-            target = Path(target_root) / "tensors"
-            target.mkdir()
-            (target / "stale.pt").write_bytes(b"\xff")
-            result = hfs.fetch_latest_baseline(
-                config=_make_config(),
-                model="org/m",
-                target_tensors_dir=target,
-            )
-            self.assertFalse(target.exists())
-        self.assertIsNone(result)
+        self.assertTrue(found)
+        kwargs = mock_snapshot.call_args.kwargs
+        self.assertEqual(
+            kwargs["allow_patterns"], ["org__m/2025/01/01/run-abc/tensors/*"]
+        )
 
     @patch("sglang.test.precision_baseline_store.snapshot_download")
+    def test_missing_tensors_returns_false(self, mock_snapshot):
+        with tempfile.TemporaryDirectory() as snap_dir:
+            mock_snapshot.return_value = snap_dir
+            with tempfile.TemporaryDirectory() as target_root:
+                target = Path(target_root) / "tensors"
+                target.mkdir()
+                (target / "stale.pt").write_bytes(b"\xff")
+                found = hfs.download_baseline(
+                    config=_make_config(), run_path="gone", target_tensors_dir=target
+                )
+                self.assertFalse(target.exists())
+        self.assertFalse(found)
+
+
+class TestPlanBaselines(CustomTestCase):
     @patch.object(hfs, "_read_manifest")
-    def test_passes_capture_signature(self, mock_manifest, mock_snapshot):
+    def test_plans_from_manifest(self, mock_manifest):
         rows = [
-            {
-                "model": "org/m",
-                "run_path": "run_new",
-                "capture_signature": "sig2",
-                "push_index": 2,
-            },
-            {
-                "model": "org/m",
-                "run_path": "run_old",
-                "capture_signature": "sig1",
-                "push_index": 1,
-            },
+            _row("good", 1, runner="A", capture_signature="sig"),
+            _row(
+                "forced",
+                2,
+                label="baseline_established",
+                runner="B",
+                capture_signature="sig",
+            ),
+            _row("other_sig", 3, runner="A", capture_signature="old"),
+            _row("f", 4, label="failed", runner="B", capture_signature="sig"),
         ]
         mock_manifest.return_value = (rows, "")
+        plan = hfs.plan_baselines(
+            config=_make_config(),
+            model="org/m",
+            runner_name="B",
+            capture_signature="sig",
+        )
+        self.assertEqual(_paths(plan.baselines), ["forced", "good"])
+        self.assertEqual(plan.runner_history.num_failed, 1)
+        self.assertEqual(plan.runner_history.confirmed_elsewhere, ("A",))
 
-        with tempfile.TemporaryDirectory() as snap_dir:
-            tensors = Path(snap_dir) / "run_new/tensors"
-            tensors.mkdir(parents=True)
-            (tensors / "layer0.pt").write_bytes(b"\x00")
-            mock_snapshot.return_value = snap_dir
-
-            with tempfile.TemporaryDirectory() as target:
-                result = hfs.fetch_latest_baseline(
-                    config=_make_config(),
-                    model="org/m",
-                    target_tensors_dir=Path(target),
-                    capture_signature="sig2",
-                )
-        self.assertEqual(result, "run_new")
+    @patch.object(hfs, "_read_manifest")
+    def test_empty_manifest(self, mock_manifest):
+        mock_manifest.return_value = ([], "")
+        plan = hfs.plan_baselines(
+            config=_make_config(), model="org/m", runner_name=None
+        )
+        self.assertEqual(plan.baselines, ())
 
 
 class TestPushRun(CustomTestCase):
@@ -443,6 +666,55 @@ class TestPushRun(CustomTestCase):
             )
 
         self.assertEqual(captured_pt_count[0], 0)
+
+    @patch("sglang.test.precision_baseline_store.HfApi")
+    @patch.object(hfs, "_read_manifest")
+    def test_other_runner_same_sha_uploads_to_new_path(
+        self, mock_manifest, mock_api_cls
+    ):
+        today_date, today_date_path = hfs._today_path()
+        existing_row = {
+            "model": "org/m",
+            "run_path": f"org__m/{today_date_path}/run-abc1234",
+            "date": today_date,
+            "push_index": 1,
+            "runner_name": "runner-bad",
+            "pass_label": "baseline_established",
+            "trust": "unconfirmed",
+        }
+        mock_manifest.return_value = ([existing_row], json.dumps(existing_row) + "\n")
+        mock_api = MagicMock()
+        mock_api_cls.return_value = mock_api
+        uploads = []
+        mock_api.upload_folder.side_effect = lambda *a, **kw: uploads.append(
+            (kw["path_in_repo"], len(list(Path(kw["folder_path"]).rglob("*.pt"))))
+        )
+        manifests = []
+        mock_api.upload_file.side_effect = lambda *a, **kw: manifests.append(
+            Path(kw["path_or_fileobj"]).read_text()
+        )
+
+        with tempfile.TemporaryDirectory() as tensor_dir:
+            (Path(tensor_dir) / "layer0.pt").write_bytes(b"\x01")
+            run_path = hfs.push_run(
+                config=_make_config(),
+                model="org/m",
+                sglang_commit="abc1234567",
+                today_tensors_dir=Path(tensor_dir),
+                meta={
+                    "runner_name": "runner-good-a",
+                    "pass_label": "passed",
+                    "trust": "confirmed",
+                    "baseline_run_path": "org__m/2025/01/01/run-old",
+                },
+            )
+
+        self.assertEqual(run_path, f"org__m/{today_date_path}/run-abc1234-2")
+        self.assertEqual(uploads, [(run_path, 1)])
+        row = json.loads(manifests[0].strip().splitlines()[-1])
+        self.assertEqual(row["runner_name"], "runner-good-a")
+        self.assertEqual(row["trust"], "confirmed")
+        self.assertEqual(row["baseline_run_path"], "org__m/2025/01/01/run-old")
 
     @patch("sglang.test.precision_baseline_store.HfApi")
     @patch.object(hfs, "_read_manifest")

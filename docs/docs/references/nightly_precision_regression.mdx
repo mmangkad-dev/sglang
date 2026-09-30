@@ -8,6 +8,7 @@ The framework operates on a **rolling-baseline** model:
 
 1. **Baseline creation or comparison:** Launch the server, send a fixed prompt, dump per-layer hidden states to disk. If a previous baseline exists, compare the new tensors against it using the SGLang tensor comparator. If the comparison passes, the new tensors become the updated baseline.
 2. On the first run (or when the capture shape changes), the dumped tensors are saved as a new baseline with no comparison.
+3. A baseline that was never compared against anything — a first run or a forced refresh — is **unconfirmed** until a *different* runner reproduces it bit-exactly (see [Runner lineage](#runner-lineage-and-trust)). This keeps one runner with divergent numerics from becoming the reference the rest of the pool is judged against.
 
 Baselines are stored locally on disk and synced to a **HuggingFace dataset** so they survive across CI runners and can be shared across machines. The HF dataset store is **required** — the test errors if `SGLANG_PRECISION_HF_REPO` is unset.
 
@@ -23,7 +24,8 @@ Baselines are stored locally on disk and synced to a **HuggingFace dataset** so 
 │     ↓                                                         │
 │  2. Compute capture_signature (schema, layers, TP, filter)    │
 │     ↓                                                         │
-│  3. Fetch baseline from HF dataset (signature-matched)        │
+│  3. Plan baselines from HF manifest (signature-matched):      │
+│     newer unconfirmed candidates + latest confirmed baseline  │
 │     ↓                                                         │
 │  4. Launch SGLang server with DUMPER enabled                   │
 │     ↓                                                         │
@@ -34,12 +36,12 @@ Baselines are stored locally on disk and synced to a **HuggingFace dataset** so 
 │     ↓                                                         │
 │  7. Kill server; assert decode tensors were captured           │
 │     ↓                                                         │
-│  8. Baseline exists (with matching signature)?                 │
-│     ├── YES → Run comparator → pass/fail                      │
-│     │         ├── PASS  → update baseline, push to HF         │
+│  8. Planned baselines exist and no forced refresh?            │
+│     ├── YES → Run comparator vs each → verdict (see lineage)  │
+│     │         ├── PASS  → push to HF as the next baseline     │
 │     │         └── FAIL  → push diagnostics to HF              │
-│     └── NO  → copy today's tensors as initial baseline        │
-│                → push to HF as "baseline_established"          │
+│     └── NO  → push today's tensors as "baseline_established"  │
+│                (unconfirmed)                                   │
 │     ↓                                                         │
 │  9. Report summary (stdout + GitHub Step Summary)             │
 └──────────────────────────────────────────────────────────────┘
@@ -114,12 +116,13 @@ This is why a stale baseline captured with fusion *not* initialized is incompati
 | `SGLANG_PRECISION_MODELS` | `zai-org/GLM-5.1-FP8` | Comma-separated HuggingFace model IDs to test |
 | `SGLANG_PRECISION_BASELINE_DIR` | `/tmp/sglang_precision_baselines` | Local directory for baseline tensors |
 | `SGLANG_PRECISION_DIFF_THRESHOLD` | `1e-3` | Per-tensor relative diff threshold |
-| `SGLANG_PRECISION_FORCE_UPDATE` | `0` | Set to `1` to skip comparison and unconditionally refresh baseline |
+| `SGLANG_PRECISION_FORCE_UPDATE` | `0` | Set to `1` to skip comparison and propose a new baseline; it stays unconfirmed until a different runner reproduces it bit-exactly |
 | `SGLANG_PRECISION_COMMIT` | _(auto-detected from git)_ | Override the sglang commit SHA tagged on push |
 | `SGLANG_PRECISION_HF_REPO` | _(required)_ | HuggingFace dataset repo for cross-runner baseline storage |
 | `SGLANG_PRECISION_HF_REVISION` | `main` | Branch/revision of the HF dataset |
 | `SGLANG_PRECISION_HF_TOKEN` | _(required in CI)_ | HuggingFace token with write access to the dataset. Kept off `HF_TOKEN`, which already carries the runner's gated-model read token |
 | `SGLANG_PRECISION_HF_READ_ONLY` | `0` | Set to `1` to fetch and compare without updating the shared baseline store |
+| `RUNNER_NAME` | _(set by GitHub Actions)_ | Producer recorded on every pushed run. A run without it can never confirm a baseline |
 
 ---
 
@@ -169,7 +172,7 @@ When running in CI, the test writes a Markdown table to the GitHub Actions job s
 Baselines are organized in the HF dataset as:
 
 ```
-<model_sanitized>/<YYYY>/<MM>/<DD>/run-<sha7>/
+<model_sanitized>/<YYYY>/<MM>/<DD>/run-<sha7>[-N]/
 ├── meta.json                    # Run metadata (model, commit, hardware, thresholds, stats)
 ├── comparator_report.jsonl      # Per-tensor comparison results
 └── tensors/
@@ -178,7 +181,9 @@ Baselines are organized in the HF dataset as:
     └── ...
 ```
 
-A top-level `manifest.jsonl` tracks all runs with one JSON object per line. Each manifest row carries a `capture_signature` field so that fetch selects only baselines with a matching capture shape.
+A top-level `manifest.jsonl` tracks all runs with one JSON object per line. Each manifest row carries a `capture_signature` field so that fetch selects only baselines with a matching capture shape, plus its lineage: `runner_name`, `driver_version`, `trust`, `baseline_run_path` / `baseline_runner_name` (what it was compared against) and `confirms_run_path`.
+
+A run reuses an existing `run-<sha7>` folder only when the same runner pushed it with the same label and trust; any other run at the same sha on the same day gets `run-<sha7>-2`, `-3`, … so its row never points at another runner's tensors.
 
 The `prune_old_runs()` function (callable manually) retains daily runs for 30 days and keeps one run per week beyond that window.
 
@@ -299,8 +304,9 @@ python3 -m pytest registered/debug_utils/test_nightly_precision_regression.py -v
 
 | Status | Meaning |
 |--------|---------|
-| `BASELINE_ESTABLISHED` | No prior baseline with a matching signature existed; today's tensors saved as the new baseline |
-| `PASSED` | All per-layer hidden states are within the diff threshold; baseline updated |
+| `BASELINE_ESTABLISHED` | First run for this signature, or a forced refresh; today's tensors saved as an **unconfirmed** baseline |
+| `PASSED` | Within the diff threshold of a confirmed baseline, or confirmed an unconfirmed one by reproducing it bit-exactly on another runner |
+| `PASSED_UNCONFIRMED` | Within the diff threshold only of an unconfirmed baseline (typically the runner that produced it agreeing with itself); not yet confirmed |
 | `FAILED` | One or more layers exceeded the diff threshold, or 0 layers were compared (baseline/target mismatch); diagnostic data pushed to HF |
 | `ERROR` | Server launch, inference, or comparison encountered an unexpected error |
 
@@ -330,26 +336,40 @@ Qwen/Qwen2.5-0.5B-Instruct                    FAILED                   tensor=la
 
 ### Local baselines
 
-Baselines are stored at:
+Planned baselines are downloaded to:
 ```
-$SGLANG_PRECISION_BASELINE_DIR/<model_sanitized>/nightly_precision/*.pt
+$SGLANG_PRECISION_BASELINE_DIR/<model_sanitized>/refs/ref<N>/*.pt
 ```
 
-A `baseline_meta.json` next to the tensors records the timestamp and commit that produced the baseline.
+The HF dataset is the only store of record; this directory is scratch space.
 
 ### HF dataset baselines
 
-- **Fetch:** At test start, if no local baseline exists, the latest signature-matched baseline is downloaded from the HF dataset.
-- **Push:** After each run, tensors and metadata are uploaded to the dataset.
+- **Plan:** At test start, the manifest is read and the signature-matched baselines to compare against are chosen (see below).
+- **Push:** After each run, tensors, metadata and lineage are uploaded to the dataset.
 - **Prune:** Use `prune_old_runs()` to garbage-collect old baselines (keeps 30 days of daily runs, one per week after that).
+
+### Runner lineage and trust
+
+The `8-gpu-h200` pool is a label, not a machine, and a runner can compute numerics that deterministically differ from the rest of the pool. Good runners reproduce each other exactly — every recorded pass has `max_rel_diff == 0.0` — so agreement between two runners is what makes a baseline trustworthy.
+
+- A row is **confirmed** or **unconfirmed** (`trust`). First-run and forced rows are unconfirmed. Rows written before lineage existed count as confirmed if they are `passed`, unconfirmed otherwise.
+- Each run compares against the newest unconfirmed candidate per runner that is newer than the latest confirmed baseline (at most 3), then against that confirmed baseline.
+- **Verdict**, in order:
+  1. Bit-exact match with an unconfirmed candidate from a *different* runner: the candidate is confirmed (`PASSED`).
+  2. Within threshold of the confirmed baseline: `PASSED`; unreproduced candidates are superseded, since the change they proposed did not reproduce.
+  3. Within threshold of an unconfirmed candidate only: `PASSED_UNCONFIRMED`; the run joins that candidate's unconfirmed lineage.
+  4. Otherwise: `FAILED`, listing every baseline compared with its runner. A failed run is never selected as a baseline and never becomes a candidate, so a regression cannot promote itself.
+- A runner that has failed before, has never produced a confirmed row, and whose peers have, is flagged in the failure as a likely machine problem.
 
 ### Refreshing a stale baseline
 
 If an intentional numerical change (e.g., kernel optimization, model refactor) causes a comparison failure:
 
 1. Verify the change is intentional
-2. Set `SGLANG_PRECISION_FORCE_UPDATE=1` and run the test once to establish a new baseline
-3. Commit any necessary threshold adjustments
+2. Set `SGLANG_PRECISION_FORCE_UPDATE=1` (or dispatch the nightly with `force_baseline_update`) and run the test once. This proposes an unconfirmed baseline.
+3. The next run on a different runner that reproduces it bit-exactly confirms it. If the refresh landed on a runner whose numerics diverge, the next good runner either still matches the previous confirmed baseline (and the refresh is superseded) or fails naming both runners; refresh again so it lands elsewhere.
+4. Commit any necessary threshold adjustments
 
 If you change the capture configuration (stride, TP size, etc.), the `capture_signature` will differ and the framework automatically establishes a fresh baseline — no manual intervention needed.
 

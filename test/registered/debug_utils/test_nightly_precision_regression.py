@@ -1,11 +1,19 @@
 """Nightly precision regression CI test: dump per-layer hidden states and
 compare day-over-day against a rolling baseline.
 
+A refreshed or first-run baseline is unconfirmed until a different runner
+reproduces it bit-exactly (see precision_baseline_store), so a runner with
+divergent numerics cannot become the reference for the rest of the pool.
+
 Env knobs:
   SGLANG_PRECISION_MODELS         comma-separated model ids (default GLM-5.2-FP8)
-  SGLANG_PRECISION_BASELINE_DIR   local baseline dir
+  SGLANG_PRECISION_BASELINE_DIR   local dir baselines are downloaded into
   SGLANG_PRECISION_DIFF_THRESHOLD per-tensor rel_diff cutoff (default 1e-3)
-  SGLANG_PRECISION_FORCE_UPDATE=1 skip comparison, refresh baseline
+  SGLANG_PRECISION_FORCE_UPDATE=1 skip comparison, propose a new (unconfirmed)
+                                  baseline
+  RUNNER_NAME                     producer recorded for lineage; set by GitHub
+                                  Actions, unset locally (runs without it can
+                                  never confirm a baseline)
   SGLANG_PRECISION_COMMIT         override sglang sha (7-40 hex) tagged on push
   SGLANG_PRECISION_HF_REPO        required HF dataset repo for cross-runner
                                   baseline storage; see precision_baseline_store
@@ -16,6 +24,7 @@ Env knobs:
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import math
@@ -209,7 +218,22 @@ def _collect_runtime_context() -> dict[str, Any]:
             ctx["hardware"] = m.group(1)
     except Exception:
         pass
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).decode()
+        driver = out.strip().splitlines()[0].strip() if out.strip() else ""
+        if driver:
+            ctx["driver_version"] = driver
+    except Exception:
+        pass
     return ctx
+
+
+def _runner_name() -> Optional[str]:
+    return os.environ.get("RUNNER_NAME") or None
 
 
 def _collect_ci_context() -> dict[str, Any]:
@@ -221,6 +245,9 @@ def _collect_ci_context() -> dict[str, Any]:
         repo = os.environ.get("GITHUB_REPOSITORY", "")
         if repo:
             ctx["ci_run_url"] = f"{server}/{repo}/actions/runs/{run_id}"
+    runner = _runner_name()
+    if runner:
+        ctx["runner_name"] = runner
     for env_key, meta_key in (
         ("GITHUB_ACTOR", "ci_actor"),
         ("GITHUB_REF", "git_ref"),
@@ -293,6 +320,7 @@ def _parse_comparator_stats(stdout: str) -> dict[str, Any]:
         "num_layers_passed": n_passed,
         "num_layers_failed": n_failed,
     }
+    out["num_rel_diffs"] = len(rel_diffs)
     if rel_diffs:
         out["max_rel_diff"] = max(rel_diffs)
         out["mean_rel_diff"] = sum(rel_diffs) / len(rel_diffs)
@@ -378,7 +406,7 @@ def _test_one_model(
     model = model_setup.model_path
     model_dir_name = _sanitize_model_name(model)
     model_baseline_dir = baseline_dir / model_dir_name
-    baseline_exp_dir = model_baseline_dir / EXP_NAME
+    runner_name = _runner_name()
 
     # Resolve the capture shape once and reuse it for the dump request and every
     # meta push, so the manifest always reflects exactly what was dumped.
@@ -395,11 +423,19 @@ def _test_one_model(
     }
     dump_cfg["capture_signature"] = _capture_signature(dump_cfg, model_setup.tp_size)
 
-    _maybe_hf_fetch(
+    plan = _maybe_hf_plan(
         hf_cfg=hf_cfg,
         model=model,
-        baseline_exp_dir=baseline_exp_dir,
+        runner_name=runner_name,
         capture_signature=dump_cfg["capture_signature"],
+    )
+    push = functools.partial(
+        _maybe_hf_push,
+        hf_cfg=hf_cfg,
+        model=model,
+        model_setup=model_setup,
+        diff_threshold=diff_threshold,
+        dump_cfg=dump_cfg,
     )
 
     with tempfile.TemporaryDirectory() as today_tmp:
@@ -416,104 +452,165 @@ def _test_one_model(
         _assert_decode_captured(today_exp_dir, tp_size=model_setup.tp_size)
         _assert_fused_tp_layout(today_exp_dir, tp_size=model_setup.tp_size)
 
-        has_baseline = baseline_exp_dir.exists() and any(baseline_exp_dir.glob("*.pt"))
-
-        if has_baseline and not force_update:
-            result = _run_comparator(
-                baseline=baseline_exp_dir,
-                target=today_exp_dir,
-                threshold=diff_threshold,
-            )
-            debug_file = _save_comparator_output(
-                stdout=result.stdout, stderr=result.stderr, prefix=model_dir_name
-            )
-            print(f"Comparator output for {model}: {debug_file}")
-            report_path = model_baseline_dir / "comparator_report.jsonl"
-            report_path.parent.mkdir(parents=True, exist_ok=True)
-            report_path.write_text(result.stdout, encoding="utf-8")
-            comparator_stats = _parse_comparator_stats(result.stdout)
-            if comparator_stats.get("num_layers_compared", 0) == 0:
-                # A clean returncode with nothing compared means the baseline
-                # and target tensor names never lined up — fail loudly rather
-                # than pass on an empty comparison.
-                return (
-                    model,
-                    "FAILED",
-                    "comparator compared 0 layers (baseline/target name mismatch?)",
-                )
-
-            if result.returncode == 0:
-                _update_baseline(model_baseline_dir, today_exp_dir)
-                _maybe_hf_push(
-                    hf_cfg=hf_cfg,
-                    model=model,
-                    model_setup=model_setup,
-                    tensors_dir=baseline_exp_dir,
-                    pass_label="passed",
-                    diff_threshold=diff_threshold,
-                    dump_cfg=dump_cfg,
-                    comparator_report=report_path,
-                    comparator_stats=comparator_stats,
-                )
-                return (model, "PASSED", "comparison ok, baseline updated")
-            # FAILED: push today's tensors as pass_label="failed" so the
-            # diagnostic diff survives on HF without rerunning the comparator.
-            _maybe_hf_push(
-                hf_cfg=hf_cfg,
-                model=model,
-                model_setup=model_setup,
+        if force_update or not plan.baselines:
+            push(
                 tensors_dir=today_exp_dir,
-                pass_label="failed",
-                diff_threshold=diff_threshold,
-                dump_cfg=dump_cfg,
-                comparator_report=report_path,
-                comparator_stats=comparator_stats,
-            )
-            summary = _extract_diff_summary(result.stdout)
-            return (model, "FAILED", summary)
-        else:
-            _update_baseline(model_baseline_dir, today_exp_dir)
-            _maybe_hf_push(
-                hf_cfg=hf_cfg,
-                model=model,
-                model_setup=model_setup,
-                tensors_dir=baseline_exp_dir,
                 pass_label="baseline_established",
-                diff_threshold=diff_threshold,
-                dump_cfg=dump_cfg,
-                comparator_report=None,
-                comparator_stats=None,
+                trust=_hfs.TRUST_UNCONFIRMED,
             )
             reason = "forced update" if force_update else "first run"
-            return (model, "BASELINE_ESTABLISHED", reason)
+            return (
+                model,
+                "BASELINE_ESTABLISHED",
+                f"{reason} on runner {runner_name or 'unknown'}; unconfirmed until "
+                f"a different runner reproduces it bit-exactly",
+            )
+
+        comparisons, reports = _compare_against_plan(
+            hf_cfg=hf_cfg,
+            plan=plan,
+            refs_dir=model_baseline_dir / "refs",
+            target=today_exp_dir,
+            threshold=diff_threshold,
+            model_dir_name=model_dir_name,
+        )
+        verdict = _hfs.decide_verdict(
+            comparisons, runner_name=runner_name, history=plan.runner_history
+        )
+        report_path, comparator_stats = (
+            reports.get(verdict.baseline.run_path, (None, None))
+            if verdict.baseline is not None
+            else (None, None)
+        )
+        # A failed run is still pushed so the diagnostic diff survives on HF
+        # without rerunning the comparator; a "failed" row is selected only when
+        # the store holds nothing else for this signature.
+        push(
+            tensors_dir=today_exp_dir,
+            pass_label="passed" if verdict.passed else "failed",
+            trust=verdict.trust,
+            baseline=verdict.baseline,
+            confirms=verdict.confirms,
+            comparator_report=report_path,
+            comparator_stats=comparator_stats,
+        )
+        if not verdict.passed:
+            return (model, "FAILED", verdict.detail)
+        status = (
+            "PASSED" if verdict.trust == _hfs.TRUST_CONFIRMED else "PASSED_UNCONFIRMED"
+        )
+        return (model, status, verdict.detail)
 
 
-def _maybe_hf_fetch(
-    *, hf_cfg, model: str, baseline_exp_dir: Path, capture_signature: str
-) -> None:
+def _compare_against_plan(
+    *,
+    hf_cfg,
+    plan,
+    refs_dir: Path,
+    target: Path,
+    threshold: float,
+    model_dir_name: str,
+):
+    shutil.rmtree(refs_dir, ignore_errors=True)
+    comparisons = []
+    reports: dict[str, tuple[Path, dict[str, Any]]] = {}
+    for idx, ref in enumerate(plan.baselines):
+        ref_dir = refs_dir / f"ref{idx}"
+        try:
+            found = _hfs.download_baseline(
+                config=hf_cfg, run_path=ref.run_path, target_tensors_dir=ref_dir
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"[hf-store] download failed for {ref.run_path}: {e}"
+            ) from e
+        if not found or not any(ref_dir.glob("*.pt")):
+            comparisons.append(
+                _hfs.Comparison(
+                    baseline=ref,
+                    passed=False,
+                    exact=False,
+                    summary="baseline tensors missing from the store",
+                )
+            )
+            continue
+        print(f"[hf-store] comparing against {ref.describe()}", flush=True)
+        result = _run_comparator(baseline=ref_dir, target=target, threshold=threshold)
+        debug_file = _save_comparator_output(
+            stdout=result.stdout, stderr=result.stderr, prefix=model_dir_name
+        )
+        print(f"Comparator output vs {ref.run_path}: {debug_file}", flush=True)
+        report_path = refs_dir / f"ref{idx}_comparator_report.jsonl"
+        report_path.write_text(result.stdout, encoding="utf-8")
+        stats = _parse_comparator_stats(result.stdout)
+        reports[ref.run_path] = (report_path, stats)
+        comparisons.append(
+            _classify_comparison(ref, result.returncode, stats, result.stdout)
+        )
+    return comparisons, reports
+
+
+def _classify_comparison(ref, returncode: int, stats: dict[str, Any], stdout: str):
+    compared = stats.get("num_layers_compared", 0)
+    if compared == 0:
+        # A clean returncode with nothing compared means the baseline and target
+        # tensor names never lined up — never count that as agreement.
+        return _hfs.Comparison(
+            baseline=ref,
+            passed=False,
+            exact=False,
+            summary="comparator compared 0 layers (baseline/target name mismatch?)",
+        )
+    passed = returncode == 0 and stats.get("num_layers_failed", 0) == 0
+    if not passed:
+        return _hfs.Comparison(
+            baseline=ref,
+            passed=False,
+            exact=False,
+            summary=_extract_diff_summary(stdout),
+        )
+    # max_rel_diff only aggregates finite values, so a pass is exact only if
+    # every compared tensor contributed one and all of them were zero.
+    exact = stats.get("num_rel_diffs") == compared and stats.get("max_rel_diff") == 0.0
+    return _hfs.Comparison(
+        baseline=ref,
+        passed=True,
+        exact=exact,
+        summary=f"passed, max_rel_diff={stats.get('max_rel_diff')}",
+    )
+
+
+def _maybe_hf_plan(
+    *, hf_cfg, model: str, runner_name: Optional[str], capture_signature: str
+):
     try:
-        src = _hfs.fetch_latest_baseline(
+        plan = _hfs.plan_baselines(
             config=hf_cfg,
             model=model,
-            target_tensors_dir=baseline_exp_dir,
+            runner_name=runner_name,
             capture_signature=capture_signature,
         )
-        if src is None:
-            # Without this line a run that found no signature-matching baseline
-            # and a run that compared cleanly both look green in the log; only
-            # the former silently re-establishes instead of detecting drift.
-            print(
-                f"[hf-store] no baseline matching capture_signature="
-                f"{capture_signature} for {model}; re-establishing",
-                flush=True,
-            )
-        else:
-            print(f"[hf-store] restored baseline for {model} from {src}", flush=True)
     except Exception as e:
         msg = f"[hf-store] fetch failed for {model}: {e}"
         if os.environ.get("GITHUB_RUN_ID"):
             raise RuntimeError(msg) from e
         warnings.warn(msg)
+        return _hfs.BaselinePlan(
+            baselines=(),
+            runner_history=_hfs.RunnerHistory(runner_name, 0, 0, ()),
+        )
+    if not plan.baselines:
+        # Without this line a run that found no signature-matching baseline
+        # and a run that compared cleanly both look green in the log; only
+        # the former silently re-establishes instead of detecting drift.
+        print(
+            f"[hf-store] no baseline matching capture_signature="
+            f"{capture_signature} for {model}; re-establishing",
+            flush=True,
+        )
+    for ref in plan.baselines:
+        print(f"[hf-store] planned {ref.describe()} for {model}", flush=True)
+    return plan
 
 
 def _maybe_hf_push(
@@ -525,6 +622,9 @@ def _maybe_hf_push(
     pass_label: str,
     diff_threshold: float,
     dump_cfg: dict[str, Any],
+    trust: Optional[str] = None,
+    baseline=None,
+    confirms=None,
     comparator_report: Optional[Path] = None,
     comparator_stats: Optional[dict[str, Any]] = None,
 ) -> None:
@@ -559,6 +659,13 @@ def _maybe_hf_push(
             "pass_label": pass_label,
             "source": "test_nightly_precision_regression.py",
         }
+        if trust is not None:
+            meta["trust"] = trust
+        if baseline is not None:
+            meta["baseline_run_path"] = baseline.run_path
+            meta["baseline_runner_name"] = baseline.runner_name
+        if confirms is not None:
+            meta["confirms_run_path"] = confirms.run_path
         meta.update(_collect_runtime_context())
         meta.update(_collect_ci_context())
         if comparator_stats:
@@ -572,7 +679,8 @@ def _maybe_hf_push(
             comparator_report=comparator_report,
         )
         print(
-            f"[hf-store] {pass_label} {len(pt_files)} tensors for {model} -> {run_path}",
+            f"[hf-store] {pass_label} ({trust or 'n/a'}) {len(pt_files)} tensors "
+            f"for {model} -> {run_path}",
             flush=True,
         )
     except Exception as e:
@@ -760,34 +868,6 @@ def _assert_fused_tp_layout(dump_dir: Path, *, tp_size: int) -> None:
         )
 
 
-def _update_baseline(model_baseline_dir: Path, today_exp_dir: Path):
-    final_dir = model_baseline_dir / EXP_NAME
-    staging_dir = model_baseline_dir / "_staging"
-    old_dir = model_baseline_dir / "_old_baseline"
-
-    if staging_dir.exists():
-        shutil.rmtree(staging_dir)
-    shutil.copytree(today_exp_dir, staging_dir)
-
-    meta = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "commit": _get_git_commit(),
-    }
-    (staging_dir.parent / "baseline_meta.json").write_text(
-        json.dumps(meta, indent=2), encoding="utf-8"
-    )
-
-    if final_dir.exists():
-        if old_dir.exists():
-            shutil.rmtree(old_dir)
-        final_dir.rename(old_dir)
-
-    staging_dir.rename(final_dir)
-
-    if old_dir.exists():
-        shutil.rmtree(old_dir)
-
-
 def _extract_diff_summary(stdout: str) -> str:
     for line in stdout.strip().splitlines():
         try:
@@ -839,7 +919,7 @@ def _report_summary(results):
     lines.append("-" * 60)
 
     for model, status, details in results:
-        lines.append(f"{model:<45} {status:<25} {details[:80]}")
+        lines.append(f"{model:<45} {status:<25} {details}")
 
     lines.append("=" * 60)
     summary = "\n".join(lines)
@@ -850,7 +930,8 @@ def _report_summary(results):
         md += "| Model | Status | Details |\n"
         md += "|-------|--------|--------|\n"
         for model, status, details in results:
-            md += f"| {model} | {status} | {details[:100]} |\n"
+            # Failure details name every baseline and runner compared; keep them whole.
+            md += f"| {model} | {status} | {details.replace('|', '/')} |\n"
         write_github_step_summary(md)
 
 

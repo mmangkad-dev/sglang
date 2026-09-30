@@ -57,7 +57,7 @@ on:
         type: boolean
         default: false
       refresh_precision_baseline:
-        description: "Force-refresh the nightly precision baseline. Restricted by the slash-command handler to the precision test on trusted in-repo PRs."
+        description: "Propose a new nightly precision baseline (confirmed once a different runner reproduces it bit-exactly). Restricted by the slash-command handler to the precision test on trusted in-repo PRs."
         required: false
         type: boolean
         default: false

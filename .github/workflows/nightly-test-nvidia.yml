@@ -33,7 +33,7 @@ on:
         type: boolean
         default: false
       force_baseline_update:
-        description: 'Refresh the precision rolling baseline instead of comparing. Dispatch once after an intentional forward-path precision change stales it; later runs compare against the new one.'
+        description: 'Propose a new precision rolling baseline instead of comparing. Dispatch once after an intentional forward-path precision change stales it; it is confirmed once a different runner reproduces it bit-exactly.'
         required: false
         type: boolean
         default: false
