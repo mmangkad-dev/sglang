@@ -190,7 +190,7 @@ def _k3_bf16_gemm(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    """F.linear / torch.mm with the same TGV dispatch module-level GEMMs get
+    """F.linear / torch.mm with the same FlashInfer backend module-level GEMMs get
     through UnquantizedLinearMethod. The fused MoE front and the deferred
     shared down GEMM call torch directly on raw merged weights, so the
     --bf16-gemm-backend cutedsl selection would silently skip them."""
@@ -202,16 +202,20 @@ def _k3_bf16_gemm(
         from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 
         if get_bf16_gemm_backend().is_cutedsl():
-            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
-                cutedsl_bf16_gemm,
-                cutedsl_bf16_gemm_out,
-                use_cutedsl_bf16_gemm,
-            )
+            from flashinfer import mm_bf16
 
-            if use_cutedsl_bf16_gemm(x.shape[0], weight.shape[0], weight.shape[1]):
-                if out is None:
-                    return cutedsl_bf16_gemm(x, weight)
-                return cutedsl_bf16_gemm_out(x, weight, out)
+            if x.shape[0] > 0:
+                dtype = out.dtype if out is not None else x.dtype
+                # FlashInfer TGV supports BF16 output; CUTLASS preserves
+                # FP32 accumulators for router logits.
+                return mm_bf16(
+                    x,
+                    weight.t(),
+                    out=out,
+                    out_dtype=dtype,
+                    pdl=dtype == torch.bfloat16,
+                    backend="tgv" if dtype == torch.bfloat16 else "cutlass",
+                )
     if out is None:
         return torch.nn.functional.linear(x, weight)
     if out.dtype != x.dtype:

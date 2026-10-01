@@ -91,8 +91,6 @@ class Bf16GemmBackend(Enum):
 
 
 _BF16_GEMM_BACKEND: Optional[Bf16GemmBackend] = None
-_cutedsl_bf16_gemm = None
-_use_cutedsl_bf16_gemm = None
 _hopper_bf16_gemv = None
 _use_hopper_bf16_gemv = None
 _splitk_tactic = None
@@ -204,7 +202,6 @@ def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
 
 def initialize_bf16_gemm_config() -> None:
     global _BF16_GEMM_BACKEND
-    global _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
     global _splitk_tactic
     global _run_splitk_dense
     global _direct_default_tactic
@@ -244,14 +241,6 @@ def initialize_bf16_gemm_config() -> None:
             raise ValueError(
                 f"--bf16-gemm-backend {backend.value} requires SM100/SM103 (Blackwell)"
             )
-
-        from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
-            cutedsl_bf16_gemm,
-            use_cutedsl_bf16_gemm,
-        )
-
-        _cutedsl_bf16_gemm = cutedsl_bf16_gemm
-        _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
 
     _enable_bf16_splitk_gemm = False
     if should_enable_bf16_splitk_gemm(backend):
@@ -332,12 +321,12 @@ def _bf16_gemm_dispatch_impl(
         output = _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
             *x.shape[:-1], -1
         )
-    elif _use_cutedsl_bf16_gemm is not None and _use_cutedsl_bf16_gemm(
-        m, weight.shape[0], weight.shape[1]
-    ):
-        output = _cutedsl_bf16_gemm(x.view(-1, x.shape[-1]), weight, bias).view(
-            *x.shape[:-1], -1
-        )
+    elif get_bf16_gemm_backend().is_cutedsl() and m > 0:
+        from flashinfer import mm_bf16
+
+        output = mm_bf16(
+            x.view(-1, x.shape[-1]), weight.t(), bias=bias, pdl=True, backend="tgv"
+        ).view(*x.shape[:-1], -1)
     elif addend is not None:
         # cuBLAS folds the addend in through the GEMM beta input;
         # a bias would need a third operand, so callers must exclude it.
@@ -555,15 +544,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and (bias is None or bias.dtype == torch.bfloat16)
             and not layer.weight.requires_grad
             and (bias is None or not bias.requires_grad)
-            and _use_cutedsl_bf16_gemm(
-                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
-            )
+            and x.shape[0] > 0
         ):
-            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
-                cutedsl_bf16_gemm_out,
-            )
+            from flashinfer import mm_bf16
 
-            return cutedsl_bf16_gemm_out(x, layer.weight, output, bias)
+            return mm_bf16(
+                x, layer.weight.t(), bias=bias, out=output, pdl=True, backend="tgv"
+            )
 
         if x.ndim != 2:
             raise ValueError("caller-owned linear output currently requires a 2D input")

@@ -158,12 +158,18 @@ class TestApplyWithAddend(CustomTestCase):
             elif route == "compiling":
                 enter(patch.object(torch.compiler, "is_compiling", return_value=True))
             elif route == "cutedsl":
-                enter(patch.object(unquant, "_use_cutedsl_bf16_gemm", lambda *a: True))
                 enter(
                     patch.object(
-                        unquant,
-                        "_cutedsl_bf16_gemm",
-                        _fake_kernel(kernel_calls, route),
+                        unquant, "_BF16_GEMM_BACKEND", unquant.Bf16GemmBackend.CUTEDSL
+                    )
+                )
+                fake = _fake_kernel(kernel_calls, route)
+                enter(
+                    patch(
+                        "flashinfer.mm_bf16",
+                        side_effect=lambda a, b, bias=None, **kwargs: fake(
+                            a, b.t(), bias
+                        ),
                     )
                 )
             elif route == "splitk":
