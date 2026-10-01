@@ -321,11 +321,16 @@ def _bf16_gemm_dispatch_impl(
         output = _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
             *x.shape[:-1], -1
         )
-    elif get_bf16_gemm_backend().is_cutedsl() and m > 0:
+    elif (
+        get_bf16_gemm_backend().is_cutedsl()
+        and m > 0
+        # FlashInfer's TGV candidate does not validate TMA row alignment.
+        and weight.shape[1] % 8 == 0
+    ):
         from flashinfer import mm_bf16
 
         output = mm_bf16(
-            x.view(-1, x.shape[-1]), weight.t(), bias=bias, pdl=True, backend="tgv"
+            x.view(-1, x.shape[-1]), weight.t(), bias=bias, pdl=True, backend="auto"
         ).view(*x.shape[:-1], -1)
     elif addend is not None:
         # cuBLAS folds the addend in through the GEMM beta input;
@@ -545,11 +550,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and not layer.weight.requires_grad
             and (bias is None or not bias.requires_grad)
             and x.shape[0] > 0
+            and layer.weight.shape[1] % 8 == 0
         ):
             from flashinfer import mm_bf16
 
             return mm_bf16(
-                x, layer.weight.t(), bias=bias, out=output, pdl=True, backend="tgv"
+                x, layer.weight.t(), bias=bias, out=output, pdl=True, backend="auto"
             )
 
         if x.ndim != 2:

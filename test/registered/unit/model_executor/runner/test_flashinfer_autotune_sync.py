@@ -58,6 +58,89 @@ def _gate_worker(rank, world_size, master_port, cache_path, writer):
             dist.destroy_process_group()
 
 
+class TestBf16Autotune(CustomTestCase):
+    def setUp(self):
+        self.kernel = SimpleNamespace(
+            disable_flashinfer_autotune=False, bf16_gemm_backend="auto"
+        )
+        self.deterministic = SimpleNamespace(enable_deterministic_inference=False)
+        self.mr = SimpleNamespace(
+            device="cuda",
+            dtype=torch.bfloat16,
+            model_config=SimpleNamespace(quantization=None),
+            spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
+            is_draft_worker=False,
+            is_generation=True,
+            model=SimpleNamespace(),
+            attn_backend=SimpleNamespace(extend_dummy_seqs_capped_by_req_pool=False),
+            canary_manager=None,
+        )
+        for name, value in (
+            (
+                "get_exec",
+                SimpleNamespace(
+                    kernel=self.kernel,
+                    deterministic=self.deterministic,
+                    moe=SimpleNamespace(
+                        moe_runner_backend="triton", moe_a2a_backend="none"
+                    ),
+                ),
+            ),
+            ("get_platform", SimpleNamespace(is_sm100=True)),
+            ("get_disagg", SimpleNamespace(disaggregation_mode="null")),
+        ):
+            mock = patch.object(autotune, name, return_value=value)
+            mock.start()
+            self.addCleanup(mock.stop)
+        mock = patch.object(torch.cuda, "get_device_capability", return_value=(10, 3))
+        mock.start()
+        self.addCleanup(mock.stop)
+
+    def test_dense_bf16_enables_startup_tuning(self):
+        for backend, expected in (
+            ("auto", True),
+            ("cutedsl", True),
+            ("torch", False),
+            ("gemv", False),
+        ):
+            with self.subTest(backend=backend):
+                self.kernel.bf16_gemm_backend = backend
+                self.assertEqual(
+                    autotune.should_run_flashinfer_autotune(self.mr), expected
+                )
+        self.kernel.bf16_gemm_backend = "auto"
+        self.mr.dtype = torch.float16
+        self.assertFalse(autotune.should_run_flashinfer_autotune(self.mr))
+
+    def test_explicit_disable_and_deterministic_mode_still_win(self):
+        self.kernel.disable_flashinfer_autotune = True
+        self.assertFalse(autotune.should_run_flashinfer_autotune(self.mr))
+        self.kernel.disable_flashinfer_autotune = False
+        self.deterministic.enable_deterministic_inference = True
+        self.assertFalse(autotune.should_run_flashinfer_autotune(self.mr))
+
+    def test_prefill_bf16_tunes_without_extend_opt_in(self):
+        runner = SimpleNamespace(
+            model_runner=self.mr,
+            _alloc_dummy_decode_buffers=Mock(return_value=object()),
+            _dummy_run=Mock(),
+        )
+        with (
+            patch.object(autotune, "max_prefill_buffer_tokens", return_value=2048),
+            patch.object(
+                autotune,
+                "flashinfer_autotune_context",
+                side_effect=lambda *a, **k: nullcontext(),
+            ),
+            autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.override(False),
+        ):
+            autotune.maybe_flashinfer_autotune_extend(runner, decode_num_tokens=128)
+        runner._dummy_run.assert_called_once()
+        kwargs = runner._dummy_run.call_args.kwargs
+        self.assertEqual(kwargs["batch_size"], 2048)
+        self.assertEqual(kwargs["forward_mode_override"], autotune.ForwardMode.EXTEND)
+
+
 class TestAutotuneTacticSyncGroup(CustomTestCase):
     def test_single_rank_has_nobody_to_agree_with(self):
         # A 1-rank group would add a collective per tactic for no agreement.
@@ -181,6 +264,7 @@ class TestModelPrefillAutotune(CustomTestCase):
         # No dummy-buffer or attention APIs: this path must not build a
         # TARGET_VERIFY batch or mutate request/KV state.
         for target, kwargs in (
+            ("bf16_gemm_needs_autotune", {"return_value": False}),
             ("max_prefill_buffer_tokens", {"return_value": 65536}),
             (
                 "flashinfer_autotune_context",

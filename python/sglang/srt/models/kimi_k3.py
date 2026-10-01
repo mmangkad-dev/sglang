@@ -204,17 +204,15 @@ def _k3_bf16_gemm(
         if get_bf16_gemm_backend().is_cutedsl():
             from flashinfer import mm_bf16
 
-            if x.shape[0] > 0:
+            if x.shape[0] > 0 and weight.shape[1] % 8 == 0:
                 dtype = out.dtype if out is not None else x.dtype
-                # FlashInfer TGV supports BF16 output; CUTLASS preserves
-                # FP32 accumulators for router logits.
                 return mm_bf16(
                     x,
                     weight.t(),
                     out=out,
                     out_dtype=dtype,
                     pdl=dtype == torch.bfloat16,
-                    backend="tgv" if dtype == torch.bfloat16 else "cutlass",
+                    backend="auto",
                 )
     if out is None:
         return torch.nn.functional.linear(x, weight)

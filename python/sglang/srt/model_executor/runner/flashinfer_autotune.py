@@ -31,6 +31,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_parallel,
+    get_platform,
     get_schedule,
     get_spec,
     max_prefill_buffer_tokens,
@@ -51,6 +52,14 @@ def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
     skip_ops = set(get_exec().kernel.flashinfer_autotune_skip_ops or ())
     skip_ops.update(FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS)
     return skip_ops
+
+
+def bf16_gemm_needs_autotune(model_runner: ModelRunner) -> bool:
+    return (
+        model_runner.dtype == torch.bfloat16
+        and get_platform().is_sm100
+        and get_exec().kernel.bf16_gemm_backend in ("auto", "cutedsl")
+    )
 
 
 def should_run_flashinfer_autotune(
@@ -122,7 +131,12 @@ def should_run_flashinfer_autotune(
     else:
         fp8_gemm_needs_autotune = False
 
-    if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
+    if not (
+        moe_needs_autotune
+        or fp4_gemm_needs_autotune
+        or fp8_gemm_needs_autotune
+        or bf16_gemm_needs_autotune(mr)
+    ):
         return False
 
     if torch.cuda.get_device_capability()[0] < 9:
@@ -147,6 +161,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(mr.dtype),
         str(get_model().quantization),
         str(get_exec().moe.moe_runner_backend),
+        str(get_exec().kernel.bf16_gemm_backend),
         str(get_parallel().tp_size),
         str(get_parallel().pp_size),
         str(get_parallel().attn_dp_size),
@@ -371,7 +386,11 @@ def maybe_flashinfer_autotune_extend(
         if tuned:
             return
 
-    if not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
+    # Dense BF16 uses upstream backend selection at every token count, so
+    # decode-only tuning would leave large prefills on an untuned backend.
+    if not (
+        envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get() or bf16_gemm_needs_autotune(mr)
+    ):
         return
     is_pd_prefill_target = (
         get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
@@ -382,8 +401,7 @@ def maybe_flashinfer_autotune_extend(
         # Ordinary speculative runners force TARGET_VERIFY; PD prefill targets
         # have no draft-side state and preserve the requested EXTEND mode.
         return
-    # Multimodal generation wrappers can still run this text-only EXTEND dummy;
-    # an incompatible model should fail the explicit opt-in visibly.
+    # Multimodal generation wrappers can still run this text-only EXTEND dummy.
 
     if mr.attn_backend.extend_dummy_seqs_capped_by_req_pool:
         pool_size = mr.req_to_token_pool.size
