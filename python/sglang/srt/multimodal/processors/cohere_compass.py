@@ -31,9 +31,10 @@ class CohereCompassMultimodalProcessor(QwenVLImageProcessor):
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|VISION_START|><|IMAGE_PAD|><|VISION_END|>",
             image_token_id=hf_config.image_token_id,
-            # The regex that matches already-expanded image tokens.
+            # Already-expanded image tokens, or the legacy /generate <image>
+            # sentinel the fast path rewrites to the native placeholder.
             image_token_regex=re.compile(
-                r"<\|VISION_START\|>(?:<\|IMAGE_PAD\|>)+<\|VISION_END\|>"
+                r"<\|VISION_START\|>(?:<\|IMAGE_PAD\|>)+<\|VISION_END\|>|<image>"
             ),
             video_token_id=self.VIDEO_TOKEN_ID,
         ).build(_processor)

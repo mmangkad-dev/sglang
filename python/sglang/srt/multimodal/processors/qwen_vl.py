@@ -353,6 +353,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         self.uses_media_artifacts_without_cache = self.model_type in (
             "qwen3_vl",
             "qwen3_vl_moe",
+            "cohere_compass",
         )
         if self.model_type in (
             "qwen2_vl",
