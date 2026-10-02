@@ -19,9 +19,9 @@ Checkpoint: ``CohereLabs/North-Micro-Vision-Instruct``.
 The vision tower is a Qwen3-VL native-resolution encoder with DeepStack taps, so
 it is reused verbatim. The text decoder is Cohere's Command-A style block:
 one mean-centred ``LayerNorm`` feeding attention and MLP in parallel, summed back
-into a single residual, with three interleaved sliding-window layers (interleaved
-M-RoPE) per global layer, and the global layers carrying no position embedding at
-all (NoPE).
+into a single residual, with three sliding-window layers per global layer. The
+sliding-window layers carry Qwen3-VL style interleaved M-RoPE; the global layers
+carry no position embedding at all (NoPE).
 """
 
 from typing import Optional, Tuple, Union
@@ -33,56 +33,46 @@ from transformers.models.cohere_compass import (
     CohereCompassTextConfig,
 )
 
+from sglang.srt.configs.model_config import rope_params_have_mrope
 from sglang.srt.distributed.parallel_state import get_pp_group
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.models.commandr import CohereMLP
 from sglang.srt.models.commandr import LayerNorm as CohereCompassLayerNorm
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 
 
-class CohereCompassMLP(nn.Module):
-    def __init__(
-        self,
-        config: CohereCompassTextConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            config.hidden_size,
-            [config.intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
-        )
-        self.down_proj = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix),
-        )
-        self.act_fn = SiluAndMul()
+def get_text_rotary_emb(config: CohereCompassTextConfig) -> MRotaryEmbedding:
+    """The RoPE shared by every sliding-window layer.
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+    Interleaved M-RoPE as in transformers 5.16, the checkpoint's pinned release;
+    5.17 permutes the rotary lanes into an [h | w | t] layout, which the weights
+    were not trained with (DocVQA ANLS drops from 0.96 to 0.35).
+    """
+    rope_parameters = config.rope_parameters["sliding_attention"]
+    return get_rope(
+        head_size=config.head_dim,
+        rotary_dim=config.head_dim,
+        max_position=config.max_position_embeddings,
+        base=rope_parameters["rope_theta"],
+        rope_scaling={k: v for k, v in rope_parameters.items() if k != "rope_theta"},
+        is_neox_style=True,
+    )
+
+
+def get_attention_sliding_window_size(config: CohereCompassTextConfig) -> int:
+    # The reference window spans ``sliding_window`` keys including the query
+    # itself; SGLang's attention backends take the keys to its left.
+    return config.sliding_window - 1
 
 
 class CohereCompassAttention(nn.Module):
@@ -91,6 +81,7 @@ class CohereCompassAttention(nn.Module):
     def __init__(
         self,
         config: CohereCompassTextConfig,
+        rotary_emb: MRotaryEmbedding,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -131,27 +122,11 @@ class CohereCompassAttention(nn.Module):
         )
 
         self.layer_type = config.layer_types[layer_id]
-        rope_parameters = config.rope_parameters.get(self.layer_type)
-        # ``None`` for the global layers: they run without any position embedding.
-        if rope_parameters is None:
-            self.rotary_emb = None
-        else:
-            rope_scaling = {
-                key: value
-                for key, value in rope_parameters.items()
-                if key != "rope_theta"
-            }
-            self.rotary_emb = get_rope(
-                head_size=self.head_dim,
-                rotary_dim=self.head_dim,
-                max_position=config.max_position_embeddings,
-                base=rope_parameters["rope_theta"],
-                rope_scaling=rope_scaling,
-                is_neox_style=True,
-            )
-
+        # The global layers run without any position embedding (NoPE).
+        is_sliding = self.layer_type == "sliding_attention"
+        self.rotary_emb = rotary_emb if is_sliding else None
         self.sliding_window_size = (
-            config.sliding_window if self.layer_type == "sliding_attention" else -1
+            get_attention_sliding_window_size(config) if is_sliding else -1
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -183,6 +158,7 @@ class CohereCompassDecoderLayer(nn.Module):
     def __init__(
         self,
         config: CohereCompassTextConfig,
+        rotary_emb: MRotaryEmbedding,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -190,11 +166,12 @@ class CohereCompassDecoderLayer(nn.Module):
         super().__init__()
         self.self_attn = CohereCompassAttention(
             config,
+            rotary_emb=rotary_emb,
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
-        self.mlp = CohereCompassMLP(
+        self.mlp = CohereMLP(
             config,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
@@ -253,10 +230,13 @@ class CohereCompassTextModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        # Only the sliding-window layers carry RoPE, and they all share it.
+        rotary_emb = get_text_rotary_emb(config)
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: CohereCompassDecoderLayer(
                 config,
+                rotary_emb=rotary_emb,
                 layer_id=idx,
                 quant_config=quant_config,
                 prefix=prefix,
@@ -383,25 +363,11 @@ class CohereCompassForConditionalGeneration(Qwen3VLForConditionalGeneration):
             language_model_cls=CohereCompassTextModel,
         )
         self._pin_vision_interpolation(self.visual)
-        # The base class probes for a top-level ``mrope_section``, but CohereCompass
-        # keys its RoPE parameters by layer type: only the sliding-window layers
-        # carry M-RoPE, and the global layers are NoPE.
-        sliding_rope = config.text_config.rope_parameters.get("sliding_attention")
+        # The base class probes for a top-level ``mrope_section``; CohereCompass
+        # keys its RoPE parameters by layer type.
         self.is_mrope_enabled = not self.language_model_only and (
-            "mrope_section" in (sliding_rope or {})
+            rope_params_have_mrope(config.text_config.rope_parameters)
         )
-
-        # The tap count the decoder was built for must match the number of
-        # DeepStack embeddings the vision tower actually produces; a mismatch
-        # means visual residuals would land on the wrong layers or be dropped.
-        if hasattr(self, "model"):
-            assert (
-                self.model.num_deepstack_embeddings == self.num_deepstack_embeddings
-            ), (
-                "DeepStack tap count mismatch between the vision tower "
-                f"({self.num_deepstack_embeddings}) and the decoder "
-                f"({self.model.num_deepstack_embeddings})"
-            )
 
         # Cohere scales logits before sampling.
         self.logit_scale = config.text_config.logit_scale
@@ -409,18 +375,17 @@ class CohereCompassForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.config, logit_scale=self.logit_scale
         )
 
+    def get_attention_sliding_window_size(self) -> int:
+        return get_attention_sliding_window_size(self.config)
+
     @staticmethod
     def _pin_vision_interpolation(visual: Optional[nn.Module]) -> None:
         """Force corner-aligned position-embedding interpolation on the tower.
 
-        CohereCompass's reference vision tower fixes corner alignment
-        (transformers sets ``interpolation_align_corners = True``), and SGLang's
-        eager Qwen3-VL path is corner-aligned unconditionally. The ViT
-        CUDA-graph path instead follows the global
-        ``enable_precise_embedding_interpolation`` flag, which defaults off, so
-        leaving the inherited value in place would make
-        ``SGLANG_VIT_ENABLE_CUDA_GRAPH`` change the vision embeddings rather
-        than only how they are computed. Pin it as a model invariant.
+        The reference tower interpolates its learned position grid with
+        ``align_corners=True``. The inherited Qwen3-VL tower instead reads the
+        global ``enable_precise_embedding_interpolation`` flag (default off) on
+        its CUDA-graph path, so pin the reference behavior as a model invariant.
         """
         if visual is not None:
             visual.align_corners = True

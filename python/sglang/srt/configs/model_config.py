@@ -515,7 +515,7 @@ class ModelConfig:
         self.is_lm_only = language_model_only or getattr(
             self.hf_config, "language_model_only", False
         )
-        self.model_is_mrope = not self.is_lm_only and _rope_params_have_mrope(
+        self.model_is_mrope = not self.is_lm_only and rope_params_have_mrope(
             rope_scaling
         )
 
@@ -2449,7 +2449,7 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
     return base_scaling * mscale * mscale
 
 
-def _rope_params_have_mrope(rope_parameters: Optional[dict]) -> bool:
+def rope_params_have_mrope(rope_parameters: Optional[dict]) -> bool:
     """Whether the RoPE parameters declare M-RoPE, flat or keyed by layer type.
 
     Per-layer-type parameters (e.g. CohereCompass) nest the M-RoPE keys under
