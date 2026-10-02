@@ -15,6 +15,7 @@ from sglang.srt.configs.model_config import (
     is_multimodal_model,
     register_model_config_factory,
     resolve_spec_hidden_size,
+    rope_params_have_mrope,
 )
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
 from sglang.srt.server_args import ServerArgs
@@ -47,6 +48,46 @@ class TestHybridLayerIds(CustomTestCase):
                     get_hybrid_layer_ids([architecture], config),
                     ([0, 2], [1, 3]),
                 )
+
+
+class TestRopeParamsHaveMrope(CustomTestCase):
+    """Qwen3-VL family models enable M-RoPE positions from this predicate."""
+
+    def test_flat_mrope(self):
+        self.assertTrue(
+            rope_params_have_mrope(
+                {"rope_type": "default", "mrope_section": [24, 20, 20]}
+            )
+        )
+
+    def test_mrope_nested_by_layer_type(self):
+        # CohereCompass: only the sliding-window layers carry M-RoPE.
+        self.assertTrue(
+            rope_params_have_mrope(
+                {
+                    "sliding_attention": {
+                        "rope_theta": 50000,
+                        "mrope_section": [24, 20, 20],
+                    },
+                    "full_attention": None,
+                }
+            )
+        )
+
+    def test_nested_by_layer_type_without_mrope(self):
+        # Gemma-style per-layer-type RoPE has no M-RoPE.
+        self.assertFalse(
+            rope_params_have_mrope(
+                {
+                    "sliding_attention": {"rope_theta": 10000},
+                    "full_attention": {"rope_theta": 1000000},
+                }
+            )
+        )
+
+    def test_absent(self):
+        self.assertFalse(rope_params_have_mrope(None))
+        self.assertFalse(rope_params_have_mrope({}))
 
 
 class TestEmbeddingGemmaConfig(CustomTestCase):

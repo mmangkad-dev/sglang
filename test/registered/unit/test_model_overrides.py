@@ -658,6 +658,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         attn_dp_size=2,
                     )
 
+    def test_cohere_compass_rejects_only_dp_attention(self):
+        """Its decoder shards attention by the global TP group, so the
+        attention-TP sized KV pool of a DP-attention launch cannot hold it."""
+
+        def declare(attn_dp_size):
+            args = SimpleNamespace(attn_dp_size=attn_dp_size, ep_join_mode=None)
+            return collect_model_override_declarations(
+                "CohereCompassForConditionalGeneration", args, hf_config=None
+            )
+
+        with self.assertRaisesRegex(
+            ValueError, "CohereCompass does not support DP attention"
+        ):
+            declare(attn_dp_size=2)
+        self.assertTrue(all(not decl for _, decl in declare(attn_dp_size=1)))
+
     def test_minicpm_rejects_hierarchical_cache_for_hybrid_models(self):
         for capability in ("sparse_attention", "lightning_attention"):
             with self.subTest(capability=capability):
