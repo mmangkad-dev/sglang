@@ -33,9 +33,7 @@ from transformers.models.cohere_compass import (
     CohereCompassTextConfig,
 )
 
-from sglang.srt.configs.model_config import rope_params_have_mrope
 from sglang.srt.distributed.parallel_state import get_pp_group
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -224,7 +222,6 @@ class CohereCompassTextModel(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
-                use_attn_tp_group=is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
@@ -350,10 +347,10 @@ class CohereCompassForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # receive a visual residual, so the text config has to carry it before
         # the language model is built. A language-model-only load has no tower
         # and therefore no taps.
-        self.language_model_only = getattr(config, "language_model_only", False)
+        language_model_only = getattr(config, "language_model_only", False)
         config.text_config.deepstack_visual_indexes = (
             []
-            if self.language_model_only
+            if language_model_only
             else list(config.vision_config.deepstack_visual_indexes)
         )
         super().__init__(
@@ -363,11 +360,6 @@ class CohereCompassForConditionalGeneration(Qwen3VLForConditionalGeneration):
             language_model_cls=CohereCompassTextModel,
         )
         self._pin_vision_interpolation(self.visual)
-        # The base class probes for a top-level ``mrope_section``; CohereCompass
-        # keys its RoPE parameters by layer type.
-        self.is_mrope_enabled = not self.language_model_only and (
-            rope_params_have_mrope(config.text_config.rope_parameters)
-        )
 
         # Cohere scales logits before sampling.
         self.logit_scale = config.text_config.logit_scale

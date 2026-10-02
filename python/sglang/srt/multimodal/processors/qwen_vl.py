@@ -717,7 +717,6 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                 "qwen4_exp",
                 "intern_s2_preview",
                 "cosmos3_omni",
-                "cohere_compass",
             ]
             and video_timestamps is not None
         ):
@@ -1052,7 +1051,6 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             "intern_s2_preview",
             "interns2_mobius",
             "cosmos3_omni",
-            "cohere_compass",
         ):
             processor_kwargs.update(
                 video_metadata=video_metadata,

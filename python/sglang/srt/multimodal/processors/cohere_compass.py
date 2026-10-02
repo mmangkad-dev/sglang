@@ -38,3 +38,17 @@ class CohereCompassMultimodalProcessor(QwenVLImageProcessor):
             ),
             video_token_id=self.VIDEO_TOKEN_ID,
         ).build(_processor)
+
+    async def process_mm_data_async(
+        self, image_data, input_text, request_obj, *args, **kwargs
+    ):
+        # The checkpoint is validated on images only, and the reference video
+        # prompt construction (transformers 5.16) is malformed.
+        if request_obj.video_data:
+            raise ValueError(
+                "CohereCompass (North Micro Vision) supports image inputs only, "
+                "not video."
+            )
+        return await super().process_mm_data_async(
+            image_data, input_text, request_obj, *args, **kwargs
+        )

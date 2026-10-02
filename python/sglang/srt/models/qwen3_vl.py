@@ -27,6 +27,7 @@ import torch.nn as nn
 from einops import rearrange
 from transformers.activations import ACT2FN
 
+from sglang.srt.configs.model_config import rope_params_have_mrope
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import (
@@ -1367,8 +1368,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             # encoder_only mode: no language model, so no lm_head needed
             self.lm_head = None
 
-        self.is_mrope_enabled = (
-            not self.language_model_only and "mrope_section" in self.config.rope_scaling
+        self.is_mrope_enabled = not self.language_model_only and rope_params_have_mrope(
+            self.config.rope_scaling
         )
 
         self.logits_processor = LogitsProcessor(self.config)
