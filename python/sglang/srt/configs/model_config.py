@@ -515,10 +515,8 @@ class ModelConfig:
         self.is_lm_only = language_model_only or getattr(
             self.hf_config, "language_model_only", False
         )
-        self.model_is_mrope = (
-            not self.is_lm_only
-            and rope_scaling is not None
-            and "mrope_section" in rope_scaling
+        self.model_is_mrope = not self.is_lm_only and _rope_params_have_mrope(
+            rope_scaling
         )
 
         self.hf_generation_config = get_generation_config(
@@ -2451,6 +2449,23 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
     return base_scaling * mscale * mscale
 
 
+def _rope_params_have_mrope(rope_parameters: Optional[dict]) -> bool:
+    """Whether the RoPE parameters declare M-RoPE, flat or keyed by layer type.
+
+    Per-layer-type parameters (e.g. CohereCompass) nest the M-RoPE keys under
+    the layer type that carries them, ``{"sliding_attention": {...,
+    "mrope_section": ...}, "full_attention": None}``.
+    """
+    if not rope_parameters:
+        return False
+    if "mrope_section" in rope_parameters:
+        return True
+    return any(
+        isinstance(params, dict) and "mrope_section" in params
+        for params in rope_parameters.values()
+    )
+
+
 def is_hybrid_swa_model(
     model_architectures: List[str],
     hf_text_config: Optional[PretrainedConfig] = None,
@@ -2477,6 +2492,7 @@ def is_hybrid_swa_model(
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
         "UnlimitedOCRForCausalLM",
+        "CohereCompassForConditionalGeneration",
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):
         # Only treat Laguna as hybrid SWA when it actually has a sliding window.
@@ -2555,6 +2571,7 @@ def get_hybrid_layer_ids(
         or "MellumForCausalLM" in model_architectures
         or "MuseGlimmerForCausalLM" in model_architectures
         or "MuseGlimmerForConditionalGeneration" in model_architectures
+        or "CohereCompassForConditionalGeneration" in model_architectures
     ):
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [
